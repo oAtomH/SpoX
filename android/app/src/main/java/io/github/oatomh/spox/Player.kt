@@ -127,6 +127,9 @@ object Player {
 
     private val tc get() = controller?.transportControls
 
+    fun play() = tc?.play()
+    fun pause() = tc?.pause()
+
     fun playPause() {
         if (state.playing) tc?.pause() else tc?.play()
     }

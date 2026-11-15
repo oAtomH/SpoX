@@ -22,7 +22,7 @@ class MainActivity : Activity() {
         view.settingsRows = {
             val prefs = getSharedPreferences("spox", 0)
             listOf(
-                "Notification" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "media player"; else -> "off" },
+                "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's media player"; else -> "off" },
                 "Updates" to Updater.status.ifEmpty { "check now" },
                 "Auto-update" to if (prefs.getBoolean("auto_update", true)) "on" else "off",
                 "Notification access" to if (Player.hasAccess(this)) "allowed" else "allow...",
@@ -36,7 +36,7 @@ class MainActivity : Activity() {
             val prefs = getSharedPreferences("spox", 0)
             when (what) {
                 "access", "Notification access" -> startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                "Notification" -> SpoxNotification.cycleStyle(this)
+                "Player in notifications" -> SpoxNotification.cycleStyle(this)
                 "Updates" -> Updater.check(this, true) { runOnUiThread { view.invalidate() } }
                 "Auto-update" -> prefs.edit().putBoolean("auto_update", !prefs.getBoolean("auto_update", true)).apply()
                 "Open Spotify" -> Player.openApp(this)

@@ -26,11 +26,11 @@ object SpoxNotification {
     private var lastKey = ""
 
     /** "pixel" = SpoX's own pixel card, "media" = Android's media player look (Now Bar), "off". */
-    fun style(ctx: Context): String = ctx.getSharedPreferences("spox", 0).getString("notif_style", "pixel") ?: "pixel"
+    fun style(ctx: Context): String = ctx.getSharedPreferences("spox", 0).getString("notif_style", "media") ?: "media"
     fun enabled(ctx: Context) = style(ctx) != "off"
 
     fun cycleStyle(ctx: Context) {
-        val next = when (style(ctx)) { "pixel" -> "media"; "media" -> "off"; else -> "pixel" }
+        val next = when (style(ctx)) { "media" -> "pixel"; "pixel" -> "off"; else -> "media" }
         ctx.getSharedPreferences("spox", 0).edit().putString("notif_style", next).apply()
         clear(ctx)
         update(ctx)
@@ -38,8 +38,14 @@ object SpoxNotification {
 
     private fun session(ctx: Context): MediaSession = session ?: MediaSession(ctx, "SpoX").also { s ->
         s.setCallback(object : MediaSession.Callback() {
-            override fun onPlay() = Player.playPause()
-            override fun onPause() = Player.playPause()
+            override fun onPlay() { Player.play() }
+            override fun onPause() { Player.pause() }
+            override fun onCustomAction(action: String, extras: android.os.Bundle?) {
+                when (action) {
+                    "shuffle" -> Player.toggleShuffle()
+                    "repeat" -> Player.toggleRepeat()
+                }
+            }
             override fun onSkipToNext() { Player.next() }
             override fun onSkipToPrevious() { Player.prev() }
             override fun onSeekTo(pos: Long) { Player.seek(pos) }
@@ -99,7 +105,7 @@ object SpoxNotification {
                 setShowBadge(false)
             })
         }
-        val key = "${style(ctx)}|${st.title}|${st.artist}|${st.playing}|${st.positionMs / 1000}|${st.art?.generationId}"
+        val key = "${style(ctx)}|${st.title}|${st.artist}|${st.playing}|${st.positionMs / 1000}|${st.art?.generationId}|${st.shuffle}|${st.repeat}"
         if (key == lastKey) return
         lastKey = key
         val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
@@ -126,6 +132,9 @@ object SpoxNotification {
                 .setActions(PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
                     PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO)
                 .setState(if (st.playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED, st.position(), if (st.playing) 1f else 0f)
+                // extra buttons on the phone's player (Android shows up to two)
+                .addCustomAction(PlaybackState.CustomAction.Builder("shuffle", if (st.shuffle) "Shuffle on" else "Shuffle off", R.drawable.ic_shuffle).build())
+                .addCustomAction(PlaybackState.CustomAction.Builder("repeat", if (st.repeat) "Repeat on" else "Repeat off", R.drawable.ic_repeat).build())
                 .build()
         )
         fun action(name: String, icon: Int, label: String) = Notification.Action.Builder(
