@@ -16,8 +16,8 @@ android {
         // 28 on purpose: Android only lets apps that target 28 or lower run a program they
         // downloaded themselves (the same trick Termux uses)
         targetSdk = 28
-        versionName = "0.1"
-        versionCode = 1
+        versionName = "0.2"
+        versionCode = 2
     }
 
     val ks = System.getenv("SPOX_KEYSTORE_FILE")
@@ -43,4 +43,9 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     lint { abortOnError = false; checkReleaseBuilds = false }
+}
+
+dependencies {
+    // .deb packages are xz-compressed
+    implementation("org.tukaani:xz:1.10")
 }

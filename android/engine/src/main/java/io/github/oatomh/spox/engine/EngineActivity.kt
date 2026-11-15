@@ -56,7 +56,7 @@ class EngineActivity : Activity() {
         }
         root.addView(ScrollView(this).apply { addView(out) }, LinearLayout.LayoutParams(-1, -1))
         setContentView(root)
-        log("SpoX Engine test 0.1")
+        log("SpoX Engine test 0.2")
         log("Phone: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), ABIs ${Build.SUPPORTED_ABIS.joinToString()}")
         log("Tap 1, wait, then tap 2 and send the report.")
     }
@@ -93,7 +93,20 @@ class EngineActivity : Activity() {
                 for (args in listOf(listOf("--help"), listOf("--version"))) {
                     tryRun(listOf(bin.absolutePath) + args, dir)
                 }
-                // if it needs the glibc loader, also try the phone's own loader (normally fails)
+                // it's a normal Linux (glibc) program: fetch the few Linux libraries it asks for from
+                // Debian and start it through Debian's own loader
+                val root = File(filesDir, "linux").apply { mkdirs() }
+                log("\n== Linux libraries (Debian 13, arm64) ==")
+                getDebs(listOf("libc6", "libgcc-s1", "libatomic1"), root)
+                val lib = File(root, "usr/lib/aarch64-linux-gnu")
+                val ld = File(lib, "ld-linux-aarch64.so.1").let { if (it.exists()) it else File(root, "usr/lib/ld-linux-aarch64.so.1") }
+                log("loader: ${ld.exists()} (${ld.canonicalPath.substringAfter(root.path)})")
+                File(ld.canonicalPath).setExecutable(true, false)
+                lib.listFiles()?.forEach { it.setReadable(true, false) }
+                log("\n== start it through the Debian loader ==")
+                val base = listOf(ld.canonicalPath, "--library-path", lib.path, bin.absolutePath)
+                tryRun(base + "--help", dir)
+                tryRun(base + "--version", dir)
                 log("\n== done ==")
             } catch (e: Throwable) {
                 log("ERROR: ${e.javaClass.simpleName}: ${e.message}")
@@ -119,11 +132,56 @@ class EngineActivity : Activity() {
         }
     }
 
+    // ---- Debian packages ------------------------------------------------------------------
+
+    private fun getDebs(names: List<String>, root: File) {
+        val index = "https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.gz"
+        val want = names.toMutableSet()
+        val files = HashMap<String, String>()
+        var pkg = ""
+        GZIPInputStream(BufferedInputStream(URL(index).openStream())).bufferedReader().useLines { lines ->
+            for (line in lines) {
+                if (line.startsWith("Package: ")) pkg = line.removePrefix("Package: ").trim()
+                else if (line.startsWith("Filename: ") && pkg in want) {
+                    files[pkg] = line.removePrefix("Filename: ").trim()
+                    want -= pkg
+                    if (want.isEmpty()) break
+                }
+            }
+        }
+        for ((p, path) in files) {
+            val url = "https://deb.debian.org/debian/$path"
+            val bytes = URL(url).openStream().use { it.readBytes() }
+            log("$p: ${path.substringAfterLast('/')} (${bytes.size / 1024} KB)")
+            // .deb = "ar" archive; the files are in data.tar.xz
+            var o = 8
+            while (o + 60 <= bytes.size) {
+                val name = String(bytes, o, 16).trim().trimEnd('/')
+                val size = String(bytes, o + 48, 10).trim().toInt()
+                val start = o + 60
+                if (name.startsWith("data.tar")) {
+                    val raw = bytes.inputStream(start, size)
+                    val s: InputStream = when {
+                        name.endsWith(".xz") -> org.tukaani.xz.XZInputStream(raw)
+                        name.endsWith(".gz") -> GZIPInputStream(raw)
+                        else -> raw
+                    }
+                    val got = untar(s, root)
+                    log("  unpacked ${got.size} files")
+                }
+                o = start + size + (size and 1)
+            }
+        }
+        if (want.isNotEmpty()) log("not found: $want")
+    }
+
     // ---- tar.gz (only what Soloist's archive needs) ------------------------------------------
 
-    private fun untarGz(input: InputStream, dest: File): List<File> {
+    private fun untarGz(input: InputStream, dest: File): List<File> = untar(GZIPInputStream(input), dest)
+
+    private fun untar(stream: InputStream, dest: File): List<File> {
         val out = mutableListOf<File>()
-        GZIPInputStream(input).use { gz ->
+        stream.use { gz ->
             val header = ByteArray(512)
             while (true) {
                 if (readFully(gz, header) < 512) break
@@ -150,6 +208,13 @@ class EngineActivity : Activity() {
                                 left -= n
                             }
                         }
+                        out += f
+                    }
+                    '2' -> {
+                        val target = String(header, 157, 100).trimEnd('\u0000')
+                        f.parentFile?.mkdirs()
+                        f.delete()
+                        runCatching { android.system.Os.symlink(target, f.path) }
                         out += f
                     }
                     else -> skip(gz, size)
