@@ -1,5 +1,5 @@
-# Test-builds SpoX for Android whenever its code changes (no release). The APK is kept as a
-# download on the run's page for a week.
+# Test-builds SpoX for Android whenever its code changes and puts it on the
+# "android-preview" pre-release page.
 name: Android build
 
 on:
@@ -7,6 +7,9 @@ on:
     branches: [main]
     paths: ["android/**", ".github/workflows/android.yml"]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   apk:
@@ -29,8 +32,18 @@ jobs:
         env:
           SPOX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle -p android assembleRelease --no-daemon
-      - uses: actions/upload-artifact@v4
+      - name: Check the APK
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk SpoX.apk
+          ls -la SpoX.apk
+          echo "skin files inside: $(unzip -l SpoX.apk | grep -c 'assets/skin/')"
+      # a "preview" pre-release to install on the phone straight from GitHub (the normal
+      # releases stay what the Windows app updates from)
+      - uses: softprops/action-gh-release@v2
         with:
-          name: SpoX-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
-          retention-days: 7
+          tag_name: android-preview
+          name: SpoX for Android (preview)
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          body: Test build of SpoX for Android, made from the newest code. Open this page on your phone and tap SpoX.apk.
+          files: SpoX.apk
