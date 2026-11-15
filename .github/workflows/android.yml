@@ -35,7 +35,8 @@ jobs:
       - name: Check the APK
         run: |
           cp android/app/build/outputs/apk/release/app-release.apk SpoX.apk
-          ls -la SpoX.apk
+          cp android/engine/build/outputs/apk/release/engine-release.apk SpoX-Engine.apk
+          ls -la SpoX.apk SpoX-Engine.apk
           echo "skin files inside: $(unzip -l SpoX.apk | grep -c 'assets/skin/')"
       # a "preview" pre-release to install on the phone straight from GitHub (the normal
       # releases stay what the Windows app updates from)
@@ -45,5 +46,7 @@ jobs:
           name: SpoX for Android (preview)
           prerelease: true
           target_commitish: ${{ github.sha }}
-          body: Test build of SpoX for Android, made from the newest code. Open this page on your phone and tap SpoX.apk.
-          files: SpoX.apk
+          body: Test build of SpoX for Android, made from the newest code. Open this page on your phone and tap SpoX.apk. SpoX-Engine.apk is the test for playing without the Spotify app.
+          files: |
+            SpoX.apk
+            SpoX-Engine.apk

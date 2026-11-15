@@ -86,7 +86,7 @@ jobs:
         env:
           SPOX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          gradle -p android assembleRelease --no-daemon
+          gradle -p android :app:assembleRelease --no-daemon
           cp android/app/build/outputs/apk/release/app-release.apk SpoX.apk
       - name: Add to the release
         uses: softprops/action-gh-release@v2
