@@ -48,6 +48,68 @@ static struct bpf filter[] = {
     RET(0x7ff00000), // trace
 };
 
+static void out(const char *s);
+static void num(long v);
+static int starts(const char *s, const char *p);
+
+// SPOXRUN_LOG=1: also stop on network calls and write what the program does (for finding problems)
+static struct bpf filter_log[] = {
+    LD(4), JEQ(0xC00000B7, 1, 0), RET(0x7fff0000),
+    LD(0),
+    JEQ(56, 9, 0), JEQ(79, 8, 0), JEQ(291, 7, 0), JEQ(48, 6, 0), JEQ(439, 5, 0),
+    JEQ(198, 4, 0),  // socket
+    JEQ(203, 3, 0),  // connect
+    JEQ(206, 2, 0),  // sendto
+    JEQ(200, 1, 0),  // bind
+    RET(0x7fff0000),
+    RET(0x7ff00000),
+};
+static int logging = 0, logged = 0;
+
+static void hex(u64 v) { char b[19] = "0x"; int i = 2; for (int sh = 28; sh >= 0; sh -= 4) b[i++] = "0123456789abcdef"[(v >> sh) & 15]; b[i] = 0; out(b); }
+
+static int peek(long pid, u64 addr, void *dst, int n) {
+    unsigned char *d = dst;
+    for (int i = 0; i < n; i += 8) {
+        u64 w;
+        if (sys(PTRACE, 2, pid, (long)(addr + i), (long)&w, 0) != 0) return i;
+        for (int j = 0; j < 8 && i + j < n; j++) d[i + j] = ((unsigned char *)&w)[j];
+    }
+    return n;
+}
+
+static void addr(long pid, u64 a) {
+    unsigned char sa[16];
+    if (!a || peek(pid, a, sa, 16) < 8) { out(" (no address)"); return; }
+    int fam = sa[0] | sa[1] << 8;
+    if (fam == 2) { out(" "); for (int i = 4; i < 8; i++) { num(sa[i]); if (i < 7) out("."); } out(":"); num(sa[2] << 8 | sa[3]); }
+    else if (fam == 10) { out(" ipv6 port "); num(sa[2] << 8 | sa[3]); }
+    else if (fam == 1) out(" (unix socket)");
+    else if (fam == 16) out(" (netlink)");
+    else { out(" family "); num(fam); }
+}
+
+static void trace(long pid, u64 *r) {
+    if (!logging || logged >= 120) return;
+    long nr = r[8];
+    char p[96]; p[0] = 0;
+    if (nr == 206 && !r[4]) return;                       // sendto on a connected socket: skip
+    if (nr == 56 || nr == 79 || nr == 291 || nr == 48 || nr == 439) {
+        int n = peek(pid, r[1], p, 95); p[n] = 0;
+        for (int i = 0; i < n && p[i]; i++) if (p[i] < 32) p[i] = '?';
+        if (p[0] != '/' || starts(p, "/data/")) return;   // the program's own files
+    }
+    logged++;
+    out("[trace] ");
+    if (nr == 198) { out("socket family "); num(r[0]); out(" type "); num(r[1] & 0xff); }
+    else if (nr == 203) { out("connect"); addr(pid, r[1]); }
+    else if (nr == 206) { out("sendto"); addr(pid, r[4]); }
+    else if (nr == 200) { out("bind"); addr(pid, r[1]); }
+    else { out(nr == 56 ? "open " : "look "); out(p); }
+    out("\n");
+    if (logged == 120) out("[trace] (enough)\n");
+}
+
 static int starts(const char *s, const char *p) { while (*p) if (*s++ != *p++) return 0; return 1; }
 
 static void out(const char *s) { int n = 0; while (s[n]) n++; sys(WRITE, 2, (long)s, n, 0, 0); }
@@ -79,7 +141,10 @@ __attribute__((used)) void start_c(long *sp) {
     if (argc < 2) { out("usage: spoxrun program [args...]\n"); sys(EXIT, 2, 0, 0, 0, 0); }
 
     const char *etc = 0;
-    for (char **e = envp; *e; e++) if (starts(*e, "SPOXRUN_ETC=")) etc = *e + 12;
+    for (char **e = envp; *e; e++) {
+        if (starts(*e, "SPOXRUN_ETC=")) etc = *e + 12;
+        if (starts(*e, "SPOXRUN_LOG=1")) logging = 1;
+    }
     if (etc) {
         long fd = sys(OPENAT, -100, (long)etc, 0x200000 /* O_PATH */ | 0x4000 /* O_DIRECTORY */, 0, 0);
         if (fd >= 0) { sys(DUP3, fd, ETC_FD, 0, 0, 0); if (fd != ETC_FD) sys(57 /* close */, fd, 0, 0, 0, 0); }
@@ -91,6 +156,7 @@ __attribute__((used)) void start_c(long *sp) {
         sys(PTRACE, 0 /* TRACEME */, 0, 0, 0, 0);
         if (etc) {
             struct { unsigned short len; struct bpf *f; } prog = { sizeof filter / sizeof filter[0], filter };
+            if (logging) { prog.len = sizeof filter_log / sizeof filter_log[0]; prog.f = filter_log; }
             sys(PRCTL, 38 /* NO_NEW_PRIVS */, 1, 0, 0, 0);
             long r = sys(SECCOMP, 1 /* SET_MODE_FILTER */, 0, (long)&prog, 0, 0);
             if (r < 0) { out("[spoxrun] seccomp filter not allowed "); num(r); out("\n"); }
@@ -123,6 +189,7 @@ __attribute__((used)) void start_c(long *sp) {
             u64 regs[34];
             struct { void *base; u64 len; } iov = { regs, sizeof regs };
             if (sys(PTRACE, 0x4204, t, 1, (long)&iov, 0) == 0) {
+                trace(t, regs);
                 u64 w = 0;
                 if (sys(PTRACE, 2 /* PEEKDATA */, t, (long)regs[1], (long)&w, 0) == 0) {
                     const char *c = (const char *)&w;

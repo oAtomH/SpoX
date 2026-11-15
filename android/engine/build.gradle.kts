@@ -16,8 +16,8 @@ android {
         // 28 on purpose: Android only lets apps that target 28 or lower run a program they
         // downloaded themselves (the same trick Termux uses)
         targetSdk = 28
-        versionName = "0.6"
-        versionCode = 6
+        versionName = "0.7"
+        versionCode = 7
     }
 
     val ks = System.getenv("SPOX_KEYSTORE_FILE")

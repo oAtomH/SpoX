@@ -41,7 +41,7 @@ class EngineActivity : Activity() {
     private lateinit var liveBtn: Button
     private val report = StringBuilder()
     private val soloistUrl = "https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz"
-    private val version = "0.6"
+    private val version = "0.7"
 
     private val prefs get() = getSharedPreferences("engine", 0)
     private val dir get() = File(filesDir, "soloist")
@@ -154,7 +154,9 @@ class EngineActivity : Activity() {
         if (force || !File(lib, "ld-linux-aarch64.so.1").exists() || !File(root, "usr/bin/getent").exists()) {
             log("\n== Linux libraries (Debian 13, arm64) ==")
             root.mkdirs()
-            getDebs(listOf("libc6", "libgcc-s1", "libatomic1", "libc-bin"), root)
+            val had = File(lib, "ld-linux-aarch64.so.1").exists()
+            runCatching { getDebs(listOf("libc6", "libgcc-s1", "libatomic1", "libc-bin"), root) }
+                .onFailure { if (had) log("(Debian not reachable right now, keeping the libraries already here)") else throw it }
             File(loaderPath()).setExecutable(true, false)
         }
         runCatching {
@@ -173,7 +175,26 @@ class EngineActivity : Activity() {
             cm.getLinkProperties(cm.activeNetwork)?.dnsServers?.mapNotNull { it.hostAddress?.substringBefore('%') }
         }.getOrNull().orEmpty().filter { ':' !in it }.take(2) + listOf("1.1.1.1", "8.8.8.8")
         File(etc, "resolv.conf").writeText(dns.distinct().take(3).joinToString("") { "nameserver $it\n" } + "options timeout:2 attempts:2\n")
-        File(etc, "hosts").writeText("127.0.0.1 localhost\n::1 localhost\n")
+        // Spotify's main server names, looked up by Android: Soloist finds them even if its own
+        // lookups fail
+        val names = listOf("apresolve.spotify.com", "spclient.wg.spotify.com", "dealer.spotify.com",
+            "login5.spotify.com", "clienttoken.spotify.com", "api.spotify.com", "accounts.spotify.com",
+            "ap.spotify.com", "ap-gew1.spotify.com", "ap-gew4.spotify.com", "ap-gue1.spotify.com", "ap-gae2.spotify.com",
+            "gew1-spclient.spotify.com", "gew4-spclient.spotify.com", "gue1-spclient.spotify.com", "gae2-spclient.spotify.com",
+            "gew1-dealer.spotify.com", "gew4-dealer.spotify.com", "gue1-dealer.spotify.com",
+            "audio4-ak-spotify-com.akamaized.net", "audio-ak-spotify-com.akamaized.net", "audio-ak.spotify.com.edgesuite.net",
+            "audio4-fa.scdn.co", "audio-fa.scdn.co", "heads-fa.scdn.co", "heads4-ak-spotify-com.akamaized.net",
+            "i.scdn.co", "seektables.scdn.co", "spotify.com", "www.spotify.com", "open.spotify.com",
+            "soloist-builds.spotifycdn.com", "event-sender.spotify.com")
+        val lines = StringBuilder("127.0.0.1 localhost\n::1 localhost\n")
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+        val found = names.map { n -> pool.submit<String?> {
+            runCatching { java.net.InetAddress.getAllByName(n).firstOrNull { it is java.net.Inet4Address }?.hostAddress }.getOrNull()?.let { "$it $n\n" }
+        } }.mapNotNull { runCatching { it.get(6, TimeUnit.SECONDS) }.getOrNull() }
+        pool.shutdownNow()
+        found.forEach { lines.append(it) }
+        File(etc, "hosts").writeText(lines.toString())
+        log("hosts: ${found.size} of ${names.size} Spotify servers looked up")
         File(etc, "nsswitch.conf").writeText("passwd: files\ngroup: files\nhosts: files dns\n")
         val uid = android.system.Os.getuid()
         File(etc, "passwd").writeText("spox:x:$uid:$uid:SpoX:${filesDir.path}:/bin/sh\n")
@@ -198,6 +219,7 @@ class EngineActivity : Activity() {
     }
 
     private fun linuxEnv() = mapOf(
+        "SPOXRUN_LOG" to (if (tracing) "1" else "0"),
         "SPOXRUN_ETC" to File(root, "etc").path,
         "HOME" to filesDir.path,
         "TMPDIR" to cacheDir.path,
@@ -209,6 +231,7 @@ class EngineActivity : Activity() {
     // ---- 2. live run ----------------------------------------------------------------------
 
     @Volatile private var live: Process? = null
+    @Volatile private var tracing = false
     private var multicast: WifiManager.MulticastLock? = null
 
     private fun startLive() {
@@ -223,6 +246,7 @@ class EngineActivity : Activity() {
                 prepare(force = false)
                 data.mkdirs(); cache.mkdirs()
                 File(data, "ws.port").delete()
+                tracing = true
                 // Spotify Connect finds devices by multicast on the Wi-Fi; Android filters it unless asked
                 multicast = getSystemService(WifiManager::class.java).createMulticastLock("spox").apply { setReferenceCounted(false); acquire() }
                 val cmd = listOf(run.path, loaderPath(), "--library-path", lib.path, bin.path,
@@ -247,6 +271,7 @@ class EngineActivity : Activity() {
                 log("failed: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 live = null
+                tracing = false
                 busy = false
                 multicast?.release()
                 unannounce()
