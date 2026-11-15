@@ -4,3 +4,8 @@ SpoX-Setup-*.exe
 data/
 portable.txt
 __pycache__/
+android/build/
+android/app/build/
+android/.gradle/
+*.jks
+android-signing/
