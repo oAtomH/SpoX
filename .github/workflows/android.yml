@@ -42,6 +42,10 @@ jobs:
           ls -la SpoX.apk
           echo "engine helpers inside: $(unzip -l SpoX.apk | grep -c 'assets/engine/')"
           echo "skin files inside: $(unzip -l SpoX.apk | grep -c 'assets/skin/')"
+      - name: Remove old files from the preview page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete-asset android-preview SpoX-Engine.apk -y -R ${{ github.repository }} || true
       # a "preview" pre-release to install on the phone straight from GitHub (the normal
       # releases stay what the Windows app updates from)
       - uses: softprops/action-gh-release@v2
