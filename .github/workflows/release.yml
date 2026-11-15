@@ -1,10 +1,12 @@
 # Builds SpoX on GitHub's Windows machines and publishes a release.
-# Start it by pushing a tag like v0.5.1 (or run it by hand from the Actions tab).
+# It runs by itself whenever the version in Cargo.toml changes on main
+# (or by hand: Actions tab > Release > Run workflow). Each version is released once.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["Cargo.toml"]
   workflow_dispatch:
 
 permissions:
@@ -16,28 +18,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build SpoX.exe
-        run: cargo build --release
-
-      - name: Copy exe
-        shell: pwsh
-        run: Copy-Item target\release\spox.exe SpoX.exe
-
-      - name: Build the setup wizard (Inno Setup)
+      - name: Read version
+        id: v
         shell: pwsh
         run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          gh release view "v$ver" 2>$null
+          if ($LASTEXITCODE -eq 0) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
+          exit 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.v.outputs.exists == 'false'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.v.outputs.exists == 'false'
+
+      - name: Build SpoX.exe
+        if: steps.v.outputs.exists == 'false'
+        run: cargo build --release
+
+      - name: Build the setup wizard (Inno Setup)
+        if: steps.v.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          Copy-Item target\release\spox.exe SpoX.exe
           choco install innosetup -y --no-progress
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q installer\SpoX.iss
 
       - name: Publish release
+        if: steps.v.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.v.outputs.version }}
+          name: SpoX ${{ steps.v.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: |
             SpoX.exe
             SpoX-Setup-*.exe
           generate_release_notes: true
-          draft: false
