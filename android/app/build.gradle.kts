@@ -51,6 +51,8 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    // SpoX isn't on Google Play (it updates from GitHub), so Play's target-level rule doesn't apply
+    lint { disable += "ExpiredTargetSdkVersion" }
     sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/skinAssets"))
 }
 
