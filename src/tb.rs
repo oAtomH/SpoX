@@ -56,7 +56,6 @@ struct UiState {
     pending_text_click: Option<Instant>,
     osd: Option<(String, Instant)>,
     vol_shown: Option<Instant>,
-    passthrough: bool,
     t0: Instant,
 }
 
@@ -71,7 +70,7 @@ pub fn new_shared(skin: Arc<Skin>, live: Arc<Mutex<Play>>, solo: Sender<String>,
         cfg,
         liked: Mutex::new((String::new(), false)),
         art: Mutex::new(ArtState::default()),
-        ui: Mutex::new(UiState { pressed: None, pending_text_click: None, osd: None, vol_shown: None, passthrough: false, t0: Instant::now() }),
+        ui: Mutex::new(UiState { pressed: None, pending_text_click: None, osd: None, vol_shown: None, t0: Instant::now() }),
         idle_icon: AtomicBool::new(false),
         fs_info: AtomicBool::new(false),
         app_actions: Mutex::new(Vec::new()),
@@ -196,15 +195,8 @@ pub fn ui(sh: &TbShared, ctx: &egui::Context) {
     sh.idle_icon.store(icon_mode, Ordering::SeqCst);
     let info_only = sh.fs_info.load(Ordering::SeqCst);
 
-    // fullscreen "info only": clicks fall through to the game / video below
-    {
-        let mut u = sh.ui.lock().unwrap();
-        if u.passthrough != info_only {
-            u.passthrough = info_only;
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(info_only));
-        }
-    }
-
+    // fullscreen "info only": no buttons and clicks do nothing. (No Windows click-through: switching
+    // that on and off could leave the window invisible after leaving a fullscreen app.)
     let screen = ctx.screen_rect();
     // integer scale from the window height (the watcher sizes the window to 16 * scale)
     let s = (screen.height() / 16.0).floor().max(1.0);

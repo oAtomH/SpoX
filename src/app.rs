@@ -2926,7 +2926,9 @@ impl App {
                     self.right_used = true;
                 }
             }
-            self.text(&cp, o, s, lr[0] + 9.0, y + 1.0, label, txt);
+            let vw0 = if value.starts_with('#') { 20.0 } else { self.tw(value) };
+            let label = self.fit(label, lr[2] - vw0 - 16.0);
+            self.text(&cp, o, s, lr[0] + 9.0, y + 1.0, &label, txt);
             // colours: a swatch instead of a hex code
             if let Some(c) = value.starts_with('#').then(|| crate::skin::parse_color(value)).flatten() {
                 self.fill(&cp, o, s, lr[0] + lr[2] - 18.0, y + 1.0, 16.0, 7.0, Color32::from_rgb(8, 8, 9));
@@ -3018,13 +3020,15 @@ impl App {
         let mut y = lr[1] + 1.0;
         // step text, link label, url, field index
         let steps: [(&str, &str, &str, Option<usize>); 3] = [
-            ("1. Soloist API key (Spotify Premium)", "[open page]", "https://developer.spotify.com/documentation/soloist", Some(0)),
-            ("2. Client ID: Create app > add the URI below > Web API", "[open dashboard]", "https://developer.spotify.com/dashboard", Some(1)),
-            ("3. Last.fm key: optional, more new songs", "[get key]", "https://www.last.fm/api/account/create", Some(2)),
+            ("1. Soloist API key (needs Premium)", "[get key]", "https://developer.spotify.com/documentation/soloist", Some(0)),
+            ("2. Client ID (new app, tick Web API)", "[dashboard]", "https://developer.spotify.com/dashboard", Some(1)),
+            ("3. Last.fm key (optional)", "[get key]", "https://www.last.fm/api/account/create", Some(2)),
         ];
         for (n, (label, ltxt, url, field)) in steps.iter().enumerate() {
-            self.text(p, o, s, x, y, label, txt);
             let lw = self.tw(ltxt);
+            // never under the link: cut the label to the space that's left
+            let label = self.fit(label, lr[2] - lw - 8.0);
+            self.text(p, o, s, x, y, &label, txt);
             let lx = lr[0] + lr[2] - lw - 1.0;
             let over_link = inp.over(lx, y - 1.0, lw, lh);
             self.text(p, o, s, lx, y, ltxt, if over_link { self.skin.color("lyric_current") } else { link });
@@ -3062,7 +3066,7 @@ impl App {
             }
             if n == 1 {
                 // redirect URI right under the Client ID step
-                let uw = self.text(p, o, s, x, y, web::REDIRECT_URI, dim);
+                let uw = self.text(p, o, s, x, y, &format!("Redirect URI: {}", web::REDIRECT_URI), dim);
                 let cw = self.text(p, o, s, x + uw + 6.0, y, "[copy]", link);
                 if inp.over(x, y - 1.0, uw + 6.0 + cw, lh) {
                     self.hover_now = Some("row:Paste this as the Redirect URI in your Spotify app".into());
@@ -3082,7 +3086,8 @@ impl App {
                 self.save_setup();
             }
         }
-        self.text(p, o, s, x + w1 + 8.0, y, "4. Then once: Spotify app > Devices > SpoX", dim);
+        let tip = self.fit("4. Then once: Spotify > Devices > SpoX", lr[2] - w1 - 10.0);
+        self.text(p, o, s, x + w1 + 8.0, y, &tip, dim);
     }
 
     /// Profile picture with a 1 px outline. `small` = the 8 px version. No picture: a pixel person.
