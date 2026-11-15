@@ -1,0 +1,200 @@
+{
+  "_readme": "Positions are in 1x pixels. Each element's size comes from its PNG. Colors are #RRGGBB. Press F5 in SpoX to reload the skin. Active buttons (playing, paused, shuffle on, repeat on, panel open, pinned) show their _down image.",
+  "main_size": [
+    292,
+    112
+  ],
+  "panel_size": [
+    292,
+    128
+  ],
+  "pos": {
+    "btn_menu": [
+      4,
+      4
+    ],
+    "btn_pin": [
+      256,
+      4
+    ],
+    "btn_min": [
+      268,
+      4
+    ],
+    "btn_close": [
+      280,
+      4
+    ],
+    "timer": [
+      72,
+      24
+    ],
+    "minus": [
+      64,
+      24
+    ],
+    "btn_panel": [
+      140,
+      60
+    ],
+    "btn_mini": [
+      260,
+      92
+    ],
+    "btn_prev": [
+      8,
+      92
+    ],
+    "btn_play": [
+      36,
+      92
+    ],
+    "btn_pause": [
+      64,
+      92
+    ],
+    "btn_next": [
+      92,
+      92
+    ],
+    "btn_shuffle": [
+      120,
+      92
+    ],
+    "btn_repeat": [
+      148,
+      92
+    ],
+    "btn_like": [
+      176,
+      92
+    ],
+    "btn_add": [
+      204,
+      92
+    ],
+    "btn_link": [
+      232,
+      92
+    ]
+  },
+  "rect": {
+    "drag": [
+      0,
+      0,
+      292,
+      16
+    ],
+    "art": [
+      12,
+      24,
+      48,
+      48
+    ],
+    "vis": [
+      64,
+      44,
+      68,
+      28
+    ],
+    "title": [
+      144,
+      24,
+      136,
+      10
+    ],
+    "artist": [
+      144,
+      34,
+      136,
+      10
+    ],
+    "album": [
+      144,
+      44,
+      136,
+      10
+    ],
+    "vol": [
+      168,
+      64,
+      116,
+      8
+    ],
+    "seek": [
+      8,
+      80,
+      276,
+      8
+    ]
+  },
+  "colors": {
+    "title": "#5BE38E",
+    "info": "#3E9A65",
+    "digits": "#5BE38E",
+    "list": "#9FD9B4",
+    "list_dim": "#4F7A60",
+    "list_current": "#5BE38E",
+    "list_selected_bg": "#1C3527",
+    "header": "#C3C6CC",
+    "lyric": "#4F7A60",
+    "lyric_current": "#E9F27A",
+    "vis_peak": "#C9D6CF",
+    "menu_bg": "#1B1C1F",
+    "menu_text": "#C3C6CC",
+    "menu_hover": "#1C3527",
+    "input_bg": "#050506",
+    "input_text": "#5BE38E",
+    "lyric_next": "#5A5D62",
+    "username": "#8A8D94",
+    "album": "#4F7A60",
+    "tb_title": "#5BE38E",
+    "tb_artist": "#3E9A65",
+    "anim_bg": "#0A0A0B"
+  },
+  "font": {
+    "cell": [
+      8,
+      16
+    ],
+    "first": 32,
+    "cols": 16,
+    "top_rows": 2,
+    "space": 4,
+    "spacing": 1,
+    "line_height": 10
+  },
+  "digits": {
+    "width": 12,
+    "colon_width": 4,
+    "ghost": 0.13,
+    "order": "0123456789:- "
+  },
+  "vis": {
+    "bars": 17,
+    "bar_width": 3,
+    "gap": 1
+  },
+  "art_pixels": 24,
+  "uppercase_display": false,
+  "timer_blink_when_paused": true,
+  "art_colors": 10,
+  "accordion": {
+    "header_h": 20,
+    "content_h": 96
+  },
+  "tooltips": {
+    "_note": "Override any tooltip text here, e.g. \"btn_play\": \"Play it!\""
+  },
+  "taskbar": {
+    "art_pixels": 16,
+    "status_icon": true,
+    "bezel": 1,
+    "dim": 0.45,
+    "tb_bg_corner": 4,
+    "tb_frame_corner": 2,
+    "_note": "bezel = invisible padding around the text (1x px). tb_frame.png is drawn on top of everything (transparent middle). dim = brightness when paused/idle."
+  },
+  "cfg_version": 5,
+  "anim_ms": 420
+}

@@ -1,0 +1,43 @@
+# Builds SpoX on GitHub's Windows machines and publishes a release.
+# Start it by pushing a tag like v0.5.1 (or run it by hand from the Actions tab).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build SpoX.exe
+        run: cargo build --release
+
+      - name: Copy exe
+        shell: pwsh
+        run: Copy-Item target\release\spox.exe SpoX.exe
+
+      - name: Build the setup wizard (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q installer\SpoX.iss
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SpoX.exe
+            SpoX-Setup-*.exe
+          generate_release_notes: true
+          draft: false

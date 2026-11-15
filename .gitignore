@@ -1,0 +1,6 @@
+/target
+SpoX.exe
+SpoX-Setup-*.exe
+data/
+portable.txt
+__pycache__/
