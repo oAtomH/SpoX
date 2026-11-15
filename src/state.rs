@@ -45,6 +45,7 @@ pub enum Ev {
     /// a song was added to a playlist (so the add menu can mark it)
     Added { playlist: String, uri: String },
     Removed { playlist: String, uri: String, key: String },
+    UpdateReady(String),
     /// smart shuffle state: on/off, songs it picked as "new", how many new songs are waiting
     Smart { on: bool, new_uris: Vec<String>, #[allow(dead_code)] pool: usize },
 }

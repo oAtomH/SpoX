@@ -193,3 +193,7 @@ Turn on **Settings → Discord → Show song on Discord**. Your profile then sho
 - **Friends with Spotify** click **Listen on Spotify** to open the same song.
 - **Friends with SpoX** click **Join** (or *Ask to join*, which SpoX accepts by itself). Their SpoX jumps into the same song at the same moment. It's a one-time sync, not a live session: after that song, each of you carries on separately.
 - **Discord's own "Listen Along"** (the one that keeps you in sync) is only for Spotify's own Discord status. SpoX plays through your Spotify account, so if you link Spotify under *Discord → Settings → Connections*, Discord can show that status as well. Spotify users can then Listen Along with you, and you can Listen Along with them: it plays on SpoX if SpoX is your active Spotify device. This is Discord's own feature, so it may only work when your Spotify desktop or phone app is the device playing.
+
+## Updates (v0.5.4)
+
+From v0.5.4 on, SpoX updates itself. It checks GitHub when it starts (and every 6 hours), downloads the new version in the background and swaps it in. The menu then shows **Restart to update**; otherwise the new version starts the next time you open SpoX. Your settings, sign-in and skin stay as they are. Turn it off in Settings → App → Update automatically.

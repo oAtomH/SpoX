@@ -105,6 +105,7 @@ pub struct App {
     muted_from: Option<u8>,
     collapse: Option<Collapse>,
     install_page: bool,
+    update_ready: Option<String>,
     pl_drop: bool,
     drop_scroll: usize,
     drop_fresh: bool,
@@ -219,6 +220,7 @@ impl App {
         }
         let tb_shared = Some(crate::tb::new_shared(skin.clone(), solo.live.clone(), solo.cmd.clone(), web.clone(), cfg.clone()));
         crate::discord::start(cfg.clone(), solo.live.clone(), solo.cmd.clone());
+        crate::update::start(cfg.clone(), tx.clone());
         if let Some(t) = &tb_shared {
             crate::tb::start_watcher(t.clone(), ctx.clone());
         }
@@ -273,6 +275,7 @@ impl App {
             muted_from: None,
             collapse: None,
             install_page: false,
+            update_ready: None,
             pl_drop: false,
             drop_scroll: 0,
             drop_fresh: false,
@@ -485,6 +488,10 @@ impl App {
                         self.select_playlist(p);
                     }
                 }
+            }
+            Ev::UpdateReady(v) => {
+                self.update_ready = Some(v.clone());
+                self.osd(format!("SPOX {} READY: MENU > RESTART", v));
             }
             Ev::Removed { playlist, uri, key } => {
                 if let Some(set) = self.contents.get_mut(&playlist) {
@@ -1329,9 +1336,13 @@ impl App {
             if over {
                 self.hover_now = Some("btn_menu".into());
             }
-            let pressed_now = over && inp.down;
+            // same press/release bookkeeping as a normal button, so the menu doesn't close again at once
+            if inp.pressed && over && self.pressed.is_none() && self.drag == Drag::None {
+                self.pressed = Some("btn_menu");
+            }
+            let pressed_now = over && inp.down && self.pressed == Some("btn_menu");
             self.draw_pfp(p, o, s, x, y + if pressed_now { 1.0 } else { 0.0 }, w, true);
-            over && inp.released && self.pressed.is_none() && self.drag == Drag::None
+            over && inp.released && self.pressed == Some("btn_menu")
         } else {
             self.button(p, o, s, inp, 0.0, "btn_menu", None)
         };
@@ -2628,6 +2639,7 @@ impl App {
             ("Show song on Discord".into(), onoff(c.discord), 47),
             ("Friends with SpoX can join".into(), onoff(c.discord_join), 78),
             ("App".into(), String::new(), 0),
+            ("Update automatically".into(), onoff(c.auto_update), 63),
             ("Memory (RAM)".into(), self.mem_text.clone(), 61),
             ("Install SpoX for this user".into(), if crate::install::is_installed() { "installed".into() } else { "install...".into() }, 62),
             ("Account".into(), String::new(), 0),
@@ -2804,6 +2816,7 @@ impl App {
                 46 => c.tb_show_when = cycle(&c.tb_show_when, &["always", "hidden"]),
                 47 => c.discord = !c.discord,
                 78 => c.discord_join = !c.discord_join,
+                63 => c.auto_update = !c.auto_update,
                 20 => c.smart_ratio = cycle(&c.smart_ratio.to_string(), &["25", "50", "75", "100"]).parse().unwrap_or(50),
                 21 => c.smart_avoid_artist = !c.smart_avoid_artist,
                 30 => c.tb_on = !c.tb_on,
@@ -3110,6 +3123,9 @@ impl App {
         if !self.signed_in || !scopes_ok {
             items.push(((if !has_client { "Set up Spotify keys..." } else if self.signed_in { "Sign in again (new features)" } else { "Sign in to Spotify" }).to_string(), 4));
         }
+        if let Some(v) = &self.update_ready {
+            items.push((format!("Restart to update ({})", v), 20));
+        }
         items.push(("Settings...".into(), 5));
         items.push(("Open skin folder".into(), 7));
         items.push(("Quit + stop Soloist".into(), 8));
@@ -3145,6 +3161,12 @@ impl App {
         }
         if let Some(id) = clicked {
             match id {
+                20 => {
+                    // hand over to the new version; this one closes without stopping the music
+                    crate::update::restart();
+                    self.quitting_for_install = true;
+                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 0 => {
                     let mut c = self.cfg.lock().unwrap();
                     c.scale = if c.scale >= 4 { 1 } else { c.scale + 1 };

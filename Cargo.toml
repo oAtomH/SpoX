@@ -1,6 +1,6 @@
 [package]
 name = "spox"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "SpoX - a tiny pixel-art Spotify mini player built on Spotify Soloist"
 license = "MIT"

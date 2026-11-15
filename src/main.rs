@@ -13,6 +13,7 @@ mod soloist;
 mod smart;
 mod state;
 mod tb;
+mod update;
 mod vis;
 mod web;
 
