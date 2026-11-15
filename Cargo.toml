@@ -1,6 +1,6 @@
 [package]
 name = "spox"
-version = "0.5.7"
+version = "0.6.0"
 edition = "2021"
 description = "SpoX - a tiny pixel-art Spotify mini player built on Spotify Soloist"
 license = "MIT"
@@ -23,7 +23,7 @@ souvlaki = "0.8"
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Security", "Win32_System_Pipes"] }
 ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }
 native-tls = "0.2"
 

@@ -503,6 +503,8 @@ pub fn ui(sh: &TbShared, ctx: &egui::Context) {
     if osd_on {
         ctx.request_repaint_after(Duration::from_millis(100));
     }
+    let tb_pace = if animate || osd_on { 70 } else if play.status == "playing" { 1000 } else { 0 };
+    crate::desktop::TB_PACE_MS.store(tb_pace, Ordering::SeqCst);
     if animate {
         // marquee moves 1 px per step: repaint only as often as needed
         ctx.request_repaint_after(Duration::from_millis(70));
@@ -722,6 +724,7 @@ mod win {
                         ShowWindowAsync(me, SW_HIDE);
                     }
                     last = Some((0, 0, 0, 0, false));
+                    crate::desktop::TB_PACE_MS.store(0, Ordering::SeqCst);
                     continue;
                 }
                 let (bw, bh) = super::base_size(&sh.cfg, sh.idle_icon.load(Ordering::SeqCst), info);

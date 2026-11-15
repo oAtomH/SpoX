@@ -297,7 +297,29 @@ impl Api {
     }
 
     fn me(&self) {
-        let Ok(me) = self.get("/me") else { return };
+        let me = match self.get("/me") {
+            Ok(v) => v,
+            Err(e) => {
+                web_log(&format!("/me failed: {}", e));
+                // no profile access: at least the name, from the owner of one of your playlists
+                let name = self
+                    .get("/me/playlists?limit=20")
+                    .ok()
+                    .and_then(|v| {
+                        let uid = self.user_id();
+                        v.get("items")?.as_array()?.iter().find_map(|p| {
+                            let o = p.get("owner")?;
+                            (uid.is_empty() || o.get("id")?.as_str()? == uid).then(|| o.get("display_name")?.as_str().map(|s| s.to_string()))?
+                        })
+                    })
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    let _ = self.ev.send(Ev::Profile { name, img: None, small: None });
+                    self.ctx.request_repaint();
+                }
+                return;
+            }
+        };
         let name = me.get("display_name").and_then(|x| x.as_str()).or_else(|| me.get("id").and_then(|x| x.as_str())).unwrap_or("").to_string();
         // smallest profile picture, turned into 12x12 pixel art
         let url = me
@@ -611,4 +633,16 @@ fn load_cached_playlists() -> Option<Vec<Playlist>> {
             })
             .collect(),
     )
+}
+
+/// Small log for Spotify errors (cache\\web.log), to see why something didn't load.
+pub fn web_log(line: &str) {
+    use std::io::Write as _;
+    let p = crate::config::cache_dir().join("web.log");
+    if std::fs::metadata(&p).map(|m| m.len() > 64 * 1024).unwrap_or(false) {
+        let _ = std::fs::remove_file(&p);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "{} {}", crate::config::now_ms(), line);
+    }
 }

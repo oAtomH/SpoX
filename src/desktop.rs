@@ -316,3 +316,40 @@ unsafe extern "system" fn no_redraw_on_move(
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
+
+/// How often the main window must redraw right now (ms, 0 = only on events). A small thread
+/// enforces it, so the visualizer, clock and lyrics never wait for a mouse move to wake egui up.
+pub static PACE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Same for the taskbar player.
+pub static TB_PACE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn start_pacer(ctx: egui::Context, pace: &'static std::sync::atomic::AtomicU64, vp: egui::ViewportId) {
+    std::thread::Builder::new()
+        .name("pacer".into())
+        .spawn(move || loop {
+            let ms = pace.load(Ordering::SeqCst);
+            if ms == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            ctx.request_repaint_of(vp);
+        })
+        .ok();
+}
+
+/// Window really not visible (hidden to tray or minimized), asked from Windows itself.
+pub fn window_unseen() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+        let h = hwnd();
+        if h != 0 {
+            return IsWindowVisible(h as _) == 0 || IsIconic(h as _) != 0;
+        }
+        return false;
+    }
+    #[cfg(not(windows))]
+    HIDDEN.load(Ordering::SeqCst)
+}

@@ -9,8 +9,8 @@ use crate::soloist::{command, command_with};
 use crate::state::Play;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,26 +20,54 @@ pub const APP_ID: &str = "1571562342980788294";
 /// Where the SpoX icon and the "Get SpoX" button lead.
 pub const LINK: &str = "https://github.com/oAtomH/SpoX";
 
-type Reader = Box<dyn Read + Send>;
-type Writer = Box<dyn Write + Send>;
+/// The pipe to Discord. One thread does everything: on Windows a read waiting on a pipe would also
+/// block every write on it (that's what kept the status from ever being sent before).
+trait Pipe: Read + Write + Send {
+    /// bytes waiting to be read (never blocks)
+    fn available(&mut self) -> usize;
+}
 
-fn connect() -> Option<(Reader, Writer)> {
+#[cfg(windows)]
+impl Pipe for std::fs::File {
+    fn available(&mut self) -> usize {
+        use std::os::windows::io::AsRawHandle;
+        let mut n: u32 = 0;
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(self.as_raw_handle() as _, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut n, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            usize::MAX // broken pipe: let the read fail so we reconnect
+        } else {
+            n as usize
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Pipe for std::os::unix::net::UnixStream {
+    // SpoX ships for Windows; on other systems replies are simply not read
+    fn available(&mut self) -> usize {
+        0
+    }
+}
+
+type Writer = Box<dyn Pipe>;
+type Reader = Box<dyn Pipe>;
+
+fn connect() -> Option<Box<dyn Pipe>> {
     for i in 0..10 {
         #[cfg(windows)]
         {
             if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(format!(r"\\.\pipe\discord-ipc-{}", i)) {
-                if let Ok(r) = f.try_clone() {
-                    return Some((Box::new(r), Box::new(f)));
-                }
+                return Some(Box::new(f));
             }
         }
         #[cfg(unix)]
         {
             let base = std::env::var("XDG_RUNTIME_DIR").or_else(|_| std::env::var("TMPDIR")).unwrap_or_else(|_| "/tmp".into());
             if let Ok(s) = std::os::unix::net::UnixStream::connect(format!("{}/discord-ipc-{}", base, i)) {
-                if let Ok(r) = s.try_clone() {
-                    return Some((Box::new(r), Box::new(s)));
-                }
+                let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                return Some(Box::new(s));
             }
         }
         let _ = i;
@@ -198,20 +226,60 @@ fn join(solo: &Sender<String>, secret: &str) {
 
 /// One live connection to the Discord app.
 struct Conn {
-    w: Writer,
-    alive: Arc<AtomicBool>,
-    /// replies the reader wants written (accepting "Ask to join")
-    out: Receiver<Value>,
+    p: Box<dyn Pipe>,
 }
 
-fn open(cfg: &Shared, solo: &Sender<String>, no_join: &Arc<AtomicU8>) -> Option<Conn> {
-    let Some((mut r, mut w)) = connect() else {
-        log("Discord not running (no pipe)");
+impl Conn {
+    /// Handle everything Discord sent since last time (replies, someone joining). false = closed.
+    fn pump(&mut self, cfg: &Shared, solo: &Sender<String>, level: &Arc<AtomicU8>) -> bool {
+        loop {
+            let n = self.p.available();
+            if n == usize::MAX {
+                return false;
+            }
+            if n < 8 {
+                return true;
+            }
+            let Ok((op, v)) = read_frame(&mut self.p) else { return false };
+            if op == 2 {
+                log(&format!("Discord closed the connection: {}", v));
+                return false;
+            }
+            match v["evt"].as_str() {
+                Some("ACTIVITY_JOIN") => {
+                    if let Some(sec) = v["data"]["secret"].as_str() {
+                        log("a friend joined");
+                        join(solo, sec);
+                    }
+                }
+                Some("ACTIVITY_JOIN_REQUEST") => {
+                    // "Ask to join": say yes right away (it's just music)
+                    if cfg.lock().unwrap().discord_join {
+                        if let Some(uid) = v["data"]["user"]["id"].as_str() {
+                            let _ = write_frame(&mut self.p, 1, &json!({"cmd": "SEND_ACTIVITY_JOIN_INVITE", "args": {"user_id": uid}, "nonce": nonce()}));
+                        }
+                    }
+                }
+                Some("ERROR") if v["cmd"] == "SET_ACTIVITY" => {
+                    // refused: try again with fewer extras, and write down why (cache\discord.log)
+                    let l = level.fetch_add(1, Ordering::SeqCst);
+                    log(&format!("refused (level {}): {}", l, v["data"]["message"].as_str().unwrap_or("?")));
+                }
+                _ if v["cmd"] == "SET_ACTIVITY" => log("showing on your profile"),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn open() -> Option<Conn> {
+    let Some(mut p) = connect() else {
+        log("Discord isn't running");
         return None;
     };
-    write_frame(&mut w, 0, &json!({"v": 1, "client_id": APP_ID})).ok()?;
+    write_frame(&mut p, 0, &json!({"v": 1, "client_id": APP_ID})).ok()?;
     // first reply is READY (or a close with a reason)
-    match read_frame(&mut r) {
+    match read_frame(&mut p) {
         Ok((op, _)) if op != 2 => log("connected"),
         other => {
             log(&format!("handshake refused: {:?}", other.map(|x| x.1)));
@@ -219,43 +287,9 @@ fn open(cfg: &Shared, solo: &Sender<String>, no_join: &Arc<AtomicU8>) -> Option<
         }
     }
     for evt in ["ACTIVITY_JOIN", "ACTIVITY_JOIN_REQUEST"] {
-        let _ = write_frame(&mut w, 1, &json!({"cmd": "SUBSCRIBE", "evt": evt, "nonce": nonce()}));
+        let _ = write_frame(&mut p, 1, &json!({"cmd": "SUBSCRIBE", "evt": evt, "nonce": nonce()}));
     }
-    let alive = Arc::new(AtomicBool::new(true));
-    let (tx, out) = std::sync::mpsc::channel::<Value>();
-    let (alive2, no_join2, solo2, cfg2) = (alive.clone(), no_join.clone(), solo.clone(), cfg.clone());
-    // reader: replies + events (someone joins / asks to join)
-    std::thread::spawn(move || {
-        while let Ok((op, v)) = read_frame(&mut r) {
-            if op == 2 {
-                break;
-            }
-            match v["evt"].as_str() {
-                Some("ACTIVITY_JOIN") => {
-                    if let Some(sec) = v["data"]["secret"].as_str() {
-                        join(&solo2, sec);
-                    }
-                }
-                Some("ACTIVITY_JOIN_REQUEST") => {
-                    // "Ask to join": say yes right away (it's just music)
-                    if cfg2.lock().unwrap().discord_join {
-                        if let Some(uid) = v["data"]["user"]["id"].as_str() {
-                            let _ = tx.send(json!({"cmd": "SEND_ACTIVITY_JOIN_INVITE", "args": {"user_id": uid}, "nonce": nonce()}));
-                        }
-                    }
-                }
-                Some("ERROR") if v["cmd"] == "SET_ACTIVITY" => {
-                    // refused: try again with fewer extras, and write down why (cache\\discord.log)
-                    let l = no_join2.fetch_add(1, Ordering::SeqCst);
-                    log(&format!("level {} refused: {}", l, v["data"]));
-                }
-                _ if v["cmd"] == "SET_ACTIVITY" => log("activity set"),
-                _ => {}
-            }
-        }
-        alive2.store(false, Ordering::SeqCst);
-    });
-    Some(Conn { w, alive, out })
+    Some(Conn { p })
 }
 
 /// Background thread: keeps the presence in sync with what's playing and handles Join.
@@ -273,14 +307,14 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
             let mut last_send_at = Instant::now() - Duration::from_secs(60);
             let mut registered = false;
             loop {
-                std::thread::sleep(Duration::from_millis(1000));
+                std::thread::sleep(Duration::from_millis(500));
                 let (on, allow_join) = {
                     let c = cfg.lock().unwrap();
                     (c.discord, c.discord_join)
                 };
                 if !on || APP_ID.is_empty() {
                     if let Some(mut c) = conn.take() {
-                        let _ = write_frame(&mut c.w, 1, &json!({"cmd": "SET_ACTIVITY", "args": {"pid": std::process::id(), "activity": null}, "nonce": nonce()}));
+                        let _ = write_frame(&mut c.p, 1, &json!({"cmd": "SET_ACTIVITY", "args": {"pid": std::process::id(), "activity": null}, "nonce": nonce()}));
                     }
                     last_sent = None;
                     continue;
@@ -289,24 +323,23 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
                     registered = true;
                     register_launcher();
                 }
-                if conn.as_ref().map(|c| !c.alive.load(Ordering::SeqCst)).unwrap_or(false) {
-                    conn = None; // Discord closed: try again later
+                if let Some(c) = conn.as_mut() {
+                    if !c.pump(&cfg, &solo, &no_join) {
+                        conn = None; // Discord closed: try again later
+                    }
                 }
                 if conn.is_none() {
                     if last_try.elapsed() < Duration::from_secs(15) {
                         continue;
                     }
                     last_try = Instant::now();
-                    conn = open(&cfg, &solo, &no_join);
+                    conn = open();
                     last_sent = None;
                     if conn.is_none() {
                         continue;
                     }
                 }
                 let c = conn.as_mut().unwrap();
-                while let Ok(m) = c.out.try_recv() {
-                    let _ = write_frame(&mut c.w, 1, &m);
-                }
                 let play = live.lock().unwrap().clone();
                 let level = no_join.load(Ordering::SeqCst).min(3);
                 let joinable = allow_join && level == 0;
@@ -330,7 +363,7 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
                 }
                 let act = activity(&play, LINK, joinable.then_some(party_id.as_str()), level);
                 let msg = json!({"cmd": "SET_ACTIVITY", "args": {"pid": std::process::id(), "activity": act}, "nonce": nonce()});
-                if write_frame(&mut c.w, 1, &msg).is_ok() {
+                if write_frame(&mut c.p, 1, &msg).is_ok() {
                     last_sent = key;
                     last_send_at = Instant::now();
                 } else {
@@ -341,8 +374,12 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
         .ok();
 }
 
+/// Last thing that happened, shown in Settings > Discord.
+pub static STATE: Mutex<String> = Mutex::new(String::new());
+
 /// Small log next to the cache, to see why Discord refuses something.
 fn log(line: &str) {
+    *STATE.lock().unwrap() = line.chars().take(60).collect();
     use std::io::Write as _;
     let p = crate::config::cache_dir().join("discord.log");
     if std::fs::metadata(&p).map(|m| m.len() > 64 * 1024).unwrap_or(false) {

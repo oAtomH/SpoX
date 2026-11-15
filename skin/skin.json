@@ -150,7 +150,8 @@
     "album": "#4F7A60",
     "tb_title": "#5BE38E",
     "tb_artist": "#3E9A65",
-    "anim_bg": "#0A0A0B"
+    "anim_bg": "#0A0A0B",
+    "list_new": "#7ED6E6"
   },
   "font": {
     "cell": [

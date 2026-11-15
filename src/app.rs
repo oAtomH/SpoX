@@ -185,6 +185,7 @@ impl App {
         };
         let setup_fields = [cfg_v.soloist_key.clone(), cfg_v.client_id.clone(), cfg_v.lastfm_key.clone()];
         let pinned = [cfg_v.pinned[0], cfg_v.pinned[1], cfg_v.pinned[2], cfg_v.pinned_history];
+        let saved_name = cfg_v.profile_name.clone();
         let cfg: Shared = Arc::new(Mutex::new(cfg_v));
         let (tx, rx) = std::sync::mpsc::channel();
         let skin = std::sync::Arc::new(Skin::load(&ctx));
@@ -222,6 +223,8 @@ impl App {
         let tb_shared = Some(crate::tb::new_shared(skin.clone(), solo.live.clone(), solo.cmd.clone(), web.clone(), cfg.clone()));
         crate::discord::start(cfg.clone(), solo.live.clone(), solo.cmd.clone());
         crate::update::start(cfg.clone(), tx.clone());
+        crate::desktop::start_pacer(ctx.clone(), &crate::desktop::PACE_MS, egui::ViewportId::ROOT);
+        crate::desktop::start_pacer(ctx.clone(), &crate::desktop::TB_PACE_MS, crate::tb::id());
         if let Some(t) = &tb_shared {
             crate::tb::start_watcher(t.clone(), ctx.clone());
         }
@@ -269,7 +272,7 @@ impl App {
             liked_uri: String::new(),
             add_menu: false,
             add_scroll: 0,
-            profile_name: String::new(),
+            profile_name: saved_name,
             pfp: None,
             pfp_small: None,
             refresh_at: None,
@@ -557,7 +560,16 @@ impl App {
                 self.smart_new = new_uris.into_iter().collect();
             }
             Ev::Profile { name, img, small } => {
-                self.profile_name = name;
+                if !name.is_empty() {
+                    let mut c = self.cfg.lock().unwrap();
+                    if c.profile_name != name {
+                        c.profile_name = name.clone();
+                        c.save();
+                    }
+                }
+                if !name.is_empty() || self.profile_name.is_empty() {
+                    self.profile_name = name;
+                }
                 self.pfp = img.map(|i| self.ctx.load_texture("pfp", i, egui::TextureOptions::NEAREST));
                 self.pfp_small = small.map(|i| self.ctx.load_texture("pfp8", i, egui::TextureOptions::NEAREST));
             }
@@ -610,16 +622,25 @@ impl App {
         art::request(url, size.max(4), if pixel { colors } else { 0 }, self.tx.clone(), self.ctx.clone());
     }
 
+    /// Recently played: a song counts after 10 s of playing (skipped-through songs don't),
+    /// newest first, max 100, written in the background.
+    fn note_history(&mut self) {
+        let Some(t) = &self.play.track else { return };
+        if self.play.status != "playing" || self.play.position(now_ms()) < 10_000.0 {
+            return;
+        }
+        if self.history.first().map(|h| h.0.uri == t.uri).unwrap_or(false) {
+            return;
+        }
+        self.history.retain(|h| h.0.uri != t.uri);
+        self.history.insert(0, (t.clone(), config::now_secs()));
+        self.history.truncate(100);
+        let h = self.history.clone();
+        std::thread::spawn(move || save_history(&h));
+    }
+
     fn on_track_changed(&mut self) {
         self.request_art();
-        if let Some(t) = &self.play.track {
-            if self.history.first().map(|h| h.0.uri != t.uri).unwrap_or(true) {
-                self.history.retain(|h| h.0.uri != t.uri);
-                self.history.insert(0, (t.clone(), config::now_secs()));
-                self.history.truncate(100);
-                save_history(&self.history);
-            }
-        }
         if let Some(t) = &self.play.track {
             if t.uri != self.liked_uri {
                 self.liked = None;
@@ -2176,7 +2197,8 @@ impl App {
                 scroll_idx = SCROLL_Q;
                 // grouped like Spotify's queue: Next in queue / Next from <playlist> / Autoplay
                 let mut last_group = String::new();
-                let new_col = self.skin.color("lyric_current");
+                // songs smart shuffle brought in: a soft cyan, so they stand out from your own songs
+                let new_col = self.skin.json["colors"]["list_new"].as_str().and_then(crate::skin::parse_color).unwrap_or(Color32::from_rgb(126, 214, 230));
                 for (i, t) in self.play.upcoming.iter().enumerate() {
                     let p = &t.provider;
                     let group = if p.contains("queue") {
@@ -2657,6 +2679,10 @@ impl App {
             ("Discord".into(), String::new(), 0),
             ("Show song on Discord".into(), onoff(c.discord), 47),
             ("Friends with SpoX can join".into(), onoff(c.discord_join), 78),
+            ("Status".into(), {
+                let st = crate::discord::STATE.lock().unwrap().clone();
+                if !c.discord { "off".into() } else if st.is_empty() { "starting...".into() } else { st }
+            }, 79),
             ("App".into(), String::new(), 0),
             ("Update automatically".into(), onoff(c.auto_update), 63),
             ("Memory (RAM)".into(), self.mem_text.clone(), 61),
@@ -3127,7 +3153,7 @@ impl App {
     }
 
     fn draw_menu(&mut self, p: &egui::Painter, o: Pos2, s: f32, inp: &Inp) {
-        let (scale, on_top, vis, has_client, tray_on, on_close) = {
+        let (scale, on_top, _vis, has_client, tray_on, on_close) = {
             let c = self.cfg.lock().unwrap();
             (c.scale, c.always_on_top, c.vis_on, !c.client_id.is_empty(), c.tray, c.on_close.clone())
         };
@@ -3140,7 +3166,6 @@ impl App {
                 255,
             ),
             (format!("Size: {}x", scale), 0),
-            (format!("Visualizer: {}", if vis { "running" } else { "paused" }), 3),
             (format!("Taskbar player: {}", if tb_on { "on" } else { "off" }), 9),
         ];
         // only shown when something needs doing
@@ -3378,6 +3403,7 @@ impl eframe::App for App {
                 self.ctx.request_repaint_of(crate::tb::id());
             }
         }
+        self.note_history();
         // actions coming from the taskbar player
         let acts: Vec<String> = self.tb.as_ref().map(|t| std::mem::take(&mut *t.app_actions.lock().unwrap())).unwrap_or_default();
         for a in acts {
@@ -3555,21 +3581,28 @@ impl eframe::App for App {
         // Only wake up when something on screen can change. Hidden in the tray or minimized:
         // nothing to draw, so no timers at all (Soloist events still wake us when needed).
         let playing = self.play.status == "playing";
-        let unseen = crate::desktop::HIDDEN.load(std::sync::atomic::Ordering::SeqCst) || ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        let unseen = crate::desktop::window_unseen();
+        let pace = |ms: u64| crate::desktop::PACE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
         if unseen && self.collapse.is_none() {
             self.vis.sleep();
+            pace(0);
             return;
         }
         if animating && self.vis_running() {
+            pace(33);
             ctx.request_repaint_after(Duration::from_millis(33));
         } else if animating {
+            pace(70);
             ctx.request_repaint_after(Duration::from_millis(70));
         } else if playing {
-            // the clock only changes once a second: wake up right when it does
-            let pos = self.play.position(now_ms()) as u64;
-            ctx.request_repaint_after(Duration::from_millis(1000 - pos % 1000 + 5));
+            // the clock and lyrics: 4 times a second is plenty and keeps lyrics on time
+            pace(250);
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else if self.setup {
+            pace(500);
             ctx.request_repaint_after(Duration::from_millis(500));
+        } else {
+            pace(0);
         }
     }
 
