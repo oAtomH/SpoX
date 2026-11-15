@@ -102,9 +102,12 @@ object Player {
         val title = m?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
         val artist = m?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
         val artKey = "$title|$artist"
-        if (artKey != lastArtKey) {
+        // Spotify often sends the cover a moment after the title: keep looking until it's there
+        if (artKey != lastArtKey || lastArt == null) {
             lastArtKey = artKey
             lastArt = m?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: m?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                ?: m?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+            if (lastArt == null) loadArtUri(m, artKey)
         }
         val compat = runCatching { MediaControllerCompat(app, MediaSessionCompat.Token.fromToken(c.sessionToken)) }.getOrNull()
         state = State(
@@ -121,6 +124,24 @@ object Player {
             app = c.packageName,
         )
         changed()
+    }
+
+    /** Some apps only give a link to the cover: fetch it in the background. */
+    private fun loadArtUri(m: MediaMetadata?, key: String) {
+        val uri = m?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI) ?: m?.getString(MediaMetadata.METADATA_KEY_ART_URI)
+            ?: m?.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI) ?: return
+        kotlin.concurrent.thread(name = "art") {
+            val bmp = runCatching {
+                if (uri.startsWith("http")) java.net.URL(uri).openStream().use { android.graphics.BitmapFactory.decodeStream(it) }
+                else app.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { android.graphics.BitmapFactory.decodeStream(it) }
+            }.getOrNull() ?: return@thread
+            main.post {
+                if (key == lastArtKey && lastArt == null) {
+                    lastArt = bmp
+                    refresh()
+                }
+            }
+        }
     }
 
     // ---- controls -------------------------------------------------------------------------
