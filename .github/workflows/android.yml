@@ -28,11 +28,13 @@ jobs:
           KS: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
           if [ -n "$KS" ]; then echo "$KS" | base64 -d > "$RUNNER_TEMP/spox.jks"; echo "SPOX_KEYSTORE_FILE=$RUNNER_TEMP/spox.jks" >> "$GITHUB_ENV"; fi
-      - name: sysguard (small Linux add-on for the engine test)
+      - name: sysguard + spoxrun (small Linux helpers for the engine test)
         run: |
           mkdir -p android/engine/src/main/assets
           clang --target=aarch64-linux-gnu -fuse-ld=lld -shared -nostdlib -fPIC -O2 -ffreestanding \
             -fno-stack-protector -fno-builtin -o android/engine/src/main/assets/sysguard.so android/engine/native/sysguard.c
+          clang --target=aarch64-linux-gnu -fuse-ld=lld -static -nostdlib -fno-pic -O2 -ffreestanding \
+            -fno-stack-protector -fno-builtin -o android/engine/src/main/assets/spoxrun android/engine/native/spoxrun.c
       - name: Build
         env:
           SPOX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}

@@ -58,6 +58,9 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var volAt = 0L
     private var animating = false
 
+    /** Frames per second while something moves: Settings > Smoothness. */
+    var fps = 30
+
     /** Call when coming back to the app (access may have changed). */
     fun refresh() {
         access = Player.hasAccess(context)
@@ -112,8 +115,13 @@ class PlayerView(ctx: Context) : View(ctx) {
         drawMain(cv, st, now)
         drawPanel(cv, st, now)
         cv.restore()
-        // smooth (every screen refresh) while anything moves; otherwise twice a second for the clock
-        if (st.playing || animating || dragging != null) postInvalidateOnAnimation() else postInvalidateDelayed(500)
+        // Pixel art moves in whole pixels, so drawing at the phone's full 120 Hz mostly repeats the
+        // same picture and costs battery. Dragging stays at full speed; otherwise the chosen rate.
+        when {
+            dragging != null -> postInvalidateOnAnimation()
+            st.playing || animating -> postInvalidateDelayed(1000L / fps)
+            else -> postInvalidateDelayed(500)
+        }
         animating = false
     }
 

@@ -54,6 +54,48 @@ object Player {
         if (!::app.isInitialized) app = ctx.applicationContext
     }
 
+    // A button press shows at once; Spotify confirms a moment later. Until then (or 1.5 s),
+    // SpoX keeps showing what you pressed instead of flickering back.
+    private var wantPlaying: Boolean? = null
+    private var wantShuffle: Boolean? = null
+    private var wantRepeat: Boolean? = null
+    private var wantUntil = 0L
+
+    private fun expect(playing: Boolean? = null, shuffle: Boolean? = null, repeat: Boolean? = null) {
+        val now = SystemClock.elapsedRealtime()
+        if (playing != null) wantPlaying = playing
+        if (shuffle != null) wantShuffle = shuffle
+        if (repeat != null) wantRepeat = repeat
+        wantUntil = now + 1500
+        state = state.copy(
+            playing = wantPlaying ?: state.playing,
+            positionMs = state.position(now), positionAt = now,
+            shuffle = wantShuffle ?: state.shuffle,
+            repeat = wantRepeat ?: state.repeat,
+        )
+        changed()
+    }
+
+    /** Spotify's answer: take it, unless it's still the old state from before the press. */
+    private fun settle(s: State): State {
+        if (SystemClock.elapsedRealtime() > wantUntil) { wantPlaying = null; wantShuffle = null; wantRepeat = null; return s }
+        if (wantPlaying == s.playing) wantPlaying = null
+        if (wantShuffle == s.shuffle) wantShuffle = null
+        if (wantRepeat == s.repeat) wantRepeat = null
+        return s.copy(playing = wantPlaying ?: s.playing, shuffle = wantShuffle ?: s.shuffle, repeat = wantRepeat ?: s.repeat)
+    }
+
+    // asking Android for the shuffle/repeat state is slow-ish: one helper per music session
+    private var compat: MediaControllerCompat? = null
+    private var compatFor: Any? = null
+    private fun compatOf(c: MediaController): MediaControllerCompat? {
+        if (compatFor != c.sessionToken) {
+            compat = runCatching { MediaControllerCompat(app, MediaSessionCompat.Token.fromToken(c.sessionToken)) }.getOrNull()
+            compatFor = c.sessionToken
+        }
+        return compat
+    }
+
     fun listen(l: () -> Unit) { listeners += l }
     fun unlisten(l: () -> Unit) { listeners -= l }
     private fun changed() = main.post { listeners.toList().forEach { it() } }
@@ -109,8 +151,8 @@ object Player {
                 ?: m?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
             if (lastArt == null) loadArtUri(m, artKey)
         }
-        val compat = runCatching { MediaControllerCompat(app, MediaSessionCompat.Token.fromToken(c.sessionToken)) }.getOrNull()
-        state = State(
+        val compat = compatOf(c)
+        state = settle(State(
             title = title,
             artist = artist,
             album = m?.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: "",
@@ -122,7 +164,7 @@ object Player {
             shuffle = (compat?.shuffleMode ?: 0) == PlaybackStateCompat.SHUFFLE_MODE_ALL,
             repeat = (compat?.repeatMode ?: 0) != PlaybackStateCompat.REPEAT_MODE_NONE,
             app = c.packageName,
-        )
+        ))
         changed()
     }
 
@@ -148,11 +190,11 @@ object Player {
 
     private val tc get() = controller?.transportControls
 
-    fun play() = tc?.play()
-    fun pause() = tc?.pause()
+    fun play() { if (controller != null) expect(playing = true); tc?.play() }
+    fun pause() { if (controller != null) expect(playing = false); tc?.pause() }
 
     fun playPause() {
-        if (state.playing) tc?.pause() else tc?.play()
+        if (state.playing) pause() else play()
     }
     fun next() = tc?.skipToNext()
     fun prev() = tc?.skipToPrevious()
@@ -166,20 +208,24 @@ object Player {
     }
 
     fun toggleShuffle() {
+        if (controller == null) return
+        expect(shuffle = !state.shuffle)
         if (custom("shuffle")) return
         val c = controller ?: return
         runCatching {
-            MediaControllerCompat(app, MediaSessionCompat.Token.fromToken(c.sessionToken)).transportControls
-                .setShuffleMode(if (state.shuffle) PlaybackStateCompat.SHUFFLE_MODE_NONE else PlaybackStateCompat.SHUFFLE_MODE_ALL)
+            compatOf(c)!!.transportControls
+                .setShuffleMode(if (state.shuffle) PlaybackStateCompat.SHUFFLE_MODE_ALL else PlaybackStateCompat.SHUFFLE_MODE_NONE)
         }
     }
 
     fun toggleRepeat() {
+        if (controller == null) return
+        expect(repeat = !state.repeat)
         if (custom("repeat")) return
         val c = controller ?: return
         runCatching {
-            MediaControllerCompat(app, MediaSessionCompat.Token.fromToken(c.sessionToken)).transportControls
-                .setRepeatMode(if (state.repeat) PlaybackStateCompat.REPEAT_MODE_NONE else PlaybackStateCompat.REPEAT_MODE_ALL)
+            compatOf(c)!!.transportControls
+                .setRepeatMode(if (state.repeat) PlaybackStateCompat.REPEAT_MODE_ALL else PlaybackStateCompat.REPEAT_MODE_NONE)
         }
     }
 

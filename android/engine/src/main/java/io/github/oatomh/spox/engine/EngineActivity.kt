@@ -56,7 +56,7 @@ class EngineActivity : Activity() {
         }
         root.addView(ScrollView(this).apply { addView(out) }, LinearLayout.LayoutParams(-1, -1))
         setContentView(root)
-        log("SpoX Engine test 0.3")
+        log("SpoX Engine test 0.4")
         log("Phone: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), ABIs ${Build.SUPPORTED_ABIS.joinToString()}")
         log("Tap 1, wait, then tap 2 and send the report.")
     }
@@ -128,6 +128,23 @@ class EngineActivity : Activity() {
                     log("\n== E. sysguard, with rseq left on ==")
                     tryRun(base + "--version", dir, mapOf("LD_PRELOAD" to guard.path))
                 } else log("\n(sysguard not inside this build)")
+                // spoxrun: watches Soloist from outside and answers every blocked call with
+                // "not supported", even the ones made before any add-on could load
+                val run = File(filesDir, "spoxrun")
+                val haveRun = runCatching {
+                    assets.open("spoxrun").use { i -> run.outputStream().use { i.copyTo(it) } }
+                    run.setExecutable(true, false)
+                }.isSuccess
+                if (haveRun) {
+                    val r = listOf(run.path) + base
+                    log("\n== F. spoxrun: does it find every library ==")
+                    tryRun(listOf(run.path) + loader + "--list" + bin.absolutePath, dir)
+                    log("\n== G. spoxrun + Soloist ==")
+                    tryRun(r + "--version", dir)
+                    tryRun(r + "--help", dir)
+                    log("\n== H. spoxrun + Soloist, rseq off ==")
+                    tryRun(r + "--version", dir, noRseq)
+                } else log("\n(spoxrun not inside this build)")
                 log("\n== system log ==")
                 runCatching {
                     val p = ProcessBuilder("logcat", "-d", "-t", "400").redirectErrorStream(true).start()
@@ -174,6 +191,8 @@ class EngineActivity : Activity() {
             log("exit: ${if (!done) "still running after 8 s (killed)" else if (code > 128) "$code = ${signals[code - 128] ?: "signal ${code - 128}"}" else "$code"}")
             val out = text.toString().trim().replace(Regex("blocked syscall (\\d+)")) {
                 val n = it.groupValues[1].toInt(); "blocked syscall $n (${calls[n] ?: "?"})"
+            }.replace(Regex(" (\\d+)x(\\d+)")) {
+                val n = it.groupValues[1].toInt(); " ${calls[n] ?: n}x${it.groupValues[2]}"
             }
             log(out.ifEmpty { "(no output)" })
         } catch (e: Throwable) {

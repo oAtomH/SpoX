@@ -18,12 +18,14 @@ class MainActivity : Activity() {
         Player.init(this)
         view = PlayerView(this)
         setContentView(view)
+        view.fps = getSharedPreferences("spox", 0).getInt("fps", 30)
 
         view.settingsRows = {
             val prefs = getSharedPreferences("spox", 0)
             listOf(
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's media player"; else -> "off" },
                 "Updates" to Updater.status.ifEmpty { "check now" },
+                "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery saver (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
                 "Auto-update" to if (prefs.getBoolean("auto_update", true)) "on" else "off",
                 "Notification access" to if (Player.hasAccess(this)) "allowed" else "allow...",
                 "Hide Spotify's own player" to "open...",
@@ -38,6 +40,11 @@ class MainActivity : Activity() {
                 "access", "Notification access" -> startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                 "Player in notifications" -> SpoxNotification.cycleStyle(this)
                 "Updates" -> Updater.check(this, true) { runOnUiThread { view.invalidate() } }
+                "Smoothness" -> {
+                    val next = when (prefs.getInt("fps", 30)) { 30 -> 60; 60 -> 15; else -> 30 }
+                    prefs.edit().putInt("fps", next).apply()
+                    view.fps = next
+                }
                 "Auto-update" -> prefs.edit().putBoolean("auto_update", !prefs.getBoolean("auto_update", true)).apply()
                 "Open Spotify" -> Player.openApp(this)
                 // Android won't let another app restyle or remove Spotify's player, but you can switch

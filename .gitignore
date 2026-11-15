@@ -10,3 +10,4 @@ android/.gradle/
 *.jks
 android-signing/
 android/engine/src/main/assets/sysguard.so
+android/engine/src/main/assets/spoxrun

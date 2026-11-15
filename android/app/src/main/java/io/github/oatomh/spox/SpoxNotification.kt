@@ -63,7 +63,15 @@ object SpoxNotification {
     }
 
     /** Album art as chunky pixels (nearest-neighbour upscale). */
+    private var artFor: Bitmap? = null
+    private var artDone: Bitmap? = null
+
     private fun pixelArt(src: Bitmap?, ctx: Context): Bitmap? {
+        if (src != null && src === artFor) return artDone
+        return pixelArtNew(src, ctx).also { artFor = src; artDone = it }
+    }
+
+    private fun pixelArtNew(src: Bitmap?, ctx: Context): Bitmap? {
         val n = Skin.get(ctx).json.optInt("art_pixels", 24)
         val small = src?.let { Bitmap.createScaledBitmap(it, n, n, true) } ?: Skin.get(ctx).sprite("icon") ?: return null
         val big = Bitmap.createBitmap(small.width * 8, small.height * 8, Bitmap.Config.ARGB_8888)
@@ -105,7 +113,10 @@ object SpoxNotification {
                 setShowBadge(false)
             })
         }
-        val key = "${style(ctx)}|${st.title}|${st.artist}|${st.playing}|${st.positionMs / 1000}|${st.art?.generationId}|${st.shuffle}|${st.repeat}"
+        // the song position only matters when it jumps (a seek): Android moves the bar by itself.
+        // So rebuild on "when did this song start" changing, not on every position report.
+        val at = if (st.playing) (st.positionAt - st.positionMs) / 2000 else st.positionMs / 1000
+        val key = "${style(ctx)}|${st.title}|${st.artist}|${st.playing}|$at|${st.art?.generationId}|${st.shuffle}|${st.repeat}"
         if (key == lastKey) return
         lastKey = key
         val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
