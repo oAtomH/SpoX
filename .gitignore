@@ -9,3 +9,4 @@ android/app/build/
 android/.gradle/
 *.jks
 android-signing/
+android/engine/src/main/assets/sysguard.so

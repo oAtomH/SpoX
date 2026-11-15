@@ -56,7 +56,7 @@ class EngineActivity : Activity() {
         }
         root.addView(ScrollView(this).apply { addView(out) }, LinearLayout.LayoutParams(-1, -1))
         setContentView(root)
-        log("SpoX Engine test 0.2")
+        log("SpoX Engine test 0.3")
         log("Phone: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), ABIs ${Build.SUPPORTED_ABIS.joinToString()}")
         log("Tap 1, wait, then tap 2 and send the report.")
     }
@@ -103,10 +103,39 @@ class EngineActivity : Activity() {
                 log("loader: ${ld.exists()} (${ld.canonicalPath.substringAfter(root.path)})")
                 File(ld.canonicalPath).setExecutable(true, false)
                 lib.listFiles()?.forEach { it.setReadable(true, false) }
-                log("\n== start it through the Debian loader ==")
-                val base = listOf(ld.canonicalPath, "--library-path", lib.path, bin.absolutePath)
-                tryRun(base + "--help", dir)
-                tryRun(base + "--version", dir)
+                val loader = listOf(ld.canonicalPath, "--library-path", lib.path)
+                val base = loader + bin.absolutePath
+                log("\n== A. the Debian loader on its own ==")
+                tryRun(loader + "--version", dir)
+                log("\n== B. does it find every library ==")
+                tryRun(loader + "--list" + bin.absolutePath, dir)
+                // glibc registers "rseq" at startup, which Android may not allow
+                val noRseq = mapOf("GLIBC_TUNABLES" to "glibc.pthread.rseq=0")
+                log("\n== C. Soloist without rseq ==")
+                tryRun(base + "--version", dir, noRseq)
+                // sysguard: answers blocked calls with "not supported" instead of a crash,
+                // and reports which ones they were
+                val guard = File(filesDir, "sysguard.so")
+                val haveGuard = runCatching {
+                    assets.open("sysguard.so").use { i -> guard.outputStream().use { i.copyTo(it) } }
+                    guard.setReadable(true, false)
+                }.isSuccess
+                if (haveGuard) {
+                    val g = noRseq + ("LD_PRELOAD" to guard.path)
+                    log("\n== D. Soloist with sysguard ==")
+                    tryRun(base + "--version", dir, g)
+                    tryRun(base + "--help", dir, g)
+                    log("\n== E. sysguard, with rseq left on ==")
+                    tryRun(base + "--version", dir, mapOf("LD_PRELOAD" to guard.path))
+                } else log("\n(sysguard not inside this build)")
+                log("\n== system log ==")
+                runCatching {
+                    val p = ProcessBuilder("logcat", "-d", "-t", "400").redirectErrorStream(true).start()
+                    val hits = p.inputStream.bufferedReader().readLines()
+                        .filter { Regex("seccomp|SIGSYS|syscall=|type=1326|soloist|ld-linux", RegexOption.IGNORE_CASE).containsMatchIn(it) }
+                    hits.takeLast(15).forEach { log(it.take(220)) }
+                    if (hits.isEmpty()) log("(nothing about it)")
+                }
                 log("\n== done ==")
             } catch (e: Throwable) {
                 log("ERROR: ${e.javaClass.simpleName}: ${e.message}")
@@ -116,17 +145,37 @@ class EngineActivity : Activity() {
         }
     }
 
-    private fun tryRun(cmd: List<String>, dir: File) {
-        log("$ ${cmd.joinToString(" ") { it.substringAfterLast('/') }}")
+    private val calls = mapOf(
+        293 to "rseq", 435 to "clone3", 439 to "faccessat2", 99 to "set_robust_list",
+        147 to "setresuid", 149 to "setresgid", 146 to "setuid", 144 to "setgid",
+        219 to "keyctl", 217 to "add_key", 51 to "chroot", 40 to "mount", 167 to "prctl",
+        278 to "getrandom", 441 to "epoll_pwait2", 436 to "close_range", 449 to "futex_waitv",
+        434 to "pidfd_open", 437 to "openat2", 452 to "fchmodat2", 453 to "map_shadow_stack",
+        444 to "landlock_create_ruleset", 280 to "bpf", 291 to "statx", 425 to "io_uring_setup",
+        426 to "io_uring_enter", 241 to "perf_event_open", 117 to "ptrace", 272 to "kcmp",
+        283 to "membarrier", 451 to "cachestat", 462 to "mseal", 279 to "memfd_create")
+
+    private val signals = mapOf(4 to "SIGILL", 6 to "SIGABRT", 7 to "SIGBUS", 9 to "SIGKILL",
+        11 to "SIGSEGV (crash)", 31 to "SIGSYS (Android blocked a system call)")
+
+    private fun tryRun(cmd: List<String>, dir: File, env: Map<String, String> = emptyMap()) {
+        val e = env.entries.joinToString(" ") { "${it.key}=${it.value.substringAfterLast('/')}" }
+        log("$ ${if (e.isEmpty()) "" else "$e "}${cmd.joinToString(" ") { it.substringAfterLast('/') }}")
         try {
-            val p = ProcessBuilder(cmd).directory(dir).redirectErrorStream(true).start()
+            val pb = ProcessBuilder(cmd).directory(dir).redirectErrorStream(true)
+            pb.environment().putAll(env)
+            val p = pb.start()
             val text = StringBuilder()
             val reader = thread { text.append(p.inputStream.bufferedReader().readText().take(4000)) }
             val done = p.waitFor(8, TimeUnit.SECONDS)
             if (!done) p.destroy()
             reader.join(2000)
-            log("exit: ${if (done) p.exitValue() else "still running after 8 s (killed)"}")
-            log(text.toString().trim().ifEmpty { "(no output)" })
+            val code = if (done) p.exitValue() else -1
+            log("exit: ${if (!done) "still running after 8 s (killed)" else if (code > 128) "$code = ${signals[code - 128] ?: "signal ${code - 128}"}" else "$code"}")
+            val out = text.toString().trim().replace(Regex("blocked syscall (\\d+)")) {
+                val n = it.groupValues[1].toInt(); "blocked syscall $n (${calls[n] ?: "?"})"
+            }
+            log(out.ifEmpty { "(no output)" })
         } catch (e: Throwable) {
             log("could not start: ${e.javaClass.simpleName}: ${e.message}")
         }
