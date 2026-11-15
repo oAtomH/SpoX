@@ -185,3 +185,11 @@ Each friend needs:
   - Dragging the window no longer redraws it.
   - Hidden or minimized, SpoX doesn't redraw at all and the visualizer stops listening.
   - The clock wakes the app once a second instead of four times.
+
+## Discord (v0.5.3)
+
+Turn on **Settings → Discord → Show song on Discord**. Your profile then shows *Listening to SpoX* with the song, album art and a time bar.
+
+- **Friends with Spotify** click **Listen on Spotify** to open the same song.
+- **Friends with SpoX** click **Join** (or *Ask to join*, which SpoX accepts by itself). Their SpoX jumps into the same song at the same moment. It's a one-time sync, not a live session: after that song, each of you carries on separately.
+- **Discord's own "Listen Along"** (the one that keeps you in sync) is only for Spotify's own Discord status. SpoX plays through your Spotify account, so if you link Spotify under *Discord → Settings → Connections*, Discord can show that status as well. Spotify users can then Listen Along with you, and you can Listen Along with them: it plays on SpoX if SpoX is your active Spotify device. This is Discord's own feature, so it may only work when your Spotify desktop or phone app is the device playing.

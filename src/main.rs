@@ -19,6 +19,28 @@ mod web;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // one SpoX at a time (Discord may start SpoX again when a friend clicks Join)
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+        let name: Vec<u16> = "Local\\SpoX-one-instance".encode_utf16().chain(std::iter::once(0)).collect();
+        // right after installing, the old copy is still closing: wait for it a little
+        let tries = if std::env::args().any(|a| a == "--after-install") { 60 } else { 1 };
+        let mut ok = false;
+        for _ in 0..tries {
+            let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if h.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+                ok = true; // keep the handle open for as long as SpoX runs
+                break;
+            }
+            CloseHandle(h);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !ok && !std::env::args().any(|a| a == "--uninstall") {
+            return Ok(());
+        }
+    }
     if std::env::args().any(|a| a == "--uninstall") {
         install::uninstall();
         return Ok(());

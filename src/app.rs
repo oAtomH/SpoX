@@ -218,7 +218,7 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         }
         let tb_shared = Some(crate::tb::new_shared(skin.clone(), solo.live.clone(), solo.cmd.clone(), web.clone(), cfg.clone()));
-        crate::discord::start(cfg.clone(), solo.live.clone());
+        crate::discord::start(cfg.clone(), solo.live.clone(), solo.cmd.clone());
         if let Some(t) = &tb_shared {
             crate::tb::start_watcher(t.clone(), ctx.clone());
         }
@@ -2625,7 +2625,8 @@ impl App {
             ("Right-click".into(), act(&c.tb_right), 39),
             ("Scroll wheel".into(), act(&c.tb_wheel), 40),
             ("Discord".into(), String::new(), 0),
-            ("Show song on Discord".into(), if crate::discord::APP_ID.is_empty() { "coming soon".into() } else { onoff(c.discord) }, 47),
+            ("Show song on Discord".into(), onoff(c.discord), 47),
+            ("Friends with SpoX can join".into(), onoff(c.discord_join), 78),
             ("App".into(), String::new(), 0),
             ("Memory (RAM)".into(), self.mem_text.clone(), 61),
             ("Install SpoX for this user".into(), if crate::install::is_installed() { "installed".into() } else { "install...".into() }, 62),
@@ -2802,6 +2803,7 @@ impl App {
                 45 => c.tb_volume_bar = !c.tb_volume_bar,
                 46 => c.tb_show_when = cycle(&c.tb_show_when, &["always", "hidden"]),
                 47 => c.discord = !c.discord,
+                78 => c.discord_join = !c.discord_join,
                 20 => c.smart_ratio = cycle(&c.smart_ratio.to_string(), &["25", "50", "75", "100"]).parse().unwrap_or(50),
                 21 => c.smart_avoid_artist = !c.smart_avoid_artist,
                 30 => c.tb_on = !c.tb_on,
@@ -2961,7 +2963,7 @@ impl App {
                     }
                     // hand over to the installed copy: stop our Soloist first so the new one starts clean
                     soloist::stop_soloist();
-                    let _ = std::process::Command::new(&exe).current_dir(exe.parent().unwrap_or(std::path::Path::new("."))).spawn();
+                    let _ = std::process::Command::new(&exe).arg("--after-install").current_dir(exe.parent().unwrap_or(std::path::Path::new("."))).spawn();
                     self.quitting_for_install = true;
                     self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
