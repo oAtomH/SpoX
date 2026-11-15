@@ -41,7 +41,7 @@ class EngineActivity : Activity() {
     private lateinit var liveBtn: Button
     private val report = StringBuilder()
     private val soloistUrl = "https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz"
-    private val version = "0.7"
+    private val version = "0.8"
 
     private val prefs get() = getSharedPreferences("engine", 0)
     private val dir get() = File(filesDir, "soloist")
@@ -163,6 +163,11 @@ class EngineActivity : Activity() {
             assets.open("spoxrun").use { i -> run.outputStream().use { i.copyTo(it) } }
             run.setExecutable(true, false)
         }.onFailure { log("spoxrun missing from this build!") }
+        // SpoX's stand-in for PipeWire (Linux's sound system): Soloist plays into it, it hands the
+        // sound to this app, and this app plays it on the phone
+        runCatching {
+            assets.open("libpipewire-0.3.so.0").use { i -> File(lib, "libpipewire-0.3.so.0").outputStream().use { i.copyTo(it) } }
+        }.onFailure { log("sound bridge missing from this build!") }
         writeEtc()
     }
 
@@ -199,6 +204,10 @@ class EngineActivity : Activity() {
         val uid = android.system.Os.getuid()
         File(etc, "passwd").writeText("spox:x:$uid:$uid:SpoX:${filesDir.path}:/bin/sh\n")
         File(etc, "group").writeText("spox:x:$uid:\n")
+        val pwConf = "# SpoX: sound goes to the SpoX Engine app\ncontext.properties = { }\n"
+        File(etc, "pipewire").mkdirs(); File(etc, "pipewire/client.conf").writeText(pwConf)
+        File(filesDir, "config/pipewire").mkdirs(); File(filesDir, "config/pipewire/client.conf").writeText(pwConf)
+        File(cacheDir, "run").mkdirs()
         // Android's trusted certificates, as one Linux-style bundle
         val certs = File(etc, "ssl/certs").apply { mkdirs() }
         val bundle = File(certs, "ca-certificates.crt")
@@ -226,6 +235,9 @@ class EngineActivity : Activity() {
         "SSL_CERT_FILE" to File(root, "etc/ssl/certs/ca-certificates.crt").path,
         "SSL_CERT_DIR" to File(root, "etc/ssl/certs").path,
         "LANG" to "C.UTF-8",
+        "XDG_CONFIG_HOME" to File(filesDir, "config").path,
+        "PIPEWIRE_CONFIG_DIR" to File(root, "etc/pipewire").path,
+        "XDG_RUNTIME_DIR" to File(cacheDir, "run").path,
     )
 
     // ---- 2. live run ----------------------------------------------------------------------
@@ -246,7 +258,8 @@ class EngineActivity : Activity() {
                 prepare(force = false)
                 data.mkdirs(); cache.mkdirs()
                 File(data, "ws.port").delete()
-                tracing = true
+                tracing = false
+                startAudio()
                 // Spotify Connect finds devices by multicast on the Wi-Fi; Android filters it unless asked
                 multicast = getSystemService(WifiManager::class.java).createMulticastLock("spox").apply { setReferenceCounted(false); acquire() }
                 val cmd = listOf(run.path, loaderPath(), "--library-path", lib.path, bin.path,
@@ -275,8 +288,74 @@ class EngineActivity : Activity() {
                 busy = false
                 multicast?.release()
                 unannounce()
+                stopAudio()
                 runOnUiThread { liveBtn.text = "2. Start Soloist" }
             }
+        }
+    }
+
+    // ---- sound: pwshim (inside Soloist) sends raw sound here, Android plays it ----------------
+
+    @Volatile private var audioServer: android.net.LocalServerSocket? = null
+
+    private fun startAudio() {
+        stopAudio()
+        val server = runCatching { android.net.LocalServerSocket("spox-audio") }.getOrElse { log("[audio] ${it.message}"); return }
+        audioServer = server
+        thread(name = "spox-audio") {
+            while (audioServer === server) {
+                val sock = runCatching { server.accept() }.getOrNull() ?: break
+                thread { play(sock) }
+            }
+        }
+    }
+
+    private fun stopAudio() {
+        audioServer?.let { s -> audioServer = null; runCatching { s.close() } }
+    }
+
+    private fun play(sock: android.net.LocalSocket) {
+        var track: android.media.AudioTrack? = null
+        try {
+            val input = java.io.DataInputStream(sock.inputStream.buffered(16384))
+            val hdr = ByteArray(16)
+            input.readFully(hdr)
+            val h = java.nio.ByteBuffer.wrap(hdr).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val magic = h.int; val rate = h.int; val ch = h.int; val fmt = h.int
+            if (magic != 0x58504f53) { log("[audio] unknown sender"); return }
+            val enc = when (fmt) { 0x103 -> android.media.AudioFormat.ENCODING_PCM_16BIT; 0x11b -> android.media.AudioFormat.ENCODING_PCM_FLOAT; else -> { log("[audio] sound format 0x${fmt.toString(16)} not supported yet"); return } }
+            val mask = if (ch == 1) android.media.AudioFormat.CHANNEL_OUT_MONO else android.media.AudioFormat.CHANNEL_OUT_STEREO
+            val min = android.media.AudioTrack.getMinBufferSize(rate, mask, enc)
+            track = android.media.AudioTrack.Builder()
+                .setAudioAttributes(android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAudioFormat(android.media.AudioFormat.Builder().setSampleRate(rate).setChannelMask(mask).setEncoding(enc).build())
+                .setBufferSizeInBytes(maxOf(min * 2, rate / 5 * ch * 4))
+                .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                .build()
+            track.play()
+            log("[audio] playing on the phone: $rate Hz, $ch channels, ${if (fmt == 0x11b) "float" else "16-bit"}")
+            val buf = java.nio.ByteBuffer.allocateDirect(16384).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val arr = ByteArray(16384)
+            var total = 0L
+            while (true) {
+                val n = input.read(arr)
+                if (n <= 0) break
+                buf.clear(); buf.put(arr, 0, n); buf.flip()
+                while (buf.hasRemaining()) {
+                    val w = track.write(buf, buf.remaining(), android.media.AudioTrack.WRITE_BLOCKING)
+                    if (w < 0) { log("[audio] write error $w"); return }
+                }
+                if (total == 0L) log("[audio] first sound arrived")
+                total += n
+            }
+            log("[audio] stream ended (${total / 1024} KB played)")
+        } catch (e: Throwable) {
+            log("[audio] ${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            runCatching { track?.stop(); track?.release() }
+            runCatching { sock.close() }
         }
     }
 

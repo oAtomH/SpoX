@@ -33,6 +33,10 @@ jobs:
           mkdir -p android/engine/src/main/assets
           clang --target=aarch64-linux-gnu -fuse-ld=lld -static -nostdlib -fno-pic -O2 -ffreestanding \
             -fno-stack-protector -fno-builtin -o android/engine/src/main/assets/spoxrun android/engine/native/spoxrun.c
+          # pwshim: stands in for PipeWire and hands Soloist's sound to Android
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu >/dev/null
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -fvisibility=hidden -Wl,-soname,libpipewire-0.3.so.0 \
+            -o android/engine/src/main/assets/libpipewire-0.3.so.0 android/engine/native/pwshim.c -lpthread
       - name: Build
         env:
           SPOX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}

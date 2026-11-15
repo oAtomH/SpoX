@@ -10,3 +10,4 @@ android/.gradle/
 *.jks
 android-signing/
 android/engine/src/main/assets/spoxrun
+android/engine/src/main/assets/libpipewire-0.3.so.0
