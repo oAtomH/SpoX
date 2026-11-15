@@ -41,7 +41,7 @@ class EngineActivity : Activity() {
     private lateinit var liveBtn: Button
     private val report = StringBuilder()
     private val soloistUrl = "https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz"
-    private val version = "0.8"
+    private val version = "0.9"
 
     private val prefs get() = getSharedPreferences("engine", 0)
     private val dir get() = File(filesDir, "soloist")

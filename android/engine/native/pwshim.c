@@ -78,18 +78,165 @@ static void make_lock(void) {
 static void lk(void) { pthread_once(&init_once, make_lock); pthread_mutex_lock(&big); }
 static void ul(void) { pthread_mutex_unlock(&big); }
 
-// dummy objects with a valid (do-nothing) method table, in case Soloist calls methods on them
-static int noop(void) { return 0; }
-static void *noops[64];
-struct obj { struct spa_interface iface; char pad[256]; };
-static struct obj *new_obj(const char *type) {
-    for (int i = 0; i < 64; i++) noops[i] = (void *)noop;
+// ---- objects: core, registry, bound objects ("proxies") -----------------------------------
+// PipeWire calls methods on these through a table of function pointers (spa_interface). Ours
+// answer like a tiny PipeWire server with one speaker: the SpoX phone speaker.
+
+struct spa_dict_item { const char *key; const char *value; };
+struct spa_dict { uint32_t flags; uint32_t n_items; const struct spa_dict_item *items; };
+
+#define MAXL 8
+struct obj {
+    struct spa_interface iface;
+    int kind;                       // 1 core, 2 registry, 3 node, 4 metadata, 5 other, 0 plain
+    uint32_t id;
+    const char *type;
+    const void *ev[MAXL]; void *evd[MAXL]; int nev;          // interface listeners
+    const void *pev[MAXL]; void *pevd[MAXL]; int npev;       // proxy listeners
+    char user[512];
+};
+
+static const struct spa_dict_item sink_items[] = {
+    { "media.class", "Audio/Sink" }, { "node.name", "spox.speaker" },
+    { "node.description", "SpoX phone speaker" }, { "node.nick", "Phone" },
+    { "audio.channels", "2" }, { "audio.rate", "44100" }, { "object.serial", "40" },
+};
+static const struct spa_dict sink_props = { 0, 7, sink_items };
+static const struct spa_dict_item meta_items[] = { { "metadata.name", "default" }, { "object.serial", "41" } };
+static const struct spa_dict meta_props = { 0, 2, meta_items };
+
+static void add_l(const void **ev, void **evd, int *n, struct spa_hook *h, const void *events, void *data) {
+    if (*n < MAXL) { ev[*n] = events; evd[*n] = data; (*n)++; }
+    if (h) { memset(h, 0, sizeof *h); h->link.next = h->link.prev = &h->link; h->cb.funcs = events; h->cb.data = data; }
+}
+
+// tasks run a moment later on a helper thread (PipeWire answers asynchronously too)
+typedef void (*task_fn)(void *a, long b);
+static void *task_run(void *arg) {
+    void **t = arg;
+    usleep(3000);
+    lk();
+    ((task_fn)t[0])(t[1], (long)t[2]);
+    pthread_cond_broadcast(&cond);
+    ul();
+    free(t);
+    return NULL;
+}
+static void later(task_fn f, void *a, long b) {
+    void **t = malloc(3 * sizeof(void *)); t[0] = (void *)f; t[1] = a; t[2] = (void *)b;
+    pthread_t th; pthread_create(&th, NULL, task_run, t); pthread_detach(th);
+}
+
+// core events: {version, info, done, ping, error, remove_id, bound_id, add_mem, remove_mem, bound_props}
+struct core_ev { uint32_t version; void (*info)(void *, const void *); void (*done)(void *, uint32_t, int); };
+static void core_done(void *a, long seq) {
+    struct obj *o = a;
+    say("[pw] core done %ld", seq);
+    for (int i = 0; i < o->nev; i++) { const struct core_ev *e = o->ev[i]; if (e && e->done) e->done(o->evd[i], 0, (int)seq); }
+}
+// registry events: {version, global(data, id, permissions, type, version, props), global_remove}
+struct reg_ev { uint32_t version; void (*global)(void *, uint32_t, uint32_t, const char *, uint32_t, const struct spa_dict *); };
+static void reg_globals(void *a, long n) {
+    struct obj *o = a; (void)n;
+    say("[pw] announcing the phone speaker");
+    for (int i = 0; i < o->nev; i++) {
+        const struct reg_ev *e = o->ev[i];
+        if (!e || !e->global) continue;
+        e->global(o->evd[i], 40, 0x1ff, "PipeWire:Interface:Node", 3, &sink_props);
+        e->global(o->evd[i], 41, 0x1ff, "PipeWire:Interface:Metadata", 3, &meta_props);
+    }
+}
+// node events: {version, info, param}; node info layout:
+struct node_info { uint32_t id, max_in, max_out; uint64_t change_mask; uint32_t n_in, n_out; int state; const char *error; const struct spa_dict *props; void *params; uint32_t n_params; };
+struct node_ev { uint32_t version; void (*info)(void *, const struct node_info *); };
+// metadata events: {version, property(data, subject, key, type, value)}
+struct meta_ev { uint32_t version; int (*property)(void *, uint32_t, const char *, const char *, const char *); };
+// proxy events: {version, destroy, bound(data, global_id), removed, done, error, bound_props}
+struct proxy_ev { uint32_t version; void (*destroy)(void *); void (*bound)(void *, uint32_t); };
+
+static void obj_events(void *a, long n) {
+    struct obj *o = a; (void)n;
+    for (int i = 0; i < o->npev; i++) { const struct proxy_ev *e = o->pev[i]; if (e && e->bound) e->bound(o->pevd[i], o->id); }
+    for (int i = 0; i < o->nev; i++) {
+        if (o->kind == 3) {
+            struct node_info info = { o->id, 0, 1, 0x1f, 0, 1, 3 /* running */, NULL, &sink_props, NULL, 0 };
+            const struct node_ev *e = o->ev[i]; if (e && e->info) e->info(o->evd[i], &info);
+        } else if (o->kind == 4) {
+            const struct meta_ev *e = o->ev[i];
+            if (e && e->property) {
+                e->property(o->evd[i], 0, "default.audio.sink", "Spa:String:JSON", "{\"name\":\"spox.speaker\"}");
+                e->property(o->evd[i], 0, "default.configured.audio.sink", "Spa:String:JSON", "{\"name\":\"spox.speaker\"}");
+            }
+        }
+    }
+}
+
+static struct obj *new_obj(const char *type, int kind);
+
+// method tables (first slot = version, then the methods in PipeWire's order)
+static long m_noop(void) { return 0; }
+static int m_add_listener(void *o_, struct spa_hook *h, const void *events, void *data) {
+    struct obj *o = o_;
+    add_l(o->ev, o->evd, &o->nev, h, events, data);
+    if (o->kind == 2) later(reg_globals, o, 0);
+    if (o->kind == 3 || o->kind == 4) later(obj_events, o, 0);
+    return 0;
+}
+static int seqn = 1;
+static int m_core_sync(void *o, uint32_t id, int seq) { (void)id; (void)seq; int s = ++seqn; later(core_done, o, s); return s; }
+static void *m_core_get_registry(void *o, uint32_t version, size_t user) { (void)o; (void)version; (void)user; say("[pw] get_registry"); return new_obj("PipeWire:Interface:Registry", 2); }
+static void *m_core_create_object(void *o, const char *factory, const char *type, uint32_t v, const void *props, size_t user) {
+    (void)o; (void)v; (void)props; (void)user; say("[pw] create_object %s %s", factory ? factory : "?", type ? type : "?"); return new_obj(type, 5);
+}
+static void *m_reg_bind(void *o, uint32_t id, const char *type, uint32_t v, size_t user) {
+    (void)o; (void)v; (void)user;
+    say("[pw] bind %u %s", id, type ? type : "?");
+    struct obj *b = new_obj(type, id == 40 ? 3 : id == 41 ? 4 : 5);
+    b->id = id;
+    return b;
+}
+static void *core_m[16], *reg_m[16], *obj_m[16];
+static pthread_once_t tables_once = PTHREAD_ONCE_INIT;
+static void make_tables(void) {
+    for (int i = 0; i < 16; i++) core_m[i] = reg_m[i] = obj_m[i] = (void *)m_noop;
+    core_m[0] = reg_m[0] = obj_m[0] = (void *)(uintptr_t)3;     // method table version
+    core_m[1] = reg_m[1] = obj_m[1] = (void *)m_add_listener;
+    core_m[3] = (void *)m_core_sync;
+    core_m[6] = (void *)m_core_get_registry;
+    core_m[7] = (void *)m_core_create_object;
+    reg_m[2] = (void *)m_reg_bind;
+}
+static struct obj *new_obj(const char *type, int kind) {
+    pthread_once(&tables_once, make_tables);
     struct obj *o = calloc(1, sizeof *o);
     o->iface.type = type;
-    o->iface.version = 0;
-    o->iface.cb.funcs = noops;
+    o->iface.version = 3;
+    o->iface.cb.funcs = kind == 1 ? (void *)core_m : kind == 2 ? (void *)reg_m : (void *)obj_m;
+    o->iface.cb.data = o;
+    o->kind = kind;
+    o->type = type;
     return o;
 }
+
+// proxy functions (every bound object, the registry and the core are proxies)
+EXPORT int pw_proxy_add_object_listener(void *p, struct spa_hook *h, const void *funcs, void *data) {
+    say("[pw] pw_proxy_add_object_listener");
+    return m_add_listener(p, h, funcs, data);
+}
+EXPORT void pw_proxy_add_listener(void *p, struct spa_hook *h, const void *events, void *data) {
+    struct obj *o = p; ONCE("pw_proxy_add_listener");
+    add_l(o->pev, o->pevd, &o->npev, h, events, data);
+    if (o->id) later(obj_events, o, 0);
+}
+EXPORT void pw_proxy_destroy(void *p) { (void)p; ONCE("pw_proxy_destroy"); }
+EXPORT void *pw_proxy_get_user_data(void *p) { return ((struct obj *)p)->user; }
+EXPORT uint32_t pw_proxy_get_bound_id(void *p) { return ((struct obj *)p)->id; }
+EXPORT uint32_t pw_proxy_get_id(void *p) { return ((struct obj *)p)->id; }
+EXPORT const char *pw_proxy_get_type(void *p, uint32_t *version) { if (version) *version = 3; return ((struct obj *)p)->type; }
+EXPORT int pw_proxy_sync(void *p, int seq) { (void)seq; return m_core_sync(p, 0, 0); }
+EXPORT void *pw_proxy_get_object_listeners(void *p) { (void)p; return NULL; }
+EXPORT void pw_proxy_ref(void *p) { (void)p; }
+EXPORT void pw_proxy_unref(void *p) { (void)p; }
 
 struct pw_thread_loop { struct obj *loop; int running; };
 
@@ -108,7 +255,7 @@ EXPORT int pw_in_valgrind(void) { return 0; }
 EXPORT struct pw_thread_loop *pw_thread_loop_new(const char *name, const void *props) {
     (void)name; (void)props; ONCE("pw_thread_loop_new");
     struct pw_thread_loop *l = calloc(1, sizeof *l);
-    l->loop = new_obj("PipeWire:Interface:Loop");
+    l->loop = new_obj("PipeWire:Interface:Loop", 0);
     return l;
 }
 EXPORT struct pw_thread_loop *pw_thread_loop_new_full(void *loop, const char *name, const void *props) { (void)loop; return pw_thread_loop_new(name, props); }
@@ -139,16 +286,16 @@ EXPORT int pw_thread_loop_in_thread(struct pw_thread_loop *l) { (void)l; return 
 
 // main loop (in case it's used instead of the thread loop)
 struct pw_main_loop { struct obj *loop; volatile int quit; };
-EXPORT struct pw_main_loop *pw_main_loop_new(const void *props) { (void)props; ONCE("pw_main_loop_new"); struct pw_main_loop *m = calloc(1, sizeof *m); m->loop = new_obj("PipeWire:Interface:Loop"); return m; }
+EXPORT struct pw_main_loop *pw_main_loop_new(const void *props) { (void)props; ONCE("pw_main_loop_new"); struct pw_main_loop *m = calloc(1, sizeof *m); m->loop = new_obj("PipeWire:Interface:Loop", 0); return m; }
 EXPORT void *pw_main_loop_get_loop(struct pw_main_loop *m) { return m->loop; }
 EXPORT int pw_main_loop_run(struct pw_main_loop *m) { ONCE("pw_main_loop_run"); while (!m->quit) usleep(50000); return 0; }
 EXPORT int pw_main_loop_quit(struct pw_main_loop *m) { m->quit = 1; return 0; }
 EXPORT void pw_main_loop_destroy(struct pw_main_loop *m) { (void)m; }
 
 // context / core
-EXPORT void *pw_context_new(void *loop, void *props, size_t user_data_size) { (void)loop; (void)props; (void)user_data_size; ONCE("pw_context_new"); return new_obj("PipeWire:Interface:Context"); }
+EXPORT void *pw_context_new(void *loop, void *props, size_t user_data_size) { (void)loop; (void)props; (void)user_data_size; ONCE("pw_context_new"); return new_obj("PipeWire:Interface:Context", 0); }
 EXPORT void pw_context_destroy(void *c) { (void)c; ONCE("pw_context_destroy"); }
-EXPORT void *pw_context_connect(void *c, void *props, size_t user_data_size) { (void)c; (void)props; (void)user_data_size; ONCE("pw_context_connect"); return new_obj("PipeWire:Interface:Core"); }
+EXPORT void *pw_context_connect(void *c, void *props, size_t user_data_size) { (void)c; (void)props; (void)user_data_size; ONCE("pw_context_connect"); return new_obj("PipeWire:Interface:Core", 1); }
 EXPORT void *pw_context_connect_fd(void *c, int fd, void *props, size_t s) { (void)fd; return pw_context_connect(c, props, s); }
 EXPORT int pw_core_disconnect(void *core) { (void)core; ONCE("pw_core_disconnect"); return 0; }
 EXPORT void *pw_context_get_object(void *c, const char *type) { (void)c; (void)type; return NULL; }
@@ -447,3 +594,5 @@ EXPORT void pw_log_set_level(int level) { (void)level; }
 EXPORT void pw_log_logv(int l, const char *f, int line, const char *fn, const char *fmt, va_list ap) { (void)l; (void)f; (void)line; (void)fn; (void)fmt; (void)ap; }
 EXPORT void pw_log_log(int l, const char *f, int line, const char *fn, const char *fmt, ...) { (void)l; (void)f; (void)line; (void)fn; (void)fmt; }
 EXPORT int pw_log_level = 0;
+EXPORT void *PW_LOG_TOPIC_DEFAULT = 0;
+#include "pwstubs.h"
