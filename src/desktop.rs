@@ -30,6 +30,10 @@ pub fn hwnd() -> isize {
     HWND.load(Ordering::SeqCst)
 }
 
+/// Message a second SpoX sends to the running one: "show yourself".
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WM_SPOX_SHOW: u32 = 0x8000 + 77;
+
 pub fn hide_window() {
     #[cfg(windows)]
     unsafe {
@@ -143,6 +147,17 @@ pub fn start_media(solo: Sender<String>) -> Option<Sender<Value>> {
 
 pub struct Tray {
     _icon: tray_icon::TrayIcon,
+    shown: std::cell::Cell<bool>,
+}
+
+impl Tray {
+    /// Show / hide the tray icon (only calls Windows when it changes).
+    pub fn set_visible(&self, on: bool) {
+        if self.shown.get() != on {
+            self.shown.set(on);
+            let _ = self._icon.set_visible(on);
+        }
+    }
 }
 
 fn tray_image(rgba: &image::RgbaImage) -> Option<tray_icon::Icon> {
@@ -203,7 +218,7 @@ pub fn start_tray(icon: &image::RgbaImage, solo: Sender<String>, ctx: egui::Cont
             }
         }
     }));
-    Some(Tray { _icon: tray })
+    Some(Tray { _icon: tray, shown: std::cell::Cell::new(true) })
 }
 
 /// RAM used by a process in MB, the way Task Manager counts it ("private working set":
@@ -283,6 +298,15 @@ unsafe extern "system" fn no_redraw_on_move(
     _data: usize,
 ) -> windows_sys::Win32::Foundation::LRESULT {
     use windows_sys::Win32::UI::Shell::DefSubclassProc;
+    if msg == WM_SPOX_SHOW {
+        // SpoX was started again while already running: bring this one forward instead
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
+        HIDDEN.store(false, Ordering::SeqCst);
+        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        return 0;
+    }
     use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, SWP_HIDEWINDOW, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOWPOS, WM_WINDOWPOSCHANGED};
     if msg == WM_WINDOWPOSCHANGED && lparam != 0 {
         let f = (*(lparam as *const WINDOWPOS)).flags;

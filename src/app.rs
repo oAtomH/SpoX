@@ -2509,10 +2509,18 @@ impl App {
                 }
             }
             CtxAct::SkipTo(i) => {
-                // Soloist has no "jump to", so skip forward the right number of times
-                for _ in 0..=i.min(40) {
-                    self.send(command("skip_next"));
-                }
+                // Soloist has no "jump to": skip forward the right number of times, one at a time
+                // (sent all at once, Soloist drops most of them while the next song loads)
+                let n = i.min(40) + 1;
+                crate::smart::hold_for(Duration::from_millis(450 * n as u64 + 2500));
+                let tx = self.solo.cmd.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..n {
+                        let _ = tx.send(command("skip_next"));
+                        std::thread::sleep(Duration::from_millis(450));
+                    }
+                    let _ = tx.send(command_with("get_queue", "limit", json!(50)));
+                });
                 self.q_selected = None;
                 self.osd("SKIPPING...");
             }
@@ -2634,11 +2642,12 @@ impl App {
             ("Text width".into(), format!("{}px", c.tb_text_w), 32),
             ("When idle (or paused 10 s)".into(), match c.tb_idle.as_str() { "icon" => "just the icon", "hide" => "hide", _ => "dim last song" }.into(), 33),
             ("Shuffle button".into(), onoff(c.tb_shuffle_btn), 49),
+            ("Hide tray icon while it's on".into(), onoff(c.hide_tray_with_player), 64),
             ("Text lines".into(), match c.tb_lines.as_str() { "one" => "one (scrolls)", "two" => "two", _ => "auto (fits)" }.into(), 43),
             ("Dim when paused".into(), onoff(c.tb_paused_dim), 44),
             ("Volume bar".into(), onoff(c.tb_volume_bar), 45),
             ("Show".into(), if c.tb_show_when == "hidden" { "only when SpoX is hidden" } else { "always" }.into(), 46),
-            ("Over fullscreen apps".into(), match c.tb_fullscreen.as_str() { "hide" => "hide", "normal" => "stay (clickable)", _ => "info only (click-through)" }.into(), 34),
+            ("Over fullscreen apps".into(), match c.tb_fullscreen.as_str() { "hide" => "hide", "normal" => "stay", "info" => "info only", _ => "move to other monitor" }.into(), 34),
             ("Click album art".into(), act(&c.tb_click_art), 35),
             ("Click song text".into(), act(&c.tb_click_text), 36),
             ("Double-click song text".into(), act(&c.tb_dbl_text), 37),
@@ -2827,13 +2836,14 @@ impl App {
                 47 => c.discord = !c.discord,
                 78 => c.discord_join = !c.discord_join,
                 63 => c.auto_update = !c.auto_update,
+                64 => c.hide_tray_with_player = !c.hide_tray_with_player,
                 20 => c.smart_ratio = cycle(&c.smart_ratio.to_string(), &["25", "50", "75", "100"]).parse().unwrap_or(50),
                 21 => c.smart_avoid_artist = !c.smart_avoid_artist,
                 30 => c.tb_on = !c.tb_on,
                 31 => c.tb_pos = cycle(&c.tb_pos, &["auto", "left", "custom"]),
                 32 => c.tb_text_w = cycle(&c.tb_text_w.to_string(), &["64", "96", "128", "160", "192"]).parse().unwrap_or(96),
                 33 => c.tb_idle = cycle(&c.tb_idle, &["dim", "icon", "hide"]),
-                34 => c.tb_fullscreen = cycle(&c.tb_fullscreen, &["info", "hide", "normal"]),
+                34 => c.tb_fullscreen = cycle(&c.tb_fullscreen, &["other", "info", "hide", "normal"]),
                 35 => c.tb_click_art = cycle(&c.tb_click_art, &actions),
                 36 => c.tb_click_text = cycle(&c.tb_click_text, &actions),
                 37 => c.tb_dbl_text = cycle(&c.tb_dbl_text, &actions),
@@ -3130,8 +3140,7 @@ impl App {
                 255,
             ),
             (format!("Size: {}x", scale), 0),
-            (format!("Always on top: {}", if on_top { "on" } else { "off" }), 1),
-            (format!("Visualizer: {}", if vis { "on" } else { "off" }), 3),
+            (format!("Visualizer: {}", if vis { "running" } else { "paused" }), 3),
             (format!("Taskbar player: {}", if tb_on { "on" } else { "off" }), 9),
         ];
         // only shown when something needs doing
@@ -3358,6 +3367,11 @@ impl eframe::App for App {
 
         while let Ok(e) = self.rx.try_recv() {
             self.on_event(e);
+        }
+        // no tray icon while the taskbar player is there (it does the same job)
+        if let Some(tr) = &self._tray {
+            let c = self.cfg.lock().unwrap();
+            tr.set_visible(!(c.tb_on && c.tb_idle != "hide" && c.hide_tray_with_player));
         }
         if let Some(t) = &self.tb {
             if t.smart_on.swap(self.smart_on, std::sync::atomic::Ordering::SeqCst) != self.smart_on {

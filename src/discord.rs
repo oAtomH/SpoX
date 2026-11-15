@@ -9,7 +9,7 @@ use crate::soloist::{command, command_with};
 use crate::state::Play;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -98,7 +98,9 @@ fn join_secret(p: &Play) -> Option<String> {
     Some(format!("{};{};{}", t.uri, p.position(now_ms()) as i64, now_ms()))
 }
 
-fn activity(p: &Play, link: &str, party: Option<&str>) -> Option<Value> {
+/// `level` = how careful to be: if Discord refuses an activity, the next one leaves out the newer
+/// extras (0: everything, 1: no Join, 2: no links, 3: bare minimum with the SpoX icon only).
+fn activity(p: &Play, link: &str, party: Option<&str>, level: u8) -> Option<Value> {
     let t = p.track.as_ref()?;
     if !p.is_active || !(p.status == "playing" || p.status == "paused" || p.status == "buffering") {
         return None;
@@ -121,18 +123,32 @@ fn activity(p: &Play, link: &str, party: Option<&str>) -> Option<Value> {
             "small_url": link,
         },
     });
+    if level >= 2 {
+        let o = a.as_object_mut().unwrap();
+        o.remove("status_display_type");
+        o.remove("details_url");
+        if let Some(asr) = o.get_mut("assets").and_then(|x| x.as_object_mut()) {
+            asr.remove("large_url");
+            asr.remove("small_url");
+            if level >= 3 {
+                asr.insert("large_image".into(), json!("spox"));
+            }
+        }
+    }
     // "Listen along" for everyone: one click opens the same song in Spotify
     let mut buttons = vec![json!({ "label": "Listen on Spotify", "url": song })];
     if link.starts_with("https://") {
         buttons.push(json!({ "label": "Get SpoX", "url": link }));
     }
-    a["buttons"] = Value::Array(buttons);
+    if level < 3 {
+        a["buttons"] = Value::Array(buttons);
+    }
     if p.status != "paused" && t.duration_ms > 0 {
         let start = now_ms() - p.position(now_ms()) as i64;
         a["timestamps"] = json!({ "start": start, "end": start + t.duration_ms as i64 });
     }
     // Join (friends with SpoX): party + join secret
-    if let (Some(id), Some(secret)) = (party, join_secret(p)) {
+    if let (Some(id), Some(secret), true) = (party, join_secret(p), level == 0) {
         if p.status != "paused" {
             a["party"] = json!({ "id": id, "size": [1, 10] });
             a["secrets"] = json!({ "join": secret });
@@ -188,13 +204,19 @@ struct Conn {
     out: Receiver<Value>,
 }
 
-fn open(cfg: &Shared, solo: &Sender<String>, no_join: &Arc<AtomicBool>) -> Option<Conn> {
-    let (mut r, mut w) = connect()?;
+fn open(cfg: &Shared, solo: &Sender<String>, no_join: &Arc<AtomicU8>) -> Option<Conn> {
+    let Some((mut r, mut w)) = connect() else {
+        log("Discord not running (no pipe)");
+        return None;
+    };
     write_frame(&mut w, 0, &json!({"v": 1, "client_id": APP_ID})).ok()?;
     // first reply is READY (or a close with a reason)
     match read_frame(&mut r) {
-        Ok((op, _)) if op != 2 => {}
-        _ => return None,
+        Ok((op, _)) if op != 2 => log("connected"),
+        other => {
+            log(&format!("handshake refused: {:?}", other.map(|x| x.1)));
+            return None;
+        }
     }
     for evt in ["ACTIVITY_JOIN", "ACTIVITY_JOIN_REQUEST"] {
         let _ = write_frame(&mut w, 1, &json!({"cmd": "SUBSCRIBE", "evt": evt, "nonce": nonce()}));
@@ -222,7 +244,12 @@ fn open(cfg: &Shared, solo: &Sender<String>, no_join: &Arc<AtomicBool>) -> Optio
                         }
                     }
                 }
-                Some("ERROR") if v["cmd"] == "SET_ACTIVITY" => no_join2.store(true, Ordering::SeqCst),
+                Some("ERROR") if v["cmd"] == "SET_ACTIVITY" => {
+                    // refused: try again with fewer extras, and write down why (cache\\discord.log)
+                    let l = no_join2.fetch_add(1, Ordering::SeqCst);
+                    log(&format!("level {} refused: {}", l, v["data"]));
+                }
+                _ if v["cmd"] == "SET_ACTIVITY" => log("activity set"),
                 _ => {}
             }
         }
@@ -239,8 +266,8 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
             let party_id = format!("spox-{}-{}", std::process::id(), now_ms());
             let mut conn: Option<Conn> = None;
             // Discord refused our activity with Join in it: keep going without Join
-            let no_join = Arc::new(AtomicBool::new(false));
-            let mut retried_without_join = false;
+            let no_join = Arc::new(AtomicU8::new(0));
+            let mut tried_level = 0u8;
             let mut last_try = Instant::now() - Duration::from_secs(60);
             let mut last_sent: Option<(String, String, i64, bool)> = None; // uri, status, start time, joinable
             let mut last_send_at = Instant::now() - Duration::from_secs(60);
@@ -281,7 +308,8 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
                     let _ = write_frame(&mut c.w, 1, &m);
                 }
                 let play = live.lock().unwrap().clone();
-                let joinable = allow_join && !no_join.load(Ordering::SeqCst);
+                let level = no_join.load(Ordering::SeqCst).min(3);
+                let joinable = allow_join && level == 0;
                 let key = play.track.as_ref().map(|t| {
                     let start = if play.status == "paused" { 0 } else { now_ms() - play.position(now_ms()) as i64 };
                     (t.uri.clone(), play.status.clone(), start, joinable)
@@ -292,15 +320,15 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
                     (None, None) => false,
                     _ => true,
                 };
-                if no_join.load(Ordering::SeqCst) && !retried_without_join {
-                    retried_without_join = true;
+                if level != tried_level {
+                    tried_level = level;
                     changed = true;
                 }
                 // Discord allows about 5 updates per 20 s
                 if !changed || last_send_at.elapsed() < Duration::from_secs(4) {
                     continue;
                 }
-                let act = activity(&play, LINK, joinable.then_some(party_id.as_str()));
+                let act = activity(&play, LINK, joinable.then_some(party_id.as_str()), level);
                 let msg = json!({"cmd": "SET_ACTIVITY", "args": {"pid": std::process::id(), "activity": act}, "nonce": nonce()});
                 if write_frame(&mut c.w, 1, &msg).is_ok() {
                     last_sent = key;
@@ -311,4 +339,16 @@ pub fn start(cfg: Shared, live: Arc<Mutex<Play>>, solo: Sender<String>) {
             }
         })
         .ok();
+}
+
+/// Small log next to the cache, to see why Discord refuses something.
+fn log(line: &str) {
+    use std::io::Write as _;
+    let p = crate::config::cache_dir().join("discord.log");
+    if std::fs::metadata(&p).map(|m| m.len() > 64 * 1024).unwrap_or(false) {
+        let _ = std::fs::remove_file(&p);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "{} {}", now_ms(), line);
+    }
 }

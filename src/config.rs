@@ -95,6 +95,7 @@ pub struct Config {
     pub dev_mode: bool,
     pub discord_join: bool,
     pub auto_update: bool,
+    pub hide_tray_with_player: bool,
     pub color_sat: i32,
     pub grey_tint: String,
     pub grey_light: i32,
@@ -157,7 +158,7 @@ impl Default for Config {
             pinned_history: false,
             tb_paused_dim: true,
             tb_monitor: "main".into(),
-            tb_fullscreen: "info".into(),
+            tb_fullscreen: "other".into(),
             tb_volume_bar: false,
             tb_show_when: "always".into(),
             tb_left_offset: 8,
@@ -170,6 +171,7 @@ impl Default for Config {
             dev_mode: false,
             discord_join: true,
             auto_update: true,
+            hide_tray_with_player: true,
             color_sat: 100,
             grey_tint: "none".into(),
             grey_light: 100,
@@ -177,7 +179,7 @@ impl Default for Config {
             text_shadow: false,
             text_style: "normal".into(),
             color_over: Default::default(),
-            cfg_version: 5,
+            cfg_version: 6,
             color_hue: 0,
             installed_asked: false,
         }
@@ -202,6 +204,13 @@ impl Config {
                         c.tb_pos = "left".into();
                     }
                     c.tb_fullscreen = if c.tb_hide_fullscreen { "info".into() } else { "normal".into() };
+                }
+                // v0.5.7: fullscreen app = hop to the other monitor (falls back to info with one monitor)
+                if c.cfg_version < 6 {
+                    c.cfg_version = 6;
+                    if c.tb_fullscreen == "info" {
+                        c.tb_fullscreen = "other".into();
+                    }
                 }
                 if c.collapse_anim == "fly" {
                     c.collapse_anim = "tv".into();

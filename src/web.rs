@@ -72,6 +72,23 @@ impl Api {
         items.iter().find_map(Self::parse_track)
     }
 
+    /// Songs by an artist (for smart shuffle without a Last.fm key), shuffled a bit by the search offset.
+    pub fn search_artist(&self, artist: &str) -> Vec<Track> {
+        if artist.is_empty() {
+            return Vec::new();
+        }
+        let q = format!("artist:\"{}\"", artist);
+        let off = (crate::config::now_ms() as u64 / 1000) % 3 * 10;
+        let Ok(v) = self.get(&format!("/search?type=track&limit=10&offset={}&q={}", off, enc(&q))) else { return Vec::new() };
+        let mut out: Vec<Track> = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
+        if out.is_empty() && off > 0 {
+            if let Ok(v) = self.get(&format!("/search?type=track&limit=10&q={}", enc(&q))) {
+                out = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
+            }
+        }
+        out
+    }
+
     /// Every song in Liked Songs (paged, capped at 5000).
     pub fn liked_all(&self) -> Vec<Track> {
         let mut out = Vec::new();

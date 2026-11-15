@@ -597,6 +597,16 @@ mod win {
         }
     }
 
+    /// "Automatically hide the taskbar" is on.
+    fn taskbar_autohides() -> bool {
+        unsafe {
+            let mut d: windows_sys::Win32::UI::Shell::APPBARDATA = std::mem::zeroed();
+            d.cbSize = std::mem::size_of::<windows_sys::Win32::UI::Shell::APPBARDATA>() as u32;
+            // ABM_GETSTATE = 4, ABS_AUTOHIDE = 1
+            (windows_sys::Win32::UI::Shell::SHAppBarMessage(4, &mut d) as u32) & 1 != 0
+        }
+    }
+
     /// All taskbars: the main one first, then the other monitors' left to right.
     fn taskbars() -> Vec<HWND> {
         unsafe {
@@ -648,7 +658,7 @@ mod win {
                 }
                 sh.monitors.store(bars.len(), Ordering::SeqCst);
                 // which taskbar?
-                let idx = match cfg.tb_monitor.as_str() {
+                let mut idx = match cfg.tb_monitor.as_str() {
                     "main" => 0,
                     "follow" => {
                         let fg = GetForegroundWindow();
@@ -662,6 +672,17 @@ mod win {
                     }
                     n => n.parse::<usize>().ok().map(|n| n.saturating_sub(1)).filter(|i| *i < bars.len()).unwrap_or(0),
                 };
+                // a fullscreen app on that monitor: hop over to another monitor's taskbar
+                let mut mode = cfg.tb_fullscreen.clone();
+                if mode == "other" {
+                    let mon0 = MonitorFromWindow(bars[idx], MONITOR_DEFAULTTONEAREST);
+                    if fullscreen_on(mon0, me) {
+                        match (0..bars.len()).find(|j| *j != idx && !fullscreen_on(MonitorFromWindow(bars[*j], MONITOR_DEFAULTTONEAREST), me)) {
+                            Some(j) => idx = j,
+                            None => mode = "info".into(), // one monitor: info only on top of the app
+                        }
+                    }
+                }
                 let bar = bars[idx];
                 let Some(br) = rect(bar) else { continue };
                 let mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST);
@@ -673,8 +694,13 @@ mod win {
                 let slid_away = mr.map(|m| br.bottom > m.bottom + 2 || br.top < m.top - 2 || h < 8).unwrap_or(false);
                 let play = sh.live.lock().unwrap().clone();
                 let idle = super::nothing_playing(&sh, &play);
-                let fs = cfg.tb_fullscreen != "normal" && fullscreen_on(mon, me);
-                let info = fs && cfg.tb_fullscreen == "info";
+                let fs = mode != "normal" && fullscreen_on(mon, me);
+                let info = fs && (mode == "info" || mode == "other");
+                // the taskbar slides away for a moment while a game / video goes fullscreen or back:
+                // stay where we are instead of blinking out (unless the taskbar is set to auto-hide)
+                if slid_away && !info && !taskbar_autohides() && last.map(|l| l.4).unwrap_or(false) {
+                    continue;
+                }
                 if sh.fs_info.swap(info, Ordering::SeqCst) != info {
                     ctx.request_repaint_of(super::id());
                 }
@@ -682,7 +708,7 @@ mod win {
                     || !wide
                     || scale < 1
                     || (slid_away && !info)
-                    || (fs && cfg.tb_fullscreen == "hide")
+                    || (fs && mode == "hide")
                     || (idle && cfg.tb_idle == "hide")
                     || (cfg.tb_show_when == "hidden" && !crate::desktop::HIDDEN.load(Ordering::SeqCst))
                     || (!info && last.map(|l| l.4 && shell_popup_over([l.0, l.1, l.2, l.3])).unwrap_or(false));

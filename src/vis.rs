@@ -17,6 +17,9 @@ pub struct Vis {
     last: Instant,
     failed_at: Option<Instant>,
     idle_since: Option<Instant>,
+    /// last time real sound arrived
+    last_fresh: Instant,
+    t0: Instant,
 }
 
 struct Ring {
@@ -37,6 +40,8 @@ impl Vis {
             last: Instant::now(),
             failed_at: None,
             idle_since: None,
+            last_fresh: Instant::now(),
+            t0: Instant::now(),
         }
     }
 
@@ -108,11 +113,29 @@ impl Vis {
             }
         }
         let mut target = vec![0.0f32; self.bars.len()];
-        if playing && self.stream.is_some() {
+        // a stream that stopped delivering sound (device switched, headset unplugged...): open it again
+        if playing && self.stream.is_some() && self.last_fresh.elapsed().as_secs_f32() > 2.5 {
+            self.stream = None;
+            self.last_fresh = Instant::now();
+        }
+        if playing && (self.stream.is_none() || self.last_fresh.elapsed().as_secs_f32() > 1.0) {
+            // no sound to read right now: keep it alive with a gentle made-up dance instead of freezing
+            let t = self.t0.elapsed().as_secs_f32();
+            let n = self.bars.len() as f32;
+            target = (0..self.bars.len())
+                .map(|i| {
+                    let x = i as f32 / n;
+                    let a = (t * 3.1 + x * 9.0).sin() * 0.5 + 0.5;
+                    let b = (t * 5.3 - x * 4.0).sin() * 0.5 + 0.5;
+                    (0.15 + 0.55 * a * b) * (1.0 - x * 0.45)
+                })
+                .collect();
+        } else if playing && self.stream.is_some() {
             let samples = {
                 let mut r = self.ring.lock().unwrap();
                 if r.fresh {
                     r.fresh = false;
+                    self.last_fresh = Instant::now();
                     let mut s = Vec::with_capacity(N);
                     s.extend_from_slice(&r.buf[r.pos..]);
                     s.extend_from_slice(&r.buf[..r.pos]);

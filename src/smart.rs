@@ -3,7 +3,7 @@
 //! suggestions (collected from the queue) and, if you add a key, from Last.fm "similar tracks".
 //! Runs on its own thread, so it keeps working while SpoX is hidden in the tray.
 
-use crate::config::{self, Shared};
+use crate::config::{self, now_ms, Shared};
 use crate::net::{self, enc};
 use crate::soloist::{command, command_with};
 use crate::state::{Ev, Play, Playlist, Track};
@@ -239,6 +239,14 @@ impl Engine {
     }
 
     fn on_track(&mut self) {
+        // you're jumping ahead in Up next: don't slip songs in until you land
+        if now_ms() < HOLD_UNTIL.load(std::sync::atomic::Ordering::SeqCst) {
+            let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
+            if let Some(i) = self.queued.iter().position(|u| *u == cur) {
+                self.queued.drain(..=i);
+            }
+            return;
+        }
         let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
         if let Some(i) = self.queued.iter().position(|u| *u == cur) {
             // one of our picks is playing: the playlist continues after it
@@ -284,7 +292,7 @@ impl Engine {
     /// Last.fm "similar tracks" for a random song of the playlist (only with a Last.fm key).
     fn maybe_discover(&mut self) {
         let key_ = self.cfg.lock().unwrap().lastfm_key.trim().to_string();
-        if key_.is_empty() || *self.fetching.lock().unwrap() {
+        if *self.fetching.lock().unwrap() || self.tracks.is_empty() {
             return;
         }
         if self.pool.lock().unwrap().len() >= 12 {
@@ -299,6 +307,26 @@ impl Engine {
         let used = self.used.clone();
         *fetching.lock().unwrap() = true;
         std::thread::spawn(move || {
+            if key_.is_empty() {
+                // no Last.fm key: more songs by artists from this playlist that you don't have yet
+                let mut added = 0;
+                for t in api.search_artist(&first_artist_raw(&seed.artists)) {
+                    let k = key(&t.name, &t.artists);
+                    if used.contains(&k) || lib.lock().unwrap().contains(&k) {
+                        continue;
+                    }
+                    let mut p = pool.lock().unwrap();
+                    if !p.iter().any(|x| x.uri == t.uri) {
+                        p.push_back(t);
+                        added += 1;
+                    }
+                    if added >= 4 {
+                        break;
+                    }
+                }
+                *fetching.lock().unwrap() = false;
+                return;
+            }
             let url = format!(
                 "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar&autocorrect=1&limit=40&format=json&api_key={}&artist={}&track={}",
                 enc(&key_), enc(&first_artist(&seed.artists)), enc(&seed.name)
@@ -339,6 +367,17 @@ impl Engine {
     }
 }
 
+fn first_artist_raw(a: &str) -> String {
+    a.split(", ").next().unwrap_or("").to_string()
+}
+
 fn first_artist(a: &str) -> String {
     a.split(", ").next().unwrap_or("").to_lowercase()
+}
+
+static HOLD_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Pause smart picks for a moment (while skipping through Up next).
+pub fn hold_for(d: Duration) {
+    HOLD_UNTIL.store(now_ms() + d.as_millis() as i64, std::sync::atomic::Ordering::SeqCst);
 }

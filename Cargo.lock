@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "spox"
-version = "0.5.5"
+version = "0.5.7"
 dependencies = [
  "base64",
  "cpal",

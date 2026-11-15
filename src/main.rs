@@ -39,6 +39,13 @@ fn main() -> eframe::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if !ok && !std::env::args().any(|a| a == "--uninstall") {
+            // already running: show that one (it may be hidden with no tray icon) and stop here
+            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+            let title: Vec<u16> = concat!("SpoX ", env!("CARGO_PKG_VERSION")).encode_utf16().chain(std::iter::once(0)).collect();
+            let h = FindWindowW(std::ptr::null(), title.as_ptr());
+            if !h.is_null() {
+                PostMessageW(h, desktop::WM_SPOX_SHOW, 0, 0);
+            }
             return Ok(());
         }
     }
