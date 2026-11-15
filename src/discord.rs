@@ -107,9 +107,12 @@ fn activity(p: &Play, link: &str) -> Option<Value> {
             "small_url": link,
         },
     });
+    // "Listen along" the simple way: one click opens the same song in Spotify
+    let mut buttons = vec![json!({ "label": "Listen on Spotify", "url": song })];
     if link.starts_with("https://") {
-        a["buttons"] = json!([{ "label": "Get SpoX", "url": link }]);
+        buttons.push(json!({ "label": "Get SpoX", "url": link }));
     }
+    a["buttons"] = Value::Array(buttons);
     if p.status != "paused" && t.duration_ms > 0 {
         let start = now_ms() - p.position(now_ms()) as i64;
         a["timestamps"] = json!({ "start": start, "end": start + t.duration_ms as i64 });
