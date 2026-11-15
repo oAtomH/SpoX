@@ -25,11 +25,15 @@ object SpoxNotification {
     private var session: MediaSession? = null
     private var lastKey = ""
 
-    fun enabled(ctx: Context) = ctx.getSharedPreferences("spox", 0).getBoolean("notification", true)
+    /** "pixel" = SpoX's own pixel card, "media" = Android's media player look (Now Bar), "off". */
+    fun style(ctx: Context): String = ctx.getSharedPreferences("spox", 0).getString("notif_style", "pixel") ?: "pixel"
+    fun enabled(ctx: Context) = style(ctx) != "off"
 
-    fun setEnabled(ctx: Context, on: Boolean) {
-        ctx.getSharedPreferences("spox", 0).edit().putBoolean("notification", on).apply()
-        if (!on) clear(ctx) else update(ctx)
+    fun cycleStyle(ctx: Context) {
+        val next = when (style(ctx)) { "pixel" -> "media"; "media" -> "off"; else -> "pixel" }
+        ctx.getSharedPreferences("spox", 0).edit().putString("notif_style", next).apply()
+        clear(ctx)
+        update(ctx)
     }
 
     private fun session(ctx: Context): MediaSession = session ?: MediaSession(ctx, "SpoX").also { s ->
@@ -61,6 +65,25 @@ object SpoxNotification {
         return big
     }
 
+    /** The taskbar player picture as the whole notification, buttons on top (Android still adds its
+     *  small header line; everything else is pixels). */
+    private fun pixelCard(ctx: Context, nm: NotificationManager, st: Player.State, open: PendingIntent) {
+        val rv = PlayerWidget.views(ctx)
+        val n = Notification.Builder(ctx, CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_spox)
+            .setContentTitle(st.title)
+            .setContentText(st.artist)
+            .setCustomContentView(rv)
+            .setCustomBigContentView(rv)
+            .setStyle(Notification.DecoratedCustomViewStyle())
+            .setContentIntent(open)
+            .setOngoing(st.playing)
+            .setOnlyAlertOnce(true)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .build()
+        runCatching { nm.notify(ID, n) }
+    }
+
     fun update(ctx: Context) {
         if (!enabled(ctx)) return
         val st = Player.state
@@ -73,10 +96,18 @@ object SpoxNotification {
                 setShowBadge(false)
             })
         }
-        val s = session(ctx)
-        val key = "${st.title}|${st.artist}|${st.playing}|${st.positionMs / 1000}"
+        val key = "${style(ctx)}|${st.title}|${st.artist}|${st.playing}|${st.positionMs / 1000}|${st.art?.generationId}"
         if (key == lastKey) return
         lastKey = key
+        val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        if (style(ctx) == "pixel") {
+            // no media session here: otherwise Android shows its own (non-pixel) player for SpoX too
+            session?.let { it.isActive = false; it.release() }
+            session = null
+            pixelCard(ctx, nm, st, open)
+            return
+        }
+        val s = session(ctx)
         val art = pixelArt(st.art, ctx)
         s.setMetadata(
             MediaMetadata.Builder()
@@ -98,7 +129,7 @@ object SpoxNotification {
             Icon.createWithResource(ctx, icon), label,
             PendingIntent.getBroadcast(ctx, name.hashCode(), Intent(ctx, NotifyActions::class.java).setAction(name), PendingIntent.FLAG_IMMUTABLE)
         ).build()
-        val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+
         val n = Notification.Builder(ctx, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_spox)
             .setLargeIcon(art)

@@ -73,6 +73,11 @@ class PlayerWidget : AppWidgetProvider() {
             val key = "${st.title}|${st.artist}|${st.playing}|${st.art?.generationId}"
             if (key == lastKey) return
             lastKey = key
+            mgr.updateAppWidget(ids, views(ctx))
+        }
+
+        /** The pixel player picture with its four touch zones (widget and pixel notification). */
+        fun views(ctx: Context): RemoteViews {
             val rv = RemoteViews(ctx.packageName, R.layout.widget)
             rv.setImageViewBitmap(R.id.w_image, render(ctx))
             fun pi(a: String) = PendingIntent.getBroadcast(ctx, a.hashCode(), Intent(ctx, PlayerWidget::class.java).setAction(a), PendingIntent.FLAG_IMMUTABLE)
@@ -80,7 +85,7 @@ class PlayerWidget : AppWidgetProvider() {
             rv.setOnClickPendingIntent(R.id.w_play, pi("w_play"))
             rv.setOnClickPendingIntent(R.id.w_next, pi("w_next"))
             rv.setOnClickPendingIntent(R.id.w_open, PendingIntent.getActivity(ctx, 1, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-            mgr.updateAppWidget(ids, rv)
+            return rv
         }
     }
 }
