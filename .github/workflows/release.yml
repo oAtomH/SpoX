@@ -82,6 +82,10 @@ jobs:
           KS: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
           if [ -n "$KS" ]; then echo "$KS" | base64 -d > "$RUNNER_TEMP/spox.jks"; echo "SPOX_KEYSTORE_FILE=$RUNNER_TEMP/spox.jks" >> "$GITHUB_ENV"; else echo "No ANDROID_KEYSTORE secret: using a debug key"; fi
+      - name: SpoX Engine helpers (spoxrun + sound bridge)
+        run: |
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu >/dev/null
+          sh android/native/build.sh
       - name: Build SpoX.apk
         env:
           SPOX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}

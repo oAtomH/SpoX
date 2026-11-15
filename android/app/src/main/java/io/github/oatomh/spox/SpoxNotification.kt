@@ -20,8 +20,8 @@ import android.media.session.PlaybackState
  * app and sends the buttons back to it. (Spotify's own player stays next to it for now.)
  */
 object SpoxNotification {
-    private const val CHANNEL = "player"
-    private const val ID = 77
+    const val CHANNEL = "player"
+    const val ID = 77
     private var session: MediaSession? = null
     private var lastKey = ""
 
@@ -66,7 +66,11 @@ object SpoxNotification {
     private var artFor: Bitmap? = null
     private var artDone: Bitmap? = null
 
+    /** Pixel-art cover on the lock screen / phone's player (Settings > Pixel cover). */
+    fun pixelCover(ctx: Context) = ctx.getSharedPreferences("spox", 0).getBoolean("pixel_cover", true)
+
     private fun pixelArt(src: Bitmap?, ctx: Context): Bitmap? {
+        if (!pixelCover(ctx)) return src
         if (src != null && src === artFor) return artDone
         return pixelArtNew(src, ctx).also { artFor = src; artDone = it }
     }
@@ -101,18 +105,41 @@ object SpoxNotification {
         runCatching { nm.notify(ID, n) }
     }
 
-    fun update(ctx: Context) {
-        if (!enabled(ctx)) return
-        val st = Player.state
-        if (!st.hasTrack) {
-            clear(ctx); return
-        }
+    fun channel(ctx: Context) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(CHANNEL) == null) {
             nm.createNotificationChannel(NotificationChannel(CHANNEL, "SpoX player", NotificationManager.IMPORTANCE_LOW).apply {
                 setShowBadge(false)
             })
         }
+    }
+
+    /** What SpoX Engine shows while it starts (and when the player is switched off). */
+    fun placeholder(ctx: Context, text: String): Notification {
+        channel(ctx)
+        return Notification.Builder(ctx, CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_spox)
+            .setContentTitle("SpoX")
+            .setContentText(text)
+            .setContentIntent(PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+            .setOngoing(true)
+            .setShowWhen(false)
+            .build()
+    }
+
+    fun update(ctx: Context) {
+        val st = Player.state
+        if (!enabled(ctx)) {
+            // the engine still needs its notification to keep running
+            if (Player.fromEngine) runCatching { ctx.getSystemService(NotificationManager::class.java).notify(ID, placeholder(ctx, st.title.ifEmpty { "Engine on" })) }
+            return
+        }
+        if (!st.hasTrack) {
+            if (!Player.fromEngine) clear(ctx)
+            return
+        }
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        channel(ctx)
         // the song position only matters when it jumps (a seek): Android moves the bar by itself.
         // So rebuild on "when did this song start" changing, not on every position report.
         val at = if (st.playing) (st.positionAt - st.positionMs) / 2000 else st.positionMs / 1000
@@ -144,8 +171,8 @@ object SpoxNotification {
                     PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO)
                 .setState(if (st.playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED, st.position(), if (st.playing) 1f else 0f)
                 // extra buttons on the phone's player (Android shows up to two)
-                .addCustomAction(PlaybackState.CustomAction.Builder("shuffle", if (st.shuffle) "Shuffle on" else "Shuffle off", R.drawable.ic_shuffle).build())
-                .addCustomAction(PlaybackState.CustomAction.Builder("repeat", if (st.repeat) "Repeat on" else "Repeat off", R.drawable.ic_repeat).build())
+                .addCustomAction(PlaybackState.CustomAction.Builder("shuffle", if (st.shuffle) "Shuffle on" else "Shuffle off", if (st.shuffle) R.drawable.ic_px_shuffle_on else R.drawable.ic_px_shuffle).build())
+                .addCustomAction(PlaybackState.CustomAction.Builder("repeat", if (st.repeat) "Repeat on" else "Repeat off", if (st.repeat) R.drawable.ic_px_repeat_on else R.drawable.ic_px_repeat).build())
                 .build()
         )
         fun action(name: String, icon: Int, label: String) = Notification.Action.Builder(
@@ -158,14 +185,14 @@ object SpoxNotification {
             .setLargeIcon(art)
             .setContentTitle(st.title)
             .setContentText(st.artist)
-            .setSubText("SpoX")
+            .setSubText(if (Player.fromEngine) "SpoX" else "SpoX · Spotify")
             .setContentIntent(open)
             .setOngoing(st.playing)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setColor(Skin.get(ctx).color("title"))
-            .addAction(action("prev", android.R.drawable.ic_media_previous, "Previous"))
-            .addAction(if (st.playing) action("toggle", android.R.drawable.ic_media_pause, "Pause") else action("toggle", android.R.drawable.ic_media_play, "Play"))
-            .addAction(action("next", android.R.drawable.ic_media_next, "Next"))
+            .addAction(action("prev", R.drawable.ic_px_prev, "Previous"))
+            .addAction(if (st.playing) action("toggle", R.drawable.ic_px_pause, "Pause") else action("toggle", R.drawable.ic_px_play, "Play"))
+            .addAction(action("next", R.drawable.ic_px_next, "Next"))
             .setStyle(Notification.MediaStyle().setMediaSession(s.sessionToken).setShowActionsInCompactView(0, 1, 2))
             .build()
         runCatching { nm.notify(ID, n) }

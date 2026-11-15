@@ -48,10 +48,41 @@ object Player {
     private lateinit var app: Context
 
     /** Music apps SpoX follows, best first. */
-    private val preferred = listOf("io.github.oatomh.spox.engine", "com.spotify.music", "com.spotify.lite")
+    private val preferred = listOf("com.spotify.music", "com.spotify.lite")
+
+    // ---- SpoX Engine (Spotify inside SpoX): used whenever it has a song -------------------------
+
+    private var engine: io.github.oatomh.spox.engine.Engine? = null
+    /** True while the music comes from SpoX's own engine (not the Spotify app). */
+    val fromEngine get() = engine?.let { it.isLive && it.now.track != null } == true
+
+    private val engineChanged: () -> Unit = { main.post { refresh() } }
+    private val outputs: () -> Unit = {
+        SpoxNotification.update(app)
+        PlayerWidget.updateAll(app)
+    }
 
     fun init(ctx: Context) {
-        if (!::app.isInitialized) app = ctx.applicationContext
+        if (::app.isInitialized) return
+        app = ctx.applicationContext
+        engine = io.github.oatomh.spox.engine.Engine.get(app).also { it.now.listeners += engineChanged }
+        // notification + widget follow every change, whether or not Notification access is on
+        listen(outputs)
+    }
+
+    private fun fromEngineState(): State {
+        val e = engine!!
+        val n = e.now
+        val t = n.track!!
+        val nowT = SystemClock.elapsedRealtime()
+        // the speaker is a little behind Soloist: show (and sync lyrics to) what you hear
+        val heard = (n.position() - if (n.playing) e.audioLagMs else 0).coerceAtLeast(0)
+        return State(
+            title = t.title, artist = t.artist, album = t.album, art = n.art,
+            durationMs = t.durationMs, positionMs = heard, positionAt = nowT,
+            playing = n.playing, shuffle = n.shuffle, repeat = n.repeat != "off",
+            app = "io.github.oatomh.spox.engine",
+        )
     }
 
     // A button press shows at once; Spotify confirms a moment later. Until then (or 1.5 s),
@@ -133,6 +164,11 @@ object Player {
     private var lastArt: Bitmap? = null
 
     private fun refresh() {
+        if (fromEngine) {
+            state = settle(fromEngineState())
+            changed()
+            return
+        }
         val c = controller
         if (c == null) {
             state = State()
@@ -190,15 +226,26 @@ object Player {
 
     private val tc get() = controller?.transportControls
 
-    fun play() { if (controller != null) expect(playing = true); tc?.play() }
-    fun pause() { if (controller != null) expect(playing = false); tc?.pause() }
+    private val eng get() = engine?.takeIf { fromEngine }
+
+    fun play() { eng?.let { expect(playing = true); it.command("play"); return }; if (controller != null) expect(playing = true); tc?.play() }
+    fun pause() { eng?.let { expect(playing = false); it.command("pause"); return }; if (controller != null) expect(playing = false); tc?.pause() }
 
     fun playPause() {
         if (state.playing) pause() else play()
     }
-    fun next() = tc?.skipToNext()
-    fun prev() = tc?.skipToPrevious()
-    fun seek(ms: Long) = tc?.seekTo(ms)
+    fun next() { eng?.let { it.command("skip_next"); return }; tc?.skipToNext() }
+    fun prev() { eng?.let { it.command("skip_prev"); return }; tc?.skipToPrevious() }
+    fun seek(ms: Long) {
+        eng?.let { e ->
+            state = state.copy(positionMs = ms, positionAt = SystemClock.elapsedRealtime())
+            changed()
+            // ask for the spot you'll hear, not the one Soloist is at
+            e.command("seek", mapOf("position_ms" to ms.coerceAtLeast(0)))
+            return
+        }
+        tc?.seekTo(ms)
+    }
 
     /** Shuffle / repeat: the music app's own buttons if it has them, else the standard command. */
     private fun custom(word: String): Boolean {
@@ -208,6 +255,7 @@ object Player {
     }
 
     fun toggleShuffle() {
+        eng?.let { e -> expect(shuffle = !state.shuffle); e.command("set_shuffle", mapOf("enabled" to state.shuffle)); return }
         if (controller == null) return
         expect(shuffle = !state.shuffle)
         if (custom("shuffle")) return
@@ -219,6 +267,7 @@ object Player {
     }
 
     fun toggleRepeat() {
+        eng?.let { e -> expect(repeat = !state.repeat); e.command("set_repeat_context", mapOf("enabled" to state.repeat)); return }
         if (controller == null) return
         expect(repeat = !state.repeat)
         if (custom("repeat")) return
@@ -250,15 +299,37 @@ object Player {
     } ?: emptyList()
 
     /** Up next, as (id, title, artist) for the list. */
-    fun queueItems(): List<Triple<Long, String, String>> = controller?.queue?.mapNotNull { q ->
+    fun queueItems(): List<Triple<Long, String, String>> = eng?.now?.queue?.mapIndexed { i, t -> Triple(i.toLong(), t.title, t.artist) } ?: controller?.queue?.mapNotNull { q ->
         val t = q.description.title?.toString() ?: return@mapNotNull null
         Triple(q.queueId, t, q.description.subtitle?.toString().orEmpty())
     } ?: emptyList()
 
-    fun playQueueItem(id: Long) = tc?.skipToQueueItem(id)
+    fun playQueueItem(id: Long) { eng?.let { it.skipAhead(id.toInt() + 1); return }; tc?.skipToQueueItem(id) }
+
+    // ---- sleep timer ---------------------------------------------------------------------
+
+    private var sleepAt = 0L
+    private val sleep = Runnable { sleepAt = 0; pause(); changed() }
+
+    fun sleepLabel(): String {
+        if (sleepAt == 0L) return "off"
+        val left = (sleepAt - SystemClock.elapsedRealtime()) / 60000 + 1
+        return "$left min left"
+    }
+
+    /** off -> 15 -> 30 -> 60 -> 90 min -> off */
+    fun cycleSleep() {
+        val left = if (sleepAt == 0L) 0 else (sleepAt - SystemClock.elapsedRealtime()) / 60000 + 1
+        val next = listOf(15L, 30L, 60L, 90L).firstOrNull { it > left + 1 } ?: 0L
+        main.removeCallbacks(sleep)
+        sleepAt = 0
+        if (next > 0) { sleepAt = SystemClock.elapsedRealtime() + next * 60000; main.postDelayed(sleep, next * 60000) }
+        changed()
+    }
 
     /** Opens the music app (e.g. to pick a playlist there). */
     fun openApp(ctx: Context) {
+        if (fromEngine) return
         val pkg = state.app.ifEmpty { "com.spotify.music" }
         ctx.packageManager.getLaunchIntentForPackage(pkg)?.let {
             it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)

@@ -11,21 +11,15 @@ import android.content.ComponentName
  */
 class MediaListener : NotificationListenerService() {
     private val sessions = MediaSessionManager.OnActiveSessionsChangedListener { Player.pick() }
-    private val update: () -> Unit = {
-        SpoxNotification.update(this)
-        PlayerWidget.updateAll(this)
-    }
 
     override fun onListenerConnected() {
         Player.init(this)
         val msm = getSystemService(MediaSessionManager::class.java)
         runCatching { msm.addOnActiveSessionsChangedListener(sessions, ComponentName(this, MediaListener::class.java)) }
-        Player.listen(update)
         Player.pick()
     }
 
     override fun onListenerDisconnected() {
         runCatching { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(sessions) }
-        Player.unlisten(update)
     }
 }

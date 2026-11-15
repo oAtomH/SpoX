@@ -155,15 +155,83 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             cached ?: load(ctx).also { cached = it }
         }
 
+        /** Forget the loaded skin (after changing the colour pack). */
+        fun reload() { cached = null }
+
+        // ---- colour packs (the same ones as SpoX on Windows) ----------------------------------
+        // name, hue turn, saturation, grey tint colour, tint strength, grey brightness
+        class Pack(val name: String, val hue: Float, val sat: Float, val tint: Int, val tintK: Float, val light: Float)
+
+        val PACKS = listOf(
+            Pack("Default", 0f, 1f, 0x000000, 0f, 1f),
+            Pack("Amber CRT", -100f, 1f, 0xFFAA3C, 0.12f, 0.95f),
+            Pack("Ice", 55f, 0.9f, 0x78BEFF, 0.10f, 1f),
+            Pack("Rose", -160f, 0.9f, 0xFF78A0, 0.08f, 1f),
+            Pack("Lime", -55f, 1f, 0x000000, 0f, 1f),
+            Pack("Mono", 0f, 0f, 0x000000, 0f, 1f),
+            Pack("Game Boy", -60f, 0.55f, 0x96AA28, 0.35f, 1.05f),
+            Pack("Vapor", 160f, 1f, 0xC850FF, 0.14f, 1f),
+            Pack("Blood", -140f, 1f, 0xFF1E1E, 0.10f, 0.85f),
+            Pack("Ocean", 70f, 1f, 0x2878C8, 0.16f, 0.95f),
+            Pack("Sunset", -120f, 1.1f, 0xFF6E3C, 0.12f, 1f),
+            Pack("Paper", 0f, 0.8f, 0xFFF0D2, 0.10f, 1.6f),
+        )
+
+        fun packName(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("pack", "Default") ?: "Default"
+
+        /** Accent (coloured) pixels get their hue turned and saturation scaled; greys keep their
+         *  shape and only get the pack's tint / brightness. Same maths as the desktop app. */
+        private fun recolor(c: Int, p: Pack): Int {
+            val a = Color.alpha(c)
+            val r = Color.red(c) / 255f; val g = Color.green(c) / 255f; val b = Color.blue(c) / 255f
+            val mx = maxOf(r, g, b); val mn = minOf(r, g, b); val d = mx - mn
+            val sat = if (mx > 0) d / mx else 0f
+            if (sat < 0.22f || d < 0.06f) {
+                if (p.tintK == 0f && p.light == 1f) return c
+                fun q(v: Int, t: Int): Int {
+                    val x = v * p.light
+                    return (x + (t * maxOf(x / 255f, 0.25f) - x) * p.tintK).toInt().coerceIn(0, 255)
+                }
+                return Color.argb(a, q(Color.red(c), (p.tint shr 16) and 255), q(Color.green(c), (p.tint shr 8) and 255), q(Color.blue(c), p.tint and 255))
+            }
+            var h = when (mx) { r -> 60f * (((g - b) / d).mod(6f)); g -> 60f * ((b - r) / d + 2f); else -> 60f * ((r - g) / d + 4f) }
+            h = (h + p.hue).mod(360f)
+            val s2 = (sat * p.sat).coerceIn(0f, 1f)
+            val cc = mx * s2
+            val x = cc * (1f - kotlin.math.abs((h / 60f).mod(2f) - 1f))
+            val m = mx - cc
+            val (r1, g1, b1) = when ((h / 60f).toInt()) { 0 -> Triple(cc, x, 0f); 1 -> Triple(x, cc, 0f); 2 -> Triple(0f, cc, x); 3 -> Triple(0f, x, cc); 4 -> Triple(x, 0f, cc); else -> Triple(cc, 0f, x) }
+            fun q(f: Float) = ((f + m) * 255f).toInt().coerceIn(0, 255)
+            return Color.argb(a, q(r1), q(g1), q(b1))
+        }
+
         private fun load(ctx: Context): Skin {
             val am = ctx.assets
             val json = runCatching { JSONObject(am.open("skin/skin.json").bufferedReader().readText()) }.getOrElse { JSONObject() }
-            val opts = BitmapFactory.Options().apply { inScaled = false; inPreferredConfig = Bitmap.Config.ARGB_8888 }
+            val opts = BitmapFactory.Options().apply { inScaled = false; inPreferredConfig = Bitmap.Config.ARGB_8888; inMutable = true }
+            val pack = PACKS.firstOrNull { it.name == packName(ctx) }?.takeIf { it.name != "Default" }
+            val cache = HashMap<Int, Int>()
+            fun rc(c: Int) = if (pack == null) c else cache.getOrPut(c) { recolor(c, pack) }
             val map = HashMap<String, Bitmap>()
             for (f in am.list("skin") ?: emptyArray()) {
                 if (!f.endsWith(".png")) continue
-                runCatching { am.open("skin/$f").use { BitmapFactory.decodeStream(it, null, opts) } }.getOrNull()?.let {
-                    map[f.removeSuffix(".png")] = it
+                runCatching { am.open("skin/$f").use { BitmapFactory.decodeStream(it, null, opts) } }.getOrNull()?.let { b ->
+                    if (pack != null) {
+                        val px = IntArray(b.width * b.height)
+                        b.getPixels(px, 0, b.width, 0, 0, b.width, b.height)
+                        for (i in px.indices) if (Color.alpha(px[i]) != 0) px[i] = rc(px[i])
+                        b.setPixels(px, 0, b.width, 0, 0, b.width, b.height)
+                    }
+                    map[f.removeSuffix(".png")] = b
+                }
+            }
+            if (pack != null) json.optJSONObject("colors")?.let { cols ->
+                for (k in cols.keys().asSequence().toList()) {
+                    val v = cols.optString(k)
+                    if (v.startsWith("#") && v.length == 7) {
+                        val c = rc(Color.parseColor(v))
+                        cols.put(k, String.format("#%06X", c and 0xFFFFFF))
+                    }
                 }
             }
             return Skin(json, map)

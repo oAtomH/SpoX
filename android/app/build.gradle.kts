@@ -15,7 +15,9 @@ android {
     defaultConfig {
         applicationId = "io.github.oatomh.spox"
         minSdk = 29
-        targetSdk = 36
+        // 28 on purpose: SpoX Engine starts Linux programs it downloads (Spotify's Soloist), which
+        // Android only allows for apps targeting Android 9 or older
+        targetSdk = 28
         versionName = cargoVersion
         versionCode = parts[0] * 10000 + parts[1] * 100 + parts[2]
     }
@@ -64,4 +66,6 @@ tasks.named("preBuild") { dependsOn(copySkin) }
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.media:media:1.7.0")
+    // .deb packages (the Linux libraries SpoX Engine fetches) are xz-compressed
+    implementation("org.tukaani:xz:1.10")
 }

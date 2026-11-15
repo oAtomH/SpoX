@@ -403,6 +403,8 @@ static int connect_android(void) {
     const char *name = "spox-audio";
     memcpy(a.sun_path + 1, name, strlen(name));   // abstract name (starts with a 0 byte)
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+    // a small send buffer: less sound waiting in the pipe = lyrics and buttons closer to what you hear
+    int sb = 16384; setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
     if (connect(fd, (struct sockaddr *)&a, len) < 0) { say("[pw] can't reach SpoX Engine's audio (%d)", errno); close(fd); return -1; }
     return fd;
 }

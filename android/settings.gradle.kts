@@ -14,4 +14,3 @@ dependencyResolutionManagement {
 }
 rootProject.name = "SpoX"
 include(":app")
-include(":engine")

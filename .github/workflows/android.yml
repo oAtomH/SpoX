@@ -28,15 +28,10 @@ jobs:
           KS: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
           if [ -n "$KS" ]; then echo "$KS" | base64 -d > "$RUNNER_TEMP/spox.jks"; echo "SPOX_KEYSTORE_FILE=$RUNNER_TEMP/spox.jks" >> "$GITHUB_ENV"; fi
-      - name: spoxrun (small Linux helper for the engine)
+      - name: SpoX Engine helpers (spoxrun + sound bridge)
         run: |
-          mkdir -p android/engine/src/main/assets
-          clang --target=aarch64-linux-gnu -fuse-ld=lld -static -nostdlib -fno-pic -O2 -ffreestanding \
-            -fno-stack-protector -fno-builtin -o android/engine/src/main/assets/spoxrun android/engine/native/spoxrun.c
-          # pwshim: stands in for PipeWire and hands Soloist's sound to Android
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu >/dev/null
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -fvisibility=hidden -Wl,-soname,libpipewire-0.3.so.0 \
-            -o android/engine/src/main/assets/libpipewire-0.3.so.0 android/engine/native/pwshim.c -lpthread
+          sh android/native/build.sh
       - name: Build
         env:
           SPOX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
@@ -44,8 +39,8 @@ jobs:
       - name: Check the APK
         run: |
           cp android/app/build/outputs/apk/release/app-release.apk SpoX.apk
-          cp android/engine/build/outputs/apk/release/engine-release.apk SpoX-Engine.apk
-          ls -la SpoX.apk SpoX-Engine.apk
+          ls -la SpoX.apk
+          echo "engine helpers inside: $(unzip -l SpoX.apk | grep -c 'assets/engine/')"
           echo "skin files inside: $(unzip -l SpoX.apk | grep -c 'assets/skin/')"
       # a "preview" pre-release to install on the phone straight from GitHub (the normal
       # releases stay what the Windows app updates from)
@@ -55,7 +50,6 @@ jobs:
           name: SpoX for Android (preview)
           prerelease: true
           target_commitish: ${{ github.sha }}
-          body: Test build of SpoX for Android, made from the newest code. Open this page on your phone and tap SpoX.apk. SpoX-Engine.apk is the test for playing without the Spotify app.
+          body: Test build of SpoX for Android, made from the newest code. Open this page on your phone and tap SpoX.apk. SpoX Engine (playing without the Spotify app) is built in: add your Soloist key in Settings.
           files: |
             SpoX.apk
-            SpoX-Engine.apk

@@ -27,7 +27,7 @@ import kotlin.math.sin
  * Everything is drawn from the skin at whole-number scales, so the pixels stay square and sharp.
  */
 class PlayerView(ctx: Context) : View(ctx) {
-    private val skin = Skin.get(ctx)
+    private val skin get() = Skin.get(context)
 
     enum class Tab(val label: String) { PLAYER("Player"), LYRICS("Lyrics"), QUEUE("Up next"), SETTINGS("Settings") }
     var tab = Tab.PLAYER
@@ -409,8 +409,10 @@ class PlayerView(ctx: Context) : View(ctx) {
     }
 
     private var visColors: IntArray? = null
+    private var visFor: Skin? = null
     private fun visCol(frac: Float): Int {
         val b = skin.sprite("vis_colors") ?: return cTitle
+        if (visFor !== skin) { visFor = skin; visColors = null }
         val c = visColors ?: IntArray(b.height) { b.getPixel(0, it) }.also { visColors = it }
         return c[min(c.size - 1, (frac * c.size).toInt().coerceAtLeast(0))]
     }
@@ -463,7 +465,23 @@ class PlayerView(ctx: Context) : View(ctx) {
         val wrapped = wrapCache.takeIf { wrapKey == "$lyricsKey|$maxW|$k" } ?: wrap(l, maxW, k).also {
             wrapCache = it; wrapKey = "$lyricsKey|$maxW|$k"
         }
-        val p = st.position(now) + 250
+        // early by a quarter second (reads naturally), plus this song's own nudge (- / + above)
+        val off = lyricOffset()
+        val p = st.position(now) + 250 + off
+        if (l.synced) {
+            val label = (if (off >= 0) "+" else "") + String.format("%.2fs", off / 1000f)
+            val bw = 16 * u
+            val y0 = contentTop + 4 * u
+            val xPlus = width - pad - bw
+            val xMinus = xPlus - bw - tw(label, u) - 8 * u
+            nine(cv, "list_bg", xMinus, y0 - 2 * u, bw, 14 * u, u, 4)
+            txt(cv, "-", xMinus + (bw - tw("-", u)) / 2, y0 + u, u, cTitle)
+            txt(cv, label, xMinus + bw + 4 * u, y0 + u, u, if (off == 0L) cDim else cTitle)
+            nine(cv, "list_bg", xPlus, y0 - 2 * u, bw, 14 * u, u, 4)
+            txt(cv, "+", xPlus + (bw - tw("+", u)) / 2, y0 + u, u, cTitle)
+            hit(xMinus - 4 * u, y0 - 6 * u, xMinus + bw + 2 * u, y0 + 16 * u, "lyroff:-")
+            hit(xPlus - 2 * u, y0 - 6 * u, width.toFloat(), y0 + 16 * u, "lyroff:+")
+        }
         val current = if (l.synced) l.lines.indexOfLast { it.first <= p } else -1
         val curRow = wrapped.indexOfFirst { it.first == current }
         val viewH = contentBottom - top
@@ -487,8 +505,18 @@ class PlayerView(ctx: Context) : View(ctx) {
                 else -> skin.color("lyric_next", skin.color("lyric"))
             }
             txt(cv, text, pad, ry, k, col)
+            // tap a line to jump there
+            if (l.synced && text.isNotEmpty() && ry + lh > top) hit(0f, maxOf(top, ry - 2 * u), width.toFloat(), minOf(contentBottom, ry + lh - 2 * u), "lyric:${l.lines[li].first}")
         }
         cv.restore()
+    }
+
+    private fun lyricKey() = "lyr_" + lyricsKey.hashCode()
+    private fun lyricOffset(): Long = context.getSharedPreferences("spox", 0).getLong(lyricKey(), 0)
+    private fun nudgeLyrics(ms: Long) {
+        val v = (lyricOffset() + ms).coerceIn(-10_000, 10_000)
+        context.getSharedPreferences("spox", 0).edit().putLong(lyricKey(), v).apply()
+        manualUntil = 0
     }
 
     /** Lyrics lines cut to the screen width once per song (not every frame). */
@@ -526,6 +554,11 @@ class PlayerView(ctx: Context) : View(ctx) {
             if (ry + rh < top) continue
             if (ry > contentBottom) break
             val (a, b, id) = r
+            if (a.startsWith("#")) {
+                // section heading
+                txt(cv, fit(a.drop(1), width - 2 * pad, u), pad, ry + 12 * u, u, cHeader)
+                continue
+            }
             if (pressed == id) box(cv, 0f, ry, width.toFloat(), rh, cLine)
             if (valueRight) {
                 val vw = tw(b, u)
@@ -637,6 +670,9 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "btn_repeat" -> Player.toggleRepeat()
             id == "link" -> Player.openApp(context)
             id == "time" -> showRemaining = !showRemaining
+            id == "lyroff:-" -> nudgeLyrics(-250)
+            id == "lyroff:+" -> nudgeLyrics(250)
+            id.startsWith("lyric:") -> id.removePrefix("lyric:").toLongOrNull()?.let { Player.seek(maxOf(0, it - lyricOffset())); manualUntil = 0 }
         }
         invalidate()
     }
