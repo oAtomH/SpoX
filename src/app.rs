@@ -72,6 +72,7 @@ pub struct App {
     lyrics: Option<Lyrics>,
     lyrics_uri: String,
     lyrics_loading: bool,
+    lyric_offset: i64,
     lyric_rows: Vec<(usize, String)>,
     lyric_rows_key: String,
     manual_lyrics_until: Option<Instant>,
@@ -242,6 +243,7 @@ impl App {
             lyrics: None,
             lyrics_uri: String::new(),
             lyrics_loading: false,
+            lyric_offset: 0,
             lyric_rows: Vec::new(),
             lyric_rows_key: String::new(),
             manual_lyrics_until: None,
@@ -630,6 +632,7 @@ impl App {
         if let Some(t) = self.play.track.clone() {
             if t.uri != self.lyrics_uri {
                 self.lyrics_uri = t.uri.clone();
+                self.lyric_offset = load_lyric_offset(&t.uri);
                 self.lyrics = None;
                 self.lyrics_loading = true;
                 self.scroll[SCROLL_LY] = 0.0;
@@ -2017,6 +2020,7 @@ impl App {
                 Tab::Lyrics => (
                     "tab_lyrics",
                     match &self.lyrics {
+                        Some(l) if l.synced && self.lyric_offset != 0 => format!("Lyrics  \u{b7}  synced {:+.2} s", self.lyric_offset as f64 / 1000.0),
                         Some(l) if l.synced => "Lyrics  \u{b7} synced".into(),
                         _ => "Lyrics".into(),
                     },
@@ -2231,7 +2235,8 @@ impl App {
                         }
                     }
                 }
-                let pos = self.play.position(now_ms()) + 250.0;
+                // a little early (people read ahead) + your per-song nudge
+                let pos = self.play.position(now_ms()) + 250.0 + self.lyric_offset as f64;
                 let cur_line = self
                     .lyrics
                     .as_ref()
@@ -2277,7 +2282,12 @@ impl App {
 
         // scrolling
         let max_scroll = rows.len().saturating_sub(rows_vis) as f32;
-        if inp.wheel != 0.0 && (inp.over(lr[0], lr[1], lr[2], lr[3]) || inp.over(sr[0], sr[1], sr[2], sr[3])) {
+        if inp.wheel != 0.0 && inp.ctrl && scroll_idx == SCROLL_LY && inp.over(lr[0], lr[1], lr[2], lr[3]) {
+            // Ctrl + scroll on the lyrics: nudge them earlier / later for this song (remembered)
+            self.lyric_offset += if inp.wheel > 0.0 { 250 } else { -250 };
+            save_lyric_offset(&self.lyrics_uri, self.lyric_offset);
+            self.osd(format!("LYRICS {:+.2} S", self.lyric_offset as f64 / 1000.0));
+        } else if inp.wheel != 0.0 && (inp.over(lr[0], lr[1], lr[2], lr[3]) || inp.over(sr[0], sr[1], sr[2], sr[3])) {
             self.scroll[scroll_idx] -= inp.wheel / (lh * s) * 1.5;
             if scroll_idx == SCROLL_LY {
                 self.manual_lyrics_until = Some(Instant::now() + Duration::from_secs(5));
@@ -3649,4 +3659,31 @@ fn save_history(h: &[(Track, i64)]) {
     let v: Vec<serde_json::Value> = h.iter().map(|(t, at)| json!([t.uri, t.name, t.artists, t.album, t.duration_ms, at, t.cover_small])).collect();
     let _ = std::fs::create_dir_all(config::cache_dir());
     let _ = std::fs::write(history_path(), serde_json::Value::Array(v).to_string());
+}
+
+fn lyric_offsets_path() -> std::path::PathBuf {
+    config::cache_dir().join("lyric_offsets.json")
+}
+
+/// Your Ctrl+scroll nudge for a song's lyrics, in ms (0 if none).
+fn load_lyric_offset(uri: &str) -> i64 {
+    std::fs::read(lyric_offsets_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v[uri].as_i64())
+        .unwrap_or(0)
+}
+
+fn save_lyric_offset(uri: &str, ms: i64) {
+    let p = lyric_offsets_path();
+    let mut v = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).unwrap_or_else(|| json!({}));
+    if ms == 0 {
+        if let Some(m) = v.as_object_mut() {
+            m.remove(uri);
+        }
+    } else {
+        v[uri] = json!(ms);
+    }
+    let _ = std::fs::create_dir_all(config::cache_dir());
+    let _ = std::fs::write(p, serde_json::to_vec(&v).unwrap_or_default());
 }

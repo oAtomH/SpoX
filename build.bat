@@ -72,7 +72,20 @@ if errorlevel 1 (
 
 rem ---- 4. Put SpoX.exe next to this file + desktop shortcut ----
 taskkill /im SpoX.exe /f >nul 2>nul
-copy /y "target\release\spox.exe" "SpoX.exe" >nul
+rem Windows needs a moment to let go of the old SpoX.exe after it closes: retry the copy
+set /a TRIES=0
+:copyexe
+timeout /t 1 /nobreak >nul
+copy /y "target\release\spox.exe" "SpoX.exe" >nul 2>nul
+if not errorlevel 1 goto copied
+set /a TRIES+=1
+if %TRIES% lss 8 goto copyexe
+echo.
+echo Could not replace SpoX.exe (is it still open, or running from somewhere else?).
+echo Close SpoX completely (tray icon - Quit) and run build.bat again.
+pause
+exit /b 1
+:copied
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=[Environment]::GetFolderPath('Desktop'); $s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'SpoX.lnk')); $s.TargetPath=(Join-Path '%~dp0' 'SpoX.exe'); $s.WorkingDirectory='%~dp0'; $s.Description='SpoX mini player'; $s.Save()"
 
 echo.

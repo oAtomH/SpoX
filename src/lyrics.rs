@@ -72,13 +72,16 @@ fn fetch(t: &Track) -> Option<Lyrics> {
     let search = format!("https://lrclib.net/api/search?artist_name={}&track_name={}", enc(artist), enc(&t.name));
     let list: Value = a.get(&search).call().ok()?.into_json().ok()?;
     let arr = list.as_array()?;
+    // only versions within 2 s of this song's length (other versions = lyrics out of time),
+    // closest first, synced before plain
     let dur = t.duration_ms as f64 / 1000.0;
-    let close = |v: &&Value| v.get("duration").and_then(|d| d.as_f64()).map(|d| (d - dur).abs() < 4.0).unwrap_or(true);
-    arr.iter()
-        .filter(close)
+    let diff = |v: &Value| v.get("duration").and_then(|d| d.as_f64()).map(|d| (d - dur).abs()).unwrap_or(99.0);
+    let mut good: Vec<&Value> = arr.iter().filter(|v| diff(v) <= 2.0).collect();
+    good.sort_by(|a, b| diff(a).partial_cmp(&diff(b)).unwrap_or(std::cmp::Ordering::Equal));
+    good.iter()
         .find(|v| v.get("syncedLyrics").map(|s| s.is_string()).unwrap_or(false))
-        .or_else(|| arr.iter().find(close))
-        .and_then(from_record)
+        .or_else(|| good.first())
+        .and_then(|v| from_record(v))
 }
 
 pub fn request(t: Track, ev: Sender<Ev>, ctx: egui::Context) {
@@ -89,7 +92,8 @@ pub fn request(t: Track, ev: Sender<Ev>, ctx: egui::Context) {
                 let fresh_none = v.get("none").and_then(|x| x.as_i64()).map(|ts| now_secs() - ts < 3 * 86400);
                 let lyr = if fresh_none == Some(true) {
                     Some(None)
-                } else if v.get("none").is_none() {
+                } else if v.get("none").is_none() && v.get("v").and_then(|x| x.as_u64()) == Some(2) {
+                    // v2 = matched by song length; older entries may be another version: look again
                     let synced = v.get("synced").and_then(|x| x.as_bool()).unwrap_or(false);
                     let lines = v
                         .get("lines")
@@ -114,7 +118,7 @@ pub fn request(t: Track, ev: Sender<Ev>, ctx: egui::Context) {
         let res = fetch(&t);
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let doc = match &res {
-            Some(l) => json!({"synced": l.synced, "lines": l.lines.iter().map(|(t, s)| json!([t, s])).collect::<Vec<_>>()}),
+            Some(l) => json!({"v": 2, "synced": l.synced, "lines": l.lines.iter().map(|(t, s)| json!([t, s])).collect::<Vec<_>>()}),
             None => json!({"none": now_secs()}),
         };
         let _ = std::fs::write(&path, doc.to_string());
