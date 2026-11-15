@@ -6,6 +6,8 @@ import android.content.ClipboardManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.ConnectivityManager
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
@@ -39,7 +41,7 @@ class EngineActivity : Activity() {
     private lateinit var liveBtn: Button
     private val report = StringBuilder()
     private val soloistUrl = "https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz"
-    private val version = "0.5"
+    private val version = "0.6"
 
     private val prefs get() = getSharedPreferences("engine", 0)
     private val dir get() = File(filesDir, "soloist")
@@ -235,7 +237,8 @@ class EngineActivity : Activity() {
                 p.inputStream.bufferedReader().useLines { lines ->
                     lines.forEach { l ->
                         val sec = (System.currentTimeMillis() - t0) / 1000
-                        log("[${sec}s] ${l.take(300)}")
+                        log("[${sec}s] ${named(l).replace("\u001b[0m", "").replace(Regex("\u001b\\[[0-9;]*m"), "").take(300)}")
+                        Regex("Started ZeroConf service on port (\\d+)").find(l)?.let { announce(it.groupValues[1].toInt()) }
                     }
                 }
                 val code = p.waitFor()
@@ -246,9 +249,44 @@ class EngineActivity : Activity() {
                 live = null
                 busy = false
                 multicast?.release()
+                unannounce()
                 runOnUiThread { liveBtn.text = "2. Start Soloist" }
             }
         }
+    }
+
+    // Soloist can't see the phone's Wi-Fi address, so its own "I'm here" messages never go out.
+    // Android announces it instead, the standard way, pointing at Soloist's login server.
+    private var nsdListener: NsdManager.RegistrationListener? = null
+
+    private fun announce(port: Int) {
+        val nsd = getSystemService(NsdManager::class.java)
+        val info = NsdServiceInfo().apply {
+            serviceName = "SpoX Phone"
+            serviceType = "_spotify-connect._tcp"
+            setPort(port)
+            setAttribute("CPath", "/zc")
+            setAttribute("VERSION", "1.0")
+            setAttribute("Stack", "SP")
+        }
+        val l = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(i: NsdServiceInfo) = log("[connect] announced as \"${i.serviceName}\" on port $port")
+            override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) = log("[connect] announce failed ($e)")
+            override fun onServiceUnregistered(i: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) {}
+        }
+        unannounce()
+        nsdListener = l
+        runCatching { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l) }.onFailure { log("[connect] ${it.message}") }
+    }
+
+    private fun unannounce() {
+        nsdListener?.let { l -> runCatching { getSystemService(NsdManager::class.java).unregisterService(l) } }
+        nsdListener = null
+    }
+
+    private fun named(l: String) = l.replace(Regex("blocked syscall (\\d+)")) {
+        val n = it.groupValues[1].toInt(); "blocked syscall $n (${calls[n] ?: "?"})"
     }
 
     private fun stopLive() {
@@ -287,7 +325,7 @@ class EngineActivity : Activity() {
 
     private val calls = mapOf(
         293 to "rseq", 435 to "clone3", 439 to "faccessat2", 99 to "set_robust_list",
-        147 to "setresuid", 149 to "setresgid", 146 to "setuid", 144 to "setgid",
+        202 to "accept", 147 to "setresuid", 149 to "setresgid", 146 to "setuid", 144 to "setgid",
         219 to "keyctl", 217 to "add_key", 51 to "chroot", 40 to "mount", 167 to "prctl",
         278 to "getrandom", 441 to "epoll_pwait2", 436 to "close_range", 449 to "futex_waitv",
         434 to "pidfd_open", 437 to "openat2", 452 to "fchmodat2", 453 to "map_shadow_stack",

@@ -249,6 +249,14 @@ object Player {
         if (a.isNullOrEmpty()) t else "$a - $t"
     } ?: emptyList()
 
+    /** Up next, as (id, title, artist) for the list. */
+    fun queueItems(): List<Triple<Long, String, String>> = controller?.queue?.mapNotNull { q ->
+        val t = q.description.title?.toString() ?: return@mapNotNull null
+        Triple(q.queueId, t, q.description.subtitle?.toString().orEmpty())
+    } ?: emptyList()
+
+    fun playQueueItem(id: Long) = tc?.skipToQueueItem(id)
+
     /** Opens the music app (e.g. to pick a playlist there). */
     fun openApp(ctx: Context) {
         val pkg = state.app.ifEmpty { "com.spotify.music" }

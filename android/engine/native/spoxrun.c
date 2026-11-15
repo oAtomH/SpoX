@@ -142,6 +142,16 @@ __attribute__((used)) void start_c(long *sp) {
             sys(PTRACE, 0x4202 /* GETSIGINFO */, t, 0, (long)info, 0);
             if (*(int *)(info + 8) == 1 /* SYS_SECCOMP */) {
                 int nr = *(int *)(info + 24);
+                u64 rr[34];
+                struct { void *base; u64 len; } io = { rr, sizeof rr };
+                if (nr == 202 /* accept */ && sys(PTRACE, 0x4204, t, 1, (long)&io, 0) == 0) {
+                    // Android allows accept4 but not plain accept: run it again as accept4(..., 0)
+                    if (counts[nr]++ < 1) out("[spoxrun] accept -> accept4\n");
+                    rr[8] = 242; rr[3] = 0; rr[32] -= 4;
+                    sys(PTRACE, 0x4205, t, 1, (long)&io, 0);
+                    sys(PTRACE, 7, t, 0, 0, 0);
+                    continue;
+                }
                 if (nr >= 0 && nr < 600 && counts[nr]++ < 2) { out("[spoxrun] blocked syscall "); num(nr); out("\n"); }
                 u64 regs[34];
                 struct { void *base; u64 len; } iov = { regs, sizeof regs };

@@ -17,7 +17,19 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         Player.init(this)
         view = PlayerView(this)
+        // full screen: SpoX draws under the status and navigation bars and keeps clear of them itself
+        if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false)
+        @Suppress("DEPRECATION")
+        run {
+            window.statusBarColor = android.graphics.Color.TRANSPARENT
+            window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        }
         setContentView(view)
+        if (Build.VERSION.SDK_INT >= 33) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) {
+                if (!view.back()) finish()
+            }
+        }
         view.fps = getSharedPreferences("spox", 0).getInt("fps", 30)
 
         view.settingsRows = {
@@ -63,6 +75,11 @@ class MainActivity : Activity() {
         if (getSharedPreferences("spox", 0).getBoolean("auto_update", true)) {
             Updater.check(this, false) { runOnUiThread { view.invalidate() } }
         }
+    }
+
+    @Deprecated("still the simplest way for a plain Activity")
+    override fun onBackPressed() {
+        if (!view.back()) @Suppress("DEPRECATION") super.onBackPressed()
     }
 
     override fun onResume() {
