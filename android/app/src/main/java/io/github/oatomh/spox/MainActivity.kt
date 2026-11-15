@@ -26,6 +26,7 @@ class MainActivity : Activity() {
                 "Updates" to Updater.status.ifEmpty { "check now" },
                 "Auto-update" to if (prefs.getBoolean("auto_update", true)) "on" else "off",
                 "Notification access" to if (Player.hasAccess(this)) "allowed" else "allow...",
+                "Hide Spotify's own player" to "open...",
                 "Open Spotify" to "",
                 "Get SpoX for Windows" to "github",
                 "Version" to (packageManager.getPackageInfo(packageName, 0).versionName ?: "?"),
@@ -39,6 +40,11 @@ class MainActivity : Activity() {
                 "Updates" -> Updater.check(this, true) { runOnUiThread { view.invalidate() } }
                 "Auto-update" -> prefs.edit().putBoolean("auto_update", !prefs.getBoolean("auto_update", true)).apply()
                 "Open Spotify" -> Player.openApp(this)
+                // Android won't let another app restyle or remove Spotify's player, but you can switch
+                // its notification off: Spotify keeps playing, and SpoX's pixel card is the only player
+                "Hide Spotify's own player" -> runCatching {
+                    startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, "com.spotify.music"))
+                }
                 "Get SpoX for Windows" -> startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/oAtomH/SpoX/releases/latest")))
             }
             view.invalidate()

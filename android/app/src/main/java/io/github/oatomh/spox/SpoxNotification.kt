@@ -77,8 +77,11 @@ object SpoxNotification {
             .setCustomBigContentView(rv)
             .setStyle(Notification.DecoratedCustomViewStyle())
             .setContentIntent(open)
-            .setOngoing(st.playing)
+            // stays put at the top like a player (not swiped away by accident)
+            .setOngoing(true)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
             .setOnlyAlertOnce(true)
+            .setShowWhen(false)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .build()
         runCatching { nm.notify(ID, n) }
