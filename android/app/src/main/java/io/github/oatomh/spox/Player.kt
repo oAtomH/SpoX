@@ -48,7 +48,7 @@ object Player {
     private lateinit var app: Context
 
     /** Music apps SpoX follows, best first. */
-    private val preferred = listOf("com.spotify.music", "com.spotify.lite")
+    private val preferred = listOf("io.github.oatomh.spox.engine", "com.spotify.music", "com.spotify.lite")
 
     fun init(ctx: Context) {
         if (!::app.isInitialized) app = ctx.applicationContext

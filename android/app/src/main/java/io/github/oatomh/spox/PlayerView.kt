@@ -328,7 +328,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         val w = width - 2 * pad
         val top = contentTop
         // header: where the music comes from, and a shortcut to the app
-        val src = when (st.app) { "com.spotify.music", "com.spotify.lite" -> "Playing on Spotify"; "" -> "SpoX"; else -> "Playing" }
+        val src = when (st.app) { "io.github.oatomh.spox.engine" -> "Playing on SpoX Engine"; "com.spotify.music", "com.spotify.lite" -> "Playing on Spotify"; "" -> "SpoX"; else -> "Playing" }
         txt(cv, src, pad, top + 4 * u, u, cDim)
         val lw = sprW("btn_link", u)
         spr(cv, if (pressed == "link") "btn_link_down" else "btn_link", width - pad - lw, top, u)
