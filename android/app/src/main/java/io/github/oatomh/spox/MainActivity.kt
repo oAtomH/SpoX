@@ -59,6 +59,6 @@ class MainActivity : Activity() {
             runCatching { NotificationListenerService.requestRebind(ComponentName(this, MediaListener::class.java)) }
             Player.pick()
         }
-        view.invalidate()
+        view.refresh()
     }
 }

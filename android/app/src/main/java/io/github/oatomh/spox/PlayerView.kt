@@ -52,6 +52,19 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var artSrc: Bitmap? = null
     private var artPix: Bitmap? = null
 
+    // slow system lookups, done now and then instead of every frame
+    private var access = Player.hasAccess(ctx)
+    private var vol = Player.volume(ctx)
+    private var volAt = 0L
+    private var animating = false
+
+    /** Call when coming back to the app (access may have changed). */
+    fun refresh() {
+        access = Player.hasAccess(context)
+        vol = Player.volume(context)
+        invalidate()
+    }
+
     var onSettingsAction: ((String) -> Unit)? = null
     var settingsRows: () -> List<Pair<String, String>> = { emptyList() }
 
@@ -99,8 +112,9 @@ class PlayerView(ctx: Context) : View(ctx) {
         drawMain(cv, st, now)
         drawPanel(cv, st, now)
         cv.restore()
-        // keep moving while something moves; otherwise once a second for the clock
-        if (st.playing) postInvalidateDelayed(if (tab == Tab.LYRICS) 100 else 50) else postInvalidateDelayed(500)
+        // smooth (every screen refresh) while anything moves; otherwise twice a second for the clock
+        if (st.playing || animating || dragging != null) postInvalidateOnAnimation() else postInvalidateDelayed(500)
+        animating = false
     }
 
     private fun drawMain(cv: Canvas, st: Player.State, now: Long) {
@@ -173,7 +187,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             val bh = max(1, (v * vr[3]).toInt())
             for (yy in 0 until bh) {
                 val py = vr[1] + vr[3] - 1 - yy
-                val c = cols?.let { b -> b.getPixel(0, min(b.height - 1, ((py - vr[1]).toFloat() / vr[3] * b.height).toInt())) } ?: skin.color("title")
+                val c = visCol(cols, (py - vr[1]).toFloat() / vr[3])
                 skin.fill(cv, bx.toFloat(), py.toFloat(), bw.toFloat(), 1f, s, c)
             }
         }
@@ -185,6 +199,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             val w = skin.textWidth(text)
             if (w <= r[2]) skin.text(cv, text, r[0].toFloat(), r[1].toFloat() + 1, s, col)
             else {
+                animating = true
                 val period = w + 24
                 val cyc = 2.5f + period / 14f
                 val ph = ((now - t0) / 1000f) % cyc
@@ -195,7 +210,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             cv.restore()
         }
         val title = when {
-            !Player.hasAccess(context) -> "ALLOW NOTIFICATION ACCESS"
+            !access -> "ALLOW NOTIFICATION ACCESS"
             !st.hasTrack -> "Play something in Spotify"
             else -> st.title
         }
@@ -215,7 +230,11 @@ class PlayerView(ctx: Context) : View(ctx) {
         // volume = the phone's media volume
         skin.rect("vol")?.let { r ->
             skin.nine(cv, "vol_track", r[0].toFloat(), r[1].toFloat(), r[2].toFloat(), r[3].toFloat(), s, 2)
-            val fw = floor(r[2] * Player.volume(context))
+            if (SystemClock.elapsedRealtime() - volAt > 1000 && dragging != "vol") {
+                vol = Player.volume(context)
+                volAt = SystemClock.elapsedRealtime()
+            }
+            val fw = floor(r[2] * vol)
             if (fw > 0) skin.nine(cv, "vol_fill", r[0].toFloat(), r[1].toFloat(), fw, r[3].toFloat(), s, 2)
             val th = skin.size("vol_thumb")
             skin.draw(cv, "vol_thumb", (r[0] + fw - th[0] / 2).coerceIn(r[0].toFloat(), (r[0] + r[2] - th[0]).toFloat()), r[1] + (r[3] - th[1]) / 2f, s)
@@ -254,7 +273,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         val lh = skin.lineHeight.toFloat()
         val rows = mutableListOf<Triple<String, Int, Boolean>>() // text, color, centered
         var current = -1
-        if (!Player.hasAccess(context)) {
+        if (!access) {
             val c = skin.color("list")
             listOf(
                 "SpoX needs Notification access to see and",
@@ -288,26 +307,21 @@ class PlayerView(ctx: Context) : View(ctx) {
                     val p = st.position(now) + 250
                     current = if (l.synced) l.lines.indexOfLast { it.first <= p } else -1
                     val maxW = (lr[2] - 4).toInt()
-                    l.lines.forEachIndexed { i, (_, text) ->
+                    val wrapped = wrapCache.takeIf { wrapKey == "$lyricsKey|$maxW" } ?: wrap(l, maxW).also {
+                        wrapCache = it
+                        wrapKey = "$lyricsKey|$maxW"
+                    }
+                    var curRow = -1
+                    for ((li, text) in wrapped) {
                         val col = when {
-                            i == current -> skin.color("lyric_current")
-                            !l.synced || i < current -> skin.color("lyric")
+                            li == current -> skin.color("lyric_current")
+                            !l.synced || li < current -> skin.color("lyric")
                             else -> skin.color("lyric_next", skin.color("lyric"))
                         }
-                        // long lines wrap onto more rows
-                        var rest = text
-                        var first = true
-                        while (rest.isNotEmpty() || first) {
-                            first = false
-                            var cut = rest
-                            while (skin.textWidth(cut) > maxW && cut.contains(' ')) cut = cut.substringBeforeLast(' ')
-                            if (skin.textWidth(cut) > maxW) cut = skin.fit(cut, maxW).dropLast(3)
-                            rows += Triple(cut, col, true)
-                            rest = rest.removePrefix(cut).trimStart()
-                            if (cut.isEmpty()) break
-                        }
-                        if (i == current) current = rows.size - 1
+                        if (li == current && curRow < 0) curRow = rows.size
+                        rows += Triple(text, col, true)
                     }
+                    current = curRow
                 }
             }
             Tab.QUEUE -> {
@@ -342,6 +356,34 @@ class PlayerView(ctx: Context) : View(ctx) {
             skin.text(cv, fitted, x, y + 1, s, col)
         }
         cv.restore()
+    }
+
+    private var visColors: IntArray? = null
+    private fun visCol(b: Bitmap?, frac: Float): Int {
+        if (b == null) return skin.color("title")
+        val c = visColors ?: IntArray(b.height) { b.getPixel(0, it) }.also { visColors = it }
+        return c[min(c.size - 1, (frac * c.size).toInt().coerceAtLeast(0))]
+    }
+
+    private var wrapKey = ""
+    private var wrapCache: List<Pair<Int, String>> = emptyList()
+
+    /** Lyrics lines cut to the panel width once per song (not every frame). */
+    private fun wrap(l: Lyrics.Result, maxW: Int): List<Pair<Int, String>> {
+        val out = mutableListOf<Pair<Int, String>>()
+        l.lines.forEachIndexed { i, (_, text) ->
+            var rest = text
+            if (rest.isEmpty()) out += i to ""
+            while (rest.isNotEmpty()) {
+                var cut = rest
+                while (skin.textWidth(cut) > maxW && cut.contains(' ')) cut = cut.substringBeforeLast(' ')
+                if (skin.textWidth(cut) > maxW) cut = skin.fit(cut, maxW).dropLast(3)
+                if (cut.isEmpty()) break
+                out += i to cut
+                rest = rest.removePrefix(cut).trimStart()
+            }
+        }
+        return out
     }
 
     // ---- touch ----------------------------------------------------------------------------
@@ -397,7 +439,10 @@ class PlayerView(ctx: Context) : View(ctx) {
                 val f = ((px - r[0]) / r[2]).coerceIn(0f, 1f)
                 seekPreview = (Player.state.durationMs * f).toLong()
             }
-            "vol" -> skin.rect("vol")?.let { r -> Player.setVolume(context, ((px - r[0]) / r[2]).coerceIn(0f, 1f)) }
+            "vol" -> skin.rect("vol")?.let { r ->
+                vol = ((px - r[0]) / r[2]).coerceIn(0f, 1f)
+                Player.setVolume(context, vol)
+            }
         }
     }
 
@@ -421,7 +466,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             showRemaining = !showRemaining; return
         }
         val top = panelTop()
-        if (!Player.hasAccess(context) && py > top) {
+        if (!access && py > top) {
             onSettingsAction?.invoke("access"); return
         }
         // tabs
