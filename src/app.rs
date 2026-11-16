@@ -114,6 +114,8 @@ pub struct App {
     smart: Option<Sender<crate::smart::Cmd>>,
     smart_on: bool,
     smart_new: std::collections::HashSet<String>,
+    /// last time the whole Up next list was asked for (it's refreshed while you look at it)
+    queue_asked: Instant,
     tb: Option<crate::tb::TbShared>,
     hold_shuffle: Option<(bool, Instant)>,
     hold_repeat: Option<(String, Instant)>,
@@ -290,6 +292,7 @@ impl App {
             smart: smart_tx,
             smart_on: false,
             smart_new: Default::default(),
+            queue_asked: Instant::now(),
             tb: tb_shared,
             hold_shuffle: None,
             hold_repeat: None,
@@ -468,6 +471,12 @@ impl App {
                     self.osd(msg);
                 }
                 let changed = self.play.apply(&v);
+                // Soloist's own queue updates only carry the next 10 songs: when the queue changes
+                // while you look at it, fetch the whole list again (not more than every 2 s)
+                if v.get("type").and_then(|t| t.as_str()) == Some("queue_changed") && self.queue_visible() && self.queue_asked.elapsed() > Duration::from_secs(2) {
+                    self.queue_asked = Instant::now();
+                    self.send(command_with("get_queue", "limit", json!(0)));
+                }
                 // keep a just-clicked shuffle/repeat state for a moment so a slow update can't flicker it back
                 if let Some((val, t)) = self.hold_shuffle {
                     if t.elapsed() < Duration::from_millis(2500) {
@@ -3405,6 +3414,11 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Up next open: refresh it every 10 s, so it matches your other devices
+        if self.connected && self.queue_visible() && self.queue_asked.elapsed() > Duration::from_secs(10) {
+            self.queue_asked = Instant::now();
+            self.send(command_with("get_queue", "limit", json!(0)));
+        }
         // 1 egui point = 1 screen pixel, so integer scales stay crisp on 125%/150% Windows scaling.
         let native = ctx.native_pixels_per_point().unwrap_or(1.0);
         let want_zoom = 1.0 / native;

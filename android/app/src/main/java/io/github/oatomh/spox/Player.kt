@@ -325,10 +325,10 @@ object Player {
         val ctx = e.now.contextUri
         // a song from the playlist itself: start the playlist right at it (one jump, nothing
         // skipped through, and other devices see it straight away). Otherwise: paced skips.
-        if (Web.signedIn && ctx.isNotEmpty() && t.provider.contains("context") && !ctx.contains(":collection")) {
+        if (Web.signedIn && ctx.isNotEmpty() && !t.provider.contains("queue") && !t.provider.contains("autoplay") && !ctx.contains(":collection")) {
             kotlin.concurrent.thread {
                 if (!Web.playIn(ctx, t.uri)) e.skipAhead(i + 1)
-                Thread.sleep(1500); e.command("get_queue", mapOf("limit" to 50))
+                Thread.sleep(1500); e.command("get_queue", mapOf("limit" to 0))
             }
         } else e.skipAhead(i + 1)
     }

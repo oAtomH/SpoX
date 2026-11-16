@@ -82,6 +82,37 @@ pub fn note_known(name: &str, artists: &str) {
     known_set().lock().unwrap().1.insert(key(name, artists));
 }
 
+/// Popular songs by artists similar to `artist` (Deezer's public API: related artists + their
+/// top songs), shuffled. (title, artist) pairs.
+fn similar_songs(artist: &str) -> Vec<(String, String)> {
+    let get = |url: String| -> Option<Value> { net::agent().get(&url).timeout(Duration::from_secs(10)).call().ok()?.into_json().ok() };
+    let Some(v) = get(format!("https://api.deezer.com/search/artist?limit=1&q={}", enc(artist))) else { return Vec::new() };
+    let Some(id) = v.pointer("/data/0/id").and_then(|x| x.as_u64()) else { return Vec::new() };
+    let Some(rel) = get(format!("https://api.deezer.com/artist/{}/related?limit=20", id)) else { return Vec::new() };
+    let mut rel: Vec<u64> = rel.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(|x| x.get("id").and_then(|i| i.as_u64())).collect()).unwrap_or_default();
+    let mut rng = Rng::new();
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        if rel.is_empty() {
+            break;
+        }
+        let r = rel.swap_remove(rng.below(rel.len()));
+        if let Some(top) = get(format!("https://api.deezer.com/artist/{}/top?limit=8", r)) {
+            for t in top.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default() {
+                if let (Some(title), Some(a)) = (t.get("title").and_then(|x| x.as_str()), t.pointer("/artist/name").and_then(|x| x.as_str())) {
+                    out.push((title.to_string(), a.to_string()));
+                }
+            }
+        }
+    }
+    // shuffle
+    for i in (1..out.len()).rev() {
+        let j = rng.below(i + 1);
+        out.swap(i, j);
+    }
+    out
+}
+
 struct Rng(u64);
 impl Rng {
     fn new() -> Self {
@@ -358,8 +389,29 @@ impl Engine {
         *fetching.lock().unwrap() = true;
         std::thread::spawn(move || {
             if key_.is_empty() {
-                // no Last.fm key: more songs by artists from this playlist that you don't have yet
+                // no Last.fm key: songs by artists SIMILAR to the playlist's (Deezer's free "related
+                // artists", no key needed), found on Spotify; else more songs by the playlist's artists
                 let mut added = 0;
+                for (title, artist) in similar_songs(&first_artist_raw(&seed.artists)) {
+                    if added >= 3 {
+                        break;
+                    }
+                    let k = key(&title, &artist);
+                    if used.contains(&k) || lib.lock().unwrap().contains(&k) || known_set().lock().unwrap().1.contains(&k) {
+                        continue;
+                    }
+                    if let Some(t) = api.search_track(&artist, &title) {
+                        let mut p = pool.lock().unwrap();
+                        if !p.iter().any(|x| x.uri == t.uri) {
+                            p.push_back(t);
+                            added += 1;
+                        }
+                    }
+                }
+                if added > 0 {
+                    *fetching.lock().unwrap() = false;
+                    return;
+                }
                 for t in api.search_artist(&first_artist_raw(&seed.artists)) {
                     let k = key(&t.name, &t.artists);
                     if used.contains(&k) || lib.lock().unwrap().contains(&k) {

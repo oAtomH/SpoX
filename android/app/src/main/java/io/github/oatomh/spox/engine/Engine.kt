@@ -497,6 +497,7 @@ class Engine private constructor(private val ctx: Context) {
         @Volatile var active = false
         @Volatile var queue: List<Track> = emptyList()
         @Volatile var contextUri = ""
+        @Volatile var queueAsked = 0L
         @Volatile var contextName = ""
         @Volatile var art: android.graphics.Bitmap? = null
         private var artFor = ""
@@ -570,9 +571,27 @@ class Engine private constructor(private val ctx: Context) {
             // the queue comes as its own message or as the answer to get_queue
             val up = m.optJSONArray("upcoming") ?: m.optJSONObject("queue")?.optJSONArray("upcoming")
                 ?: m.optJSONObject("result")?.optJSONArray("upcoming") ?: m.optJSONObject("data")?.optJSONArray("upcoming")
-            if (up != null) queue = (0 until up.length()).mapNotNull { i -> up.optJSONObject(i)?.let { e -> val pv = e.optString("provider"); parse(e.optJSONObject("item"), pv) ?: parse(e, pv) } }
+            if (up != null) {
+                val list = (0 until up.length()).mapNotNull { i ->
+                    up.optJSONObject(i)?.let { e ->
+                        // where it comes from: "context" (the playlist), "queue" (you added it), "autoplay"...
+                        val raw = e.opt("provider") ?: e.opt("source")
+                        val pv = (if (raw is org.json.JSONObject) raw.optString("type") else raw?.toString()).orEmpty().lowercase()
+                        parse(e.optJSONObject("item"), pv) ?: parse(e, pv)
+                    }
+                }
+                // Soloist's own queue updates only carry the next 10 songs: keep the full list we
+                // fetched if it still lines up, and fetch the whole list again
+                val type = m.optString("type")
+                val sameStart = list.firstOrNull()?.uri == queue.firstOrNull()?.uri
+                if (!(type == "queue_changed" && list.size == 10 && queue.size > 10 && sameStart)) queue = list
+                if (type == "queue_changed" && System.currentTimeMillis() - queueAsked > 2000) {
+                    queueAsked = System.currentTimeMillis()
+                    command("get_queue", mapOf("limit" to 0))
+                }
+            }
             val t = track
-            if (t != null && t.uri != before) command("get_queue", mapOf("limit" to 50))
+            if (t != null && t.uri != before) { queueAsked = System.currentTimeMillis(); command("get_queue", mapOf("limit" to 0)) }
             if (t != null && t.cover.isNotEmpty() && t.cover != artFor) {
                 artFor = t.cover
                 val want = t.cover
@@ -598,7 +617,7 @@ class Engine private constructor(private val ctx: Context) {
             ws = c
             if (!said) { log("[ws] connected to Soloist's control port $port"); said = true }
             c.send("{\"type\":\"command\",\"command\":\"get_state\"}")
-            c.send("{\"type\":\"command\",\"command\":\"get_queue\",\"limit\":50}")
+            c.send("{\"type\":\"command\",\"command\":\"get_queue\",\"limit\":0}")
             try {
                 while (p.isAlive) {
                     val m = c.read() ?: break

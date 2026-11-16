@@ -89,6 +89,7 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var seekRect = RectF()
     private var volRect = RectF()
     private var artRect = RectF()
+    private var miniRect = RectF()
     private var contentTop = 0f
     private var contentBottom = 0f
 
@@ -200,6 +201,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         lastFrame = now
         lastDt = dt
         hits.clear()
+        miniRect = RectF()
         cv.drawColor(cBg)
 
         // fling
@@ -282,19 +284,27 @@ class PlayerView(ctx: Context) : View(ctx) {
         box(cv, 0f, top, width.toFloat(), max(1f, u / 2), cLine)
         val a = h - 8 * u
         drawArt(cv, st, RectF(pad, top + 4 * u, pad + a, top + 4 * u + a))
+        // previous / play / next on the right (and swipe the bar sideways, like Spotify)
         val bw = sprW("btn_play", u)
-        val bx = width - pad - bw
         val by = top + (h - sprH("btn_play", u)) / 2
+        val nx = width - pad - bw
+        val bx = nx - bw - 2 * u
+        val px = bx - bw - 2 * u
         val btn = if (st.playing) "btn_pause" else "btn_play"
+        spr(cv, if (pressed == "mini_prev") "btn_prev_down" else "btn_prev", px, by, u)
         spr(cv, if (pressed == "mini_play") "${btn}_down" else btn, bx, by, u)
+        spr(cv, if (pressed == "mini_next") "btn_next_down" else "btn_next", nx, by, u)
+        miniRect = RectF(0f, top, width.toFloat(), top + h)
         val tx = pad + a + 6 * u
-        val textW = bx - tx - 6 * u
+        val textW = px - tx - 6 * u
         marquee(cv, st.title, tx, top + 6 * u, textW, u, cTitle, now)
         txt(cv, fit(st.artist, textW, u), tx, top + 17 * u, u, cInfo)
         // progress line along the top edge
         if (st.durationMs > 0) box(cv, 0f, top, width * (st.position(now).toFloat() / st.durationMs).coerceIn(0f, 1f), max(1f, u / 2), cTitle)
-        hit(bx - 4 * u, top, width.toFloat(), top + h, "mini_play")
-        hit(0f, top, bx - 4 * u, top + h, "tab:PLAYER")
+        hit(0f, top, px - 2 * u, top + h, "tab:PLAYER")
+        hit(px - 2 * u, top, bx - u, top + h, "mini_prev")
+        hit(bx - u, top, nx - u, top + h, "mini_play")
+        hit(nx - u, top, width.toFloat(), top + h, "mini_next")
     }
 
     private fun drawArt(cv: Canvas, st: Player.State, r: RectF) {
@@ -619,7 +629,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         // keep it the same as on your other devices: ask again every few seconds while it's open
         if (Player.fromEngine && SystemClock.elapsedRealtime() - queueAsked > 5000) {
             queueAsked = SystemClock.elapsedRealtime()
-            io.github.oatomh.spox.engine.Engine.get(context).command("get_queue", mapOf("limit" to 50))
+            io.github.oatomh.spox.engine.Engine.get(context).command("get_queue", mapOf("limit" to 0))
         }
         val rows = mutableListOf<Triple<String, String, String>>()
         val accent = HashSet<String>()
@@ -779,6 +789,7 @@ class PlayerView(ctx: Context) : View(ctx) {
                     tab == Tab.PLAYER && access && RectF(volRect.left, volRect.top - slop, volRect.right, volRect.bottom + slop).contains(x, y) -> "vol"
                     tab != Tab.PLAYER && y > contentTop && y < contentBottom -> "list"
                     tab == Tab.PLAYER && artRect.contains(x, y) -> "art"
+                    tab != Tab.PLAYER && miniRect.contains(x, y) -> "art"
                     else -> null
                 }
                 pressed = if (dragging == null || dragging == "list" || dragging == "art") hitAt(x, y) else null
@@ -838,7 +849,8 @@ class PlayerView(ctx: Context) : View(ctx) {
             id.startsWith("tab:") -> tab = Tab.valueOf(id.removePrefix("tab:"))
             id.startsWith("set:") -> onSettingsAction?.invoke(id.removePrefix("set:"))
             id.startsWith("queue:") -> id.removePrefix("queue:").toLongOrNull()?.let { Player.playQueueItem(it) }
-            id == "btn_prev" -> Player.prev()
+            id == "btn_prev" || id == "mini_prev" -> Player.prev()
+            id == "mini_next" -> Player.next()
             id == "btn_next" -> Player.next()
             id == "btn_play" || id == "btn_pause" || id == "mini_play" -> Player.playPause()
             id == "btn_shuffle" -> Player.toggleShuffle()
