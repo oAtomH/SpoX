@@ -114,8 +114,6 @@ pub struct App {
     smart: Option<Sender<crate::smart::Cmd>>,
     smart_on: bool,
     smart_new: std::collections::HashSet<String>,
-    /// every song you've listened to for 10 s or more (kept on disk): the rest show as "new"
-    heard: std::collections::HashSet<String>,
     tb: Option<crate::tb::TbShared>,
     hold_shuffle: Option<(bool, Instant)>,
     hold_repeat: Option<(String, Instant)>,
@@ -218,6 +216,8 @@ impl App {
         if signed_in && !demo {
             let _ = web.send(Req::LoadPlaylists);
             let _ = web.send(Req::LoadMe);
+            // which songs you know (Liked Songs, playlists, recent plays): for "new to you" marks
+            crate::smart::load_known(crate::web::Api::new(cfg.clone(), tx.clone(), ctx.clone()));
         }
         if cfg.lock().unwrap().always_on_top {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
@@ -290,7 +290,6 @@ impl App {
             smart: smart_tx,
             smart_on: false,
             smart_new: Default::default(),
-            heard: load_heard(),
             tb: tb_shared,
             hold_shuffle: None,
             hold_repeat: None,
@@ -635,10 +634,7 @@ impl App {
         if self.history.first().map(|h| h.0.uri == t.uri).unwrap_or(false) {
             return;
         }
-        if self.heard.insert(t.uri.clone()) {
-            let u = t.uri.clone();
-            std::thread::spawn(move || note_heard(&u));
-        }
+        crate::smart::note_known(&t.name, &t.artists);
         self.history.retain(|h| h.0.uri != t.uri);
         self.history.insert(0, (t.clone(), config::now_secs()));
         self.history.truncate(100);
@@ -2225,7 +2221,7 @@ impl App {
                     }
                     // highlighted: songs you've never listened to, and songs that aren't from your
                     // playlist (smart shuffle / Spotify's autoplay picks)
-                    let never = !self.heard.is_empty() && !self.heard.contains(&t.uri);
+                    let never = crate::smart::knows(&t.name, &t.artists) == Some(false);
                     let outside = self.smart_new.contains(&t.uri) || p.contains("autoplay") || p.contains("recommend");
                     let is_new = never || outside;
                     rows.push(Row {
@@ -2710,6 +2706,7 @@ impl App {
             }, 79),
             ("App".into(), String::new(), 0),
             ("Update automatically".into(), onoff(c.auto_update), 63),
+            ("Check for updates".into(), { let u = crate::update::status(); if u.is_empty() { "check now".into() } else { u } }, 96),
             ("Memory (RAM)".into(), self.mem_text.clone(), 61),
             ("Install SpoX for this user".into(), if crate::install::is_installed() { "installed".into() } else { "install...".into() }, 62),
             ("Account".into(), String::new(), 0),
@@ -2887,6 +2884,7 @@ impl App {
                 47 => c.discord = !c.discord,
                 78 => c.discord_join = !c.discord_join,
                 63 => c.auto_update = !c.auto_update,
+                96 => crate::update::check_now(self.tx.clone(), self.ctx.clone()),
                 64 => c.hide_tray_with_player = !c.hide_tray_with_player,
                 20 => c.smart_ratio = cycle(&c.smart_ratio.to_string(), &["25", "50", "75", "100"]).parse().unwrap_or(50),
                 21 => c.smart_avoid_artist = !c.smart_avoid_artist,
@@ -3732,28 +3730,6 @@ fn load_history() -> Vec<(Track, i64)> {
         })
         .collect()
 }
-fn heard_path() -> std::path::PathBuf {
-    config::cache_dir().join("heard.txt")
-}
-
-/// Songs listened to before (one uri per line), for the "new to you" marks.
-fn load_heard() -> std::collections::HashSet<String> {
-    let mut set: std::collections::HashSet<String> = std::fs::read_to_string(heard_path()).unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-    // songs already in Recently played count too
-    for (t, _) in load_history() {
-        set.insert(t.uri);
-    }
-    set
-}
-
-fn note_heard(uri: &str) {
-    use std::io::Write;
-    let _ = std::fs::create_dir_all(config::cache_dir());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(heard_path()) {
-        let _ = writeln!(f, "{}", uri);
-    }
-}
-
 fn save_history(h: &[(Track, i64)]) {
     let v: Vec<serde_json::Value> = h.iter().map(|(t, at)| json!([t.uri, t.name, t.artists, t.album, t.duration_ms, at, t.cover_small])).collect();
     let _ = std::fs::create_dir_all(config::cache_dir());

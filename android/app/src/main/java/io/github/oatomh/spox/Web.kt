@@ -146,7 +146,7 @@ object Web {
 
     private fun artists(t: JSONObject) = t.optJSONArray("artists")?.let { a -> (0 until a.length()).joinToString(", ") { a.optJSONObject(it)?.optString("name").orEmpty() } }.orEmpty()
 
-    private fun track(t: JSONObject?): Item? {
+    fun track(t: JSONObject?): Item? {
         if (t == null || !t.has("uri")) return null
         return Item(t.optString("uri"), t.optString("name"), artists(t), "track", t.optString("id"))
     }
@@ -204,6 +204,96 @@ object Web {
 
     fun isLiked(trackId: String): Boolean? = get("/me/tracks/contains?ids=$trackId")?.optJSONArray("list")?.optBoolean(0)
     fun setLiked(trackId: String, on: Boolean) = send(if (on) "PUT" else "DELETE", "/me/tracks?ids=$trackId")
+
+    // ---- songs you know, according to Spotify (Liked Songs, the playing playlist, recent plays) ----
+
+    /** "Song (Remastered) - Live" + "Artist, Feat" -> "song|artist" (same as SpoX on Windows). */
+    fun key(title: String, artists: String): String {
+        var n = title.lowercase()
+        for (cut in listOf(" (", " [", " - ")) { val i = n.indexOf(cut); if (i >= 0) n = n.substring(0, i) }
+        return n.trim() + "|" + artists.split(", ").firstOrNull().orEmpty().lowercase().trim()
+    }
+
+    private val known = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    @Volatile private var knownLoaded = false
+    @Volatile private var knownAt = 0L
+    private val knownContexts = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    /** Do you know this song? null until Spotify's lists have loaded. */
+    fun knows(title: String, artists: String): Boolean? = if (!knownLoaded) null else key(title, artists) in known
+
+    fun noteKnown(title: String, artists: String) { known += key(title, artists) }
+
+    /** Loads (or refreshes, every 30 min) Liked Songs + recent plays, and the playing playlist. */
+    fun loadKnown(context: String?) {
+        if (!signedIn) return
+        val now = System.currentTimeMillis()
+        if (now - knownAt > 30 * 60_000) {
+            knownAt = now
+            thread {
+                tracks(Item("liked", "", "", "liked")).forEach { known += key(it.title, it.sub) }
+                get("/me/player/recently-played?limit=50")?.optJSONArray("items")?.let { a ->
+                    for (i in 0 until a.length()) track(a.optJSONObject(i)?.optJSONObject("track"))?.let { known += key(it.title, it.sub) }
+                }
+                knownLoaded = true
+                changed()
+            }
+        }
+        if (context != null && context.startsWith("spotify:playlist:") && knownContexts.add(context)) {
+            thread { tracks(Item(context, "", "", "playlist", context.substringAfterLast(':'))).forEach { known += key(it.title, it.sub) }; changed() }
+        }
+    }
+
+    // ---- the songs of the playing playlist (for + / -) -------------------------------------------
+
+    private val playlistCache = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+
+    /** Is the song in this playlist? null while loading / unknown. */
+    fun inPlaylist(context: String, uri: String): Boolean? {
+        if (!context.startsWith("spotify:playlist:")) return null
+        val set = playlistCache[context]
+        if (set == null) {
+            playlistCache[context] = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+            thread {
+                val uris = tracks(Item(context, "", "", "playlist", context.substringAfterLast(':'))).map { it.uri }
+                playlistCache[context]?.addAll(uris)
+                playlistLoaded += context
+                changed()
+            }
+            return null
+        }
+        return if (context in playlistLoaded) uri in set else null
+    }
+    private val playlistLoaded = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    fun addTo(context: String, uri: String): Boolean {
+        val id = context.substringAfterLast(':')
+        val ok = send("POST", "/playlists/$id/items", JSONObject().put("uris", JSONArray().put(uri))) ||
+            send("POST", "/playlists/$id/tracks", JSONObject().put("uris", JSONArray().put(uri)))
+        if (ok) playlistCache[context]?.add(uri)
+        return ok
+    }
+
+    fun removeFrom(context: String, uri: String): Boolean {
+        val id = context.substringAfterLast(':')
+        val one = JSONArray().put(JSONObject().put("uri", uri))
+        val ok = send("DELETE", "/playlists/$id/items", JSONObject().put("items", one)) ||
+            send("DELETE", "/playlists/$id/items", JSONObject().put("tracks", one)) ||
+            send("DELETE", "/playlists/$id/tracks", JSONObject().put("tracks", one))
+        if (ok) playlistCache[context]?.remove(uri)
+        return ok
+    }
+
+    // ---- devices: move the music between this phone, your PC, a speaker... (Spotify Connect) ----
+
+    class Device(val id: String, val name: String, val type: String, val active: Boolean)
+
+    fun devices(): List<Device> = get("/me/player/devices")?.optJSONArray("devices")?.let { a ->
+        (0 until a.length()).mapNotNull { a.optJSONObject(it) }.map { Device(it.optString("id"), it.optString("name"), it.optString("type"), it.optBoolean("is_active")) }
+    } ?: emptyList()
+
+    /** Moves what's playing to another device (any Spotify app, SpoX or speaker), keeps playing. */
+    fun transfer(deviceId: String): Boolean = send("PUT", "/me/player", JSONObject().put("device_ids", JSONArray().put(deviceId)).put("play", true))
 
     /** Play a song inside its playlist/album on SpoX Phone (so "next" continues in the list). */
     fun playIn(context: String?, track: String?, uris: List<String> = emptyList()): Boolean {

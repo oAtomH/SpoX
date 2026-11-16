@@ -54,6 +54,27 @@ fn check_once(ev: &Sender<Ev>) -> Option<String> {
     Some(v)
 }
 
+static STATUS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// "check now" result for Settings.
+pub fn status() -> String {
+    STATUS.lock().unwrap().clone()
+}
+
+/// Settings > Check for updates: look right now (and download if there's a new version).
+pub fn check_now(ev: Sender<Ev>, ctx: eframe::egui::Context) {
+    if !allowed() {
+        *STATUS.lock().unwrap() = "not in the build folder".into();
+        return;
+    }
+    *STATUS.lock().unwrap() = "checking...".into();
+    std::thread::spawn(move || {
+        let r = check_once(&ev);
+        *STATUS.lock().unwrap() = match r { Some(v) => format!("v{} ready: restart", v), None => "up to date".into() };
+        ctx.request_repaint();
+    });
+}
+
 pub fn start(cfg: crate::config::Shared, ev: Sender<Ev>) {
     cleanup();
     if !allowed() {

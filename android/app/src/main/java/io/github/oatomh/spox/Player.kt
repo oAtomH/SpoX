@@ -66,6 +66,8 @@ object Player {
         if (::app.isInitialized) return
         app = ctx.applicationContext
         engine = io.github.oatomh.spox.engine.Engine.get(app).also { it.now.listeners += engineChanged }
+        Web.init(app)
+        Smart.init(app)
         // notification + widget follow every change, whether or not Notification access is on
         listen(outputs)
     }
@@ -78,7 +80,8 @@ object Player {
         // the speaker is a little behind Soloist: show (and sync lyrics to) what you hear
         val heard = (n.position() - if (n.playing) e.audioLagMs else 0).coerceAtLeast(0)
         // a song counts as listened to after 10 s
-        if (n.playing && heard > 10_000) noteHeard(t.uri)
+        if (n.playing && heard > 10_000) Web.noteKnown(t.title, t.artist)
+        Web.loadKnown(n.contextUri.ifEmpty { null })
         return State(
             title = t.title, artist = t.artist, album = t.album, art = n.art,
             durationMs = t.durationMs, positionMs = heard, positionAt = nowT,
@@ -257,7 +260,15 @@ object Player {
     }
 
     fun toggleShuffle() {
-        eng?.let { e -> expect(shuffle = !state.shuffle); e.command("set_shuffle", mapOf("enabled" to state.shuffle)); return }
+        eng?.let { e ->
+            // off -> shuffle -> smart shuffle (with the Spotify sign-in) -> off
+            when {
+                Smart.on -> { Smart.stop(); expect(shuffle = false); e.command("set_shuffle", mapOf("enabled" to false)) }
+                state.shuffle && Web.signedIn -> { if (!Smart.start(app)) { expect(shuffle = false); e.command("set_shuffle", mapOf("enabled" to false)) } else changed() }
+                else -> { expect(shuffle = !state.shuffle); e.command("set_shuffle", mapOf("enabled" to state.shuffle)) }
+            }
+            return
+        }
         if (controller == null) return
         expect(shuffle = !state.shuffle)
         if (custom("shuffle")) return
@@ -310,6 +321,7 @@ object Player {
         val e = eng ?: run { tc?.skipToQueueItem(id); return }
         val i = id.toInt()
         val t = e.now.queue.getOrNull(i) ?: return
+        Smart.holdUntil = System.currentTimeMillis() + 450L * (i + 1) + 2500
         val ctx = e.now.contextUri
         // a song from the playlist itself: start the playlist right at it (one jump, nothing
         // skipped through, and other devices see it straight away). Otherwise: paced skips.
@@ -325,23 +337,9 @@ object Player {
 
     class QRow(val id: Long, val title: String, val artist: String, val group: String, val neverHeard: Boolean, val outside: Boolean)
 
-    private val heard = HashSet<String>()
-    private var heardLoaded = false
-    private fun heardFile() = java.io.File(app.filesDir, "heard.txt")
-    private fun loadHeard() {
-        if (heardLoaded) return
-        heardLoaded = true
-        runCatching { heardFile().readLines().forEach { if (it.isNotBlank()) heard += it.trim() } }
-    }
-    private fun noteHeard(uri: String) {
-        loadHeard()
-        if (heard.add(uri)) kotlin.concurrent.thread { runCatching { heardFile().appendText(uri + "\n") } }
-    }
-
     /** Up next for the list, grouped like Spotify's queue, with "new" marks. */
     fun queueRows(): List<QRow> {
         val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, t, a, "", false, false) }
-        loadHeard()
         val name = e.now.contextName.ifEmpty { "this playlist" }
         return e.now.queue.mapIndexed { i, t ->
             val p = t.provider
@@ -351,7 +349,9 @@ object Player {
                 p.contains("context") -> "Next from $name"
                 else -> ""
             }
-            QRow(i.toLong(), t.title, t.artist, group, heard.isNotEmpty() && t.uri !in heard, p.contains("autoplay") || p.contains("recommend"))
+            // "new to you": not in your Liked Songs, this playlist or recent plays (Spotify's lists)
+            QRow(i.toLong(), t.title, t.artist, group, Web.knows(t.title, t.artist) == false,
+                p.contains("autoplay") || p.contains("recommend") || t.uri in Smart.newUris)
         }
     }
 

@@ -89,6 +89,12 @@ impl Api {
         out
     }
 
+    /// Your last 50 played songs (Spotify keeps this list; that's all its API gives).
+    pub fn recent(&self) -> Vec<Track> {
+        let Ok(v) = self.get("/me/player/recently-played?limit=50") else { return Vec::new() };
+        v.get("items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|e| e.get("track").and_then(Self::parse_track)).collect()).unwrap_or_default()
+    }
+
     /// Every song in Liked Songs (paged, capped at 5000).
     pub fn liked_all(&self) -> Vec<Track> {
         let mut out = Vec::new();

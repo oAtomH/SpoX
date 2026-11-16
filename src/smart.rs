@@ -32,6 +32,56 @@ pub fn key(name: &str, artists: &str) -> String {
     format!("{}|{}", n.trim(), a.trim())
 }
 
+// ---- songs you know, according to Spotify ------------------------------------------------------
+// Liked Songs + your playlists (the ones SpoX has loaded) + your last 50 plays. Nothing is
+// recorded by SpoX itself: it all comes from your Spotify account. Up next marks the rest as
+// "new to you", and smart shuffle only slips in songs from outside this set.
+
+static KNOWN: std::sync::OnceLock<Mutex<(bool, HashSet<String>)>> = std::sync::OnceLock::new();
+fn known_set() -> &'static Mutex<(bool, HashSet<String>)> {
+    KNOWN.get_or_init(|| Mutex::new((false, HashSet::new())))
+}
+
+/// Is this a song you know? None until the list has loaded from Spotify.
+pub fn knows(name: &str, artists: &str) -> Option<bool> {
+    let k = known_set().lock().unwrap();
+    if !k.0 {
+        return None;
+    }
+    Some(k.1.contains(&key(name, artists)))
+}
+
+/// (Re)loads the list in the background from your Spotify account.
+pub fn load_known(api: crate::web::Api) {
+    std::thread::spawn(move || {
+        let mut keys: HashSet<String> = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(config::cache_dir().join("tracks")) {
+            for f in rd.flatten() {
+                if let Ok(b) = std::fs::read(f.path()) {
+                    if let Ok(Value::Array(a)) = serde_json::from_slice::<Value>(&b) {
+                        for e in a {
+                            if let (Some(n), Some(ar)) = (e.get(1).and_then(|x| x.as_str()), e.get(2).and_then(|x| x.as_str())) {
+                                keys.insert(key(n, ar));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for t in api.liked_all().iter().chain(api.recent().iter()) {
+            keys.insert(key(&t.name, &t.artists));
+        }
+        let mut k = known_set().lock().unwrap();
+        k.1.extend(keys);
+        k.0 = true;
+    });
+}
+
+/// A song just played for a while: it's not new any more.
+pub fn note_known(name: &str, artists: &str) {
+    known_set().lock().unwrap().1.insert(key(name, artists));
+}
+
 struct Rng(u64);
 impl Rng {
     fn new() -> Self {
@@ -211,7 +261,7 @@ impl Engine {
 
     fn is_known(&self, t: &Track) -> bool {
         let k = key(&t.name, &t.artists);
-        self.used.contains(&k) || self.library.lock().unwrap().contains(&k)
+        self.used.contains(&k) || self.library.lock().unwrap().contains(&k) || known_set().lock().unwrap().1.contains(&k)
     }
 
     /// A new song (not in your playlists or Liked Songs), not by the artist playing right now.
@@ -224,7 +274,7 @@ impl Engine {
             tries -= 1;
             let Some(t) = pool.pop_front() else { break };
             let k = key(&t.name, &t.artists);
-            if self.used.contains(&k) || self.library.lock().unwrap().contains(&k) {
+            if self.used.contains(&k) || self.library.lock().unwrap().contains(&k) || known_set().lock().unwrap().1.contains(&k) {
                 continue;
             }
             if avoid && first_artist(&t.artists) == now_artist && !pool.is_empty() {

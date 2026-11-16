@@ -518,6 +518,11 @@ pub fn start_watcher(sh: TbShared, ctx: egui::Context) {
         .name("taskbar-watch".into())
         .spawn(move || win::watch(sh, ctx))
         .ok();
+    #[cfg(windows)]
+    std::thread::Builder::new()
+        .name("taskbar-raise".into())
+        .spawn(win::raise_on_events)
+        .ok();
     #[cfg(not(windows))]
     {
         let _ = (sh, ctx);
@@ -534,6 +539,65 @@ mod win {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // ---- staying above the taskbar ------------------------------------------------------------
+    // Clicking the taskbar or opening an app brings the taskbar (also "always on top") forward,
+    // covering the player until the next check: that was the flicker. Now Windows tells us the
+    // moment the active window changes, and the player goes back on top right away.
+
+    static ME: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+    fn raise() {
+        let me = ME.load(Ordering::SeqCst) as HWND;
+        if me.is_null() {
+            return;
+        }
+        unsafe {
+            if IsWindowVisible(me) != 0 {
+                SetWindowPos(me, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
+            }
+        }
+    }
+
+    unsafe extern "system" fn raise_later(_h: HWND, _m: u32, id: usize, _t: u32) {
+        KillTimer(std::ptr::null_mut(), id);
+        raise();
+    }
+
+    unsafe extern "system" fn on_event(_hook: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK, _ev: u32, _hwnd: HWND, _obj: i32, _child: i32, _thread: u32, _ms: u32) {
+        raise();
+        // the taskbar sometimes lifts itself a moment after: once more shortly after
+        SetTimer(std::ptr::null_mut(), 0, 120, Some(raise_later));
+    }
+
+    pub fn raise_on_events() {
+        use windows_sys::Win32::UI::Accessibility::SetWinEventHook;
+        unsafe {
+            // EVENT_SYSTEM_FOREGROUND (3), and minimize end (0x17); WINEVENT_OUTOFCONTEXT = 0
+            let a = SetWinEventHook(3, 3, std::ptr::null_mut(), Some(on_event), 0, 0, 0);
+            let b = SetWinEventHook(0x17, 0x17, std::ptr::null_mut(), Some(on_event), 0, 0, 0);
+            if a.is_null() && b.is_null() {
+                return;
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    /// The taskbar is really on screen at its spot (not still under a fullscreen app that's closing).
+    fn bar_shown(bar: HWND, me: HWND, r: &RECT) -> bool {
+        unsafe {
+            let pt = windows_sys::Win32::Foundation::POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
+            let h = WindowFromPoint(pt);
+            if h.is_null() {
+                return true;
+            }
+            let root = GetAncestor(h, GA_ROOT);
+            root == bar || root == me || GetAncestor(root, GA_ROOTOWNER) == bar
+        }
     }
 
     fn rect(h: HWND) -> Option<RECT> {
@@ -640,6 +704,12 @@ mod win {
         let mut last: Option<(i32, i32, i32, i32, bool)> = None;
         let mut last_me: HWND = std::ptr::null_mut();
         let mut follow_bar: usize = 0;
+        // a change (hide / fullscreen / other monitor) must hold for a moment before we act on it:
+        // apps opening, splash screens and taskbar previews flash for a split second, and
+        // following each of them made the player flicker
+        let mut applied: Option<(bool, bool, usize)> = None;
+        let mut cand: Option<(bool, bool, usize)> = None;
+        let mut cand_n = 0u32;
         loop {
             std::thread::sleep(Duration::from_millis(250));
             let cfg = sh.cfg.lock().unwrap().clone();
@@ -649,10 +719,12 @@ mod win {
                     last = None;
                     continue;
                 }
+                ME.store(me as isize, Ordering::SeqCst);
                 if me != last_me {
                     // a fresh window (player switched off and on): it starts hidden and gets placed below
                     last_me = me;
                     last = None;
+                    applied = None;
                 }
                 let bars = taskbars();
                 if bars.is_empty() {
@@ -703,9 +775,6 @@ mod win {
                 if slid_away && !info && !taskbar_autohides() && last.map(|l| l.4).unwrap_or(false) {
                     continue;
                 }
-                if sh.fs_info.swap(info, Ordering::SeqCst) != info {
-                    ctx.request_repaint_of(super::id());
-                }
                 let hide = !cfg.tb_on
                     || !wide
                     || scale < 1
@@ -714,6 +783,25 @@ mod win {
                     || (idle && cfg.tb_idle == "hide")
                     || (cfg.tb_show_when == "hidden" && !crate::desktop::HIDDEN.load(Ordering::SeqCst))
                     || (!info && last.map(|l| l.4 && shell_popup_over([l.0, l.1, l.2, l.3])).unwrap_or(false));
+                let want = (hide, info, idx);
+                // coming back to a taskbar after a fullscreen app (or from hidden): wait until that
+                // taskbar is actually back on screen, so the player arrives together with it
+                if !hide && !info && applied.map(|a| a.0 || a.1 || a.2 != idx).unwrap_or(false) && !bar_shown(bar, me, &br) {
+                    continue;
+                }
+                if last.is_some() && applied.is_some() && applied != Some(want) {
+                    if cand == Some(want) { cand_n += 1 } else { cand = Some(want); cand_n = 1 }
+                    // switching off the player in Settings is immediate; everything else waits ~0.75 s
+                    if cand_n < 3 && cfg.tb_on {
+                        continue;
+                    }
+                }
+                applied = Some(want);
+                cand = None;
+                cand_n = 0;
+                if sh.fs_info.swap(info, Ordering::SeqCst) != info {
+                    ctx.request_repaint_of(super::id());
+                }
                 if hide {
                     {
                         let mut u = sh.ui.lock().unwrap();

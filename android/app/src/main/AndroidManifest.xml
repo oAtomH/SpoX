@@ -68,6 +68,14 @@
 
         <receiver android:name=".NotifyActions" android:exported="false" />
 
+        <!-- Android Auto: SpoX's library in the car -->
+        <service android:name=".SpoxBrowser" android:exported="true">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+        <meta-data android:name="com.google.android.gms.car.application" android:resource="@xml/automotive_app_desc" />
+
         <!-- SpoX Engine: Spotify's Soloist running inside SpoX (no Spotify app needed) -->
         <service android:name=".engine.EngineService" android:exported="false" android:foregroundServiceType="mediaPlayback" />
 

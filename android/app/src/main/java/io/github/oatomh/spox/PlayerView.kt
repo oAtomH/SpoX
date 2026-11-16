@@ -31,7 +31,7 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     enum class Tab(val label: String) { PLAYER("Player"), LYRICS("Lyrics"), QUEUE("Up next"), LIBRARY("Library"), SETTINGS("Settings") }
     var tab = Tab.PLAYER
-        set(v) { field = v; scroll = 0f; fling = 0f; invalidate() }
+        set(v) { field = v; scroll = 0f; fling = 0f; queueAsked = 0L; invalidate() }
 
     /** Frames per second while something moves: Settings > Smoothness. */
     var fps = 30
@@ -48,6 +48,8 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     private val t0 = SystemClock.elapsedRealtime()
     private var animating = false
+    /** scrolling by itself (fling, lyrics gliding): full frame rate so it's not choppy */
+    private var smooth = false
     private var showRemaining = false
 
     // slow system lookups, done now and then instead of every frame
@@ -196,6 +198,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         val now = SystemClock.elapsedRealtime()
         val dt = if (lastFrame == 0L) 16f else min(100f, (now - lastFrame).toFloat())
         lastFrame = now
+        lastDt = dt
         hits.clear()
         cv.drawColor(cBg)
 
@@ -205,6 +208,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             fling *= Math.pow(0.996, dt.toDouble()).toFloat()
             if (scroll < 0 || scroll > maxScroll) fling = 0f
             animating = true
+            smooth = true
         } else if (dragging != "list") fling = 0f
 
         // bottom: tab bar, and above it a small player on the other tabs
@@ -232,11 +236,12 @@ class PlayerView(ctx: Context) : View(ctx) {
         // Pixel art moves in whole pixels, so drawing at the phone's full 120 Hz mostly repeats the
         // same picture and costs battery. Dragging stays at full speed; otherwise the chosen rate.
         when {
-            dragging != null -> postInvalidateOnAnimation()
+            dragging != null || smooth -> postInvalidateOnAnimation()
             st.playing || animating -> postInvalidateDelayed(1000L / fps)
             else -> postInvalidateDelayed(500)
         }
         animating = false
+        smooth = false
     }
 
     private fun header(cv: Canvas, title: String, sub: String = ""): Float {
@@ -332,7 +337,8 @@ class PlayerView(ctx: Context) : View(ctx) {
         val top = contentTop
         // header: where the music comes from, and a shortcut to the app
         val src = when (st.app) { "io.github.oatomh.spox.engine" -> "Playing on SpoX Engine"; "com.spotify.music", "com.spotify.lite" -> "Playing on Spotify"; "" -> "SpoX"; else -> "Playing" }
-        txt(cv, src, pad, top + 4 * u, u, cDim)
+        txt(cv, src + if (Web.signedIn) "  >" else "", pad, top + 4 * u, u, cDim)
+        if (Web.signedIn) hit(0f, top - 4 * u, pad + tw(src, u) + 20 * u, top + 16 * u, "devices")
         val lw = sprW("btn_link", u)
         if (Player.fromEngine) {
             // share the song, and like it (heart) when signed in to Spotify
@@ -343,6 +349,16 @@ class PlayerView(ctx: Context) : View(ctx) {
                 val lx = width - pad - 2 * lw - 6 * u
                 spr(cv, if (liked == true || pressed == "like") "btn_like_down" else "btn_like", lx, top, u)
                 hit(lx - 2 * u, top - 4 * u, lx + lw + 2 * u, top + 20 * u, "like")
+                // + / -: add the song to the playlist that's playing, or take it out
+                val ctxUri = io.github.oatomh.spox.engine.Engine.get(context).now.contextUri
+                val uri = Player.engineTrackUri()
+                val inPl = if (uri != null) Web.inPlaylist(ctxUri, uri) else null
+                if (inPl != null) {
+                    val px = lx - lw - 6 * u
+                    val b = if (inPl) "btn_remove" else "btn_add"
+                    spr(cv, if (pressed == "plus") "${b}_down" else b, px, top, u)
+                    hit(px - 2 * u, top - 4 * u, px + lw + 2 * u, top + 20 * u, "plus")
+                }
             }
         } else {
             spr(cv, if (pressed == "link") "btn_link_down" else "btn_link", width - pad - lw, top, u)
@@ -400,6 +416,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             val active = (b == "btn_shuffle" && st.shuffle) || (b == "btn_repeat" && st.repeat)
             val sprite = when {
                 pressed == b && skin.sprite("${b}_down") != null -> "${b}_down"
+                b == "btn_shuffle" && st.shuffle && Smart.on && skin.sprite("btn_shuffle_smart") != null -> "btn_shuffle_smart"
                 active && skin.sprite("${b}_on") != null -> "${b}_on"
                 active && skin.sprite("${b}_down") != null -> "${b}_down"
                 else -> b
@@ -500,23 +517,8 @@ class PlayerView(ctx: Context) : View(ctx) {
         val wrapped = wrapCache.takeIf { wrapKey == "$lyricsKey|$maxW|$k" } ?: wrap(l, maxW, k).also {
             wrapCache = it; wrapKey = "$lyricsKey|$maxW|$k"
         }
-        // early by a quarter second (reads naturally), plus this song's own nudge (- / + above)
-        val off = lyricOffset()
-        val p = st.position(now) + 250 + off
-        if (l.synced) {
-            val label = (if (off >= 0) "+" else "") + String.format("%.2fs", off / 1000f)
-            val bw = 16 * u
-            val y0 = contentTop + 4 * u
-            val xPlus = width - pad - bw
-            val xMinus = xPlus - bw - tw(label, u) - 8 * u
-            nine(cv, "list_bg", xMinus, y0 - 2 * u, bw, 14 * u, u, 4)
-            txt(cv, "-", xMinus + (bw - tw("-", u)) / 2, y0 + u, u, cTitle)
-            txt(cv, label, xMinus + bw + 4 * u, y0 + u, u, if (off == 0L) cDim else cTitle)
-            nine(cv, "list_bg", xPlus, y0 - 2 * u, bw, 14 * u, u, 4)
-            txt(cv, "+", xPlus + (bw - tw("+", u)) / 2, y0 + u, u, cTitle)
-            hit(xMinus - 4 * u, y0 - 6 * u, xMinus + bw + 2 * u, y0 + 16 * u, "lyroff:-")
-            hit(xPlus - 2 * u, y0 - 6 * u, width.toFloat(), y0 + 16 * u, "lyroff:+")
-        }
+        // a quarter second early reads naturally
+        val p = st.position(now) + 250
         val current = if (l.synced) l.lines.indexOfLast { it.first <= p } else -1
         val curRow = wrapped.indexOfFirst { it.first == current }
         val viewH = contentBottom - top
@@ -524,7 +526,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         // follow the song unless you scrolled by hand a moment ago (glides there, no jumps)
         if (curRow >= 0 && SystemClock.elapsedRealtime() > manualUntil && dragging != "list") {
             val target = (curRow * lh - viewH * 0.35f).coerceIn(0f, maxScroll)
-            if (abs(target - scroll) > 1f) { scroll += (target - scroll) * 0.18f; animating = true } else scroll = target
+            if (abs(target - scroll) > 1f) { scroll += (target - scroll) * (1f - Math.pow(0.82, dt60()).toFloat()); animating = true; smooth = true } else scroll = target
         }
         scroll = scroll.coerceIn(0f, maxScroll)
         cv.save()
@@ -546,13 +548,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         cv.restore()
     }
 
-    private fun lyricKey() = "lyr_" + lyricsKey.hashCode()
-    private fun lyricOffset(): Long = context.getSharedPreferences("spox", 0).getLong(lyricKey(), 0)
-    private fun nudgeLyrics(ms: Long) {
-        val v = (lyricOffset() + ms).coerceIn(-10_000, 10_000)
-        context.getSharedPreferences("spox", 0).edit().putLong(lyricKey(), v).apply()
-        manualUntil = 0
-    }
+
 
     /** Lyrics lines cut to the screen width once per song (not every frame). */
     private fun wrap(l: Lyrics.Result, maxW: Float, k: Float): List<Pair<Int, String>> {
@@ -616,8 +612,15 @@ class PlayerView(ctx: Context) : View(ctx) {
         cv.restore()
     }
 
+    private var queueAsked = 0L
+
     private fun drawQueue(cv: Canvas) {
         val top = header(cv, "Up next")
+        // keep it the same as on your other devices: ask again every few seconds while it's open
+        if (Player.fromEngine && SystemClock.elapsedRealtime() - queueAsked > 5000) {
+            queueAsked = SystemClock.elapsedRealtime()
+            io.github.oatomh.spox.engine.Engine.get(context).command("get_queue", mapOf("limit" to 50))
+        }
         val rows = mutableListOf<Triple<String, String, String>>()
         val accent = HashSet<String>()
         var group = ""
@@ -715,6 +718,22 @@ class PlayerView(ctx: Context) : View(ctx) {
         kotlin.concurrent.thread { val r = Web.isLiked(id); post { if (likedFor == id) { liked = r; invalidate() } } }
     }
 
+    var onDevices: (() -> Unit)? = null
+
+    private fun togglePlaylist() {
+        val ctxUri = io.github.oatomh.spox.engine.Engine.get(context).now.contextUri
+        val uri = Player.engineTrackUri() ?: return
+        val inPl = Web.inPlaylist(ctxUri, uri) ?: return
+        val name = io.github.oatomh.spox.engine.Engine.get(context).now.contextName.ifEmpty { "the playlist" }
+        kotlin.concurrent.thread {
+            val ok = if (inPl) Web.removeFrom(ctxUri, uri) else Web.addTo(ctxUri, uri)
+            post {
+                android.widget.Toast.makeText(context, if (!ok) "Couldn't change $name (is it yours?)" else if (inPl) "Removed from $name" else "Added to $name", android.widget.Toast.LENGTH_SHORT).show()
+                invalidate()
+            }
+        }
+    }
+
     private fun toggleLike() {
         val id = trackId()
         if (id.isEmpty()) return
@@ -739,6 +758,9 @@ class PlayerView(ctx: Context) : View(ctx) {
     }
 
     // ---- touch ----------------------------------------------------------------------------
+
+    private var lastDt = 16f
+    private fun dt60() = (lastDt / 16.67f).toDouble()
 
     private fun hitAt(x: Float, y: Float) = hits.lastOrNull { x >= it.l && x < it.r && y >= it.t && y < it.b }?.id
 
@@ -824,11 +846,11 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "link" -> Player.openApp(context)
             id == "share" -> share()
             id == "like" -> toggleLike()
+            id == "plus" -> togglePlaylist()
+            id == "devices" -> onDevices?.invoke()
             id.startsWith("lib") || id.startsWith("qlib") -> libTap(id)
             id == "time" -> showRemaining = !showRemaining
-            id == "lyroff:-" -> nudgeLyrics(-250)
-            id == "lyroff:+" -> nudgeLyrics(250)
-            id.startsWith("lyric:") -> id.removePrefix("lyric:").toLongOrNull()?.let { Player.seek(maxOf(0, it - lyricOffset())); manualUntil = 0 }
+            id.startsWith("lyric:") -> id.removePrefix("lyric:").toLongOrNull()?.let { Player.seek(it); manualUntil = 0 }
         }
         invalidate()
     }

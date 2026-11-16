@@ -36,7 +36,10 @@ object SpoxNotification {
         update(ctx)
     }
 
-    private fun session(ctx: Context): MediaSession = session ?: MediaSession(ctx, "SpoX").also { s ->
+    /** The SpoX player's session (also what Android Auto connects to). */
+    fun token(ctx: Context): MediaSession.Token = session(ctx).sessionToken
+
+    private fun session(ctx: Context): MediaSession = session?.also { if (!it.isActive) it.isActive = true } ?: MediaSession(ctx.applicationContext, "SpoX").also { s ->
         s.setCallback(object : MediaSession.Callback() {
             override fun onPlay() { Player.play() }
             override fun onPause() { Player.pause() }
@@ -49,6 +52,15 @@ object SpoxNotification {
             override fun onSkipToNext() { Player.next() }
             override fun onSkipToPrevious() { Player.prev() }
             override fun onSeekTo(pos: Long) { Player.seek(pos) }
+            // Android Auto / Assistant: play something from SpoX's library
+            override fun onPlayFromMediaId(id: String, extras: android.os.Bundle?) { SpoxBrowser.play(id) }
+            override fun onPlayFromSearch(query: String?, extras: android.os.Bundle?) {
+                val q = query.orEmpty().trim()
+                kotlin.concurrent.thread {
+                    if (q.isEmpty()) { Player.play(); return@thread }
+                    Web.search(q).firstOrNull()?.let { Player.playUri(it.uri) }
+                }
+            }
         })
         s.isActive = true
         session = s
@@ -56,9 +68,8 @@ object SpoxNotification {
 
     private fun clear(ctx: Context) {
         ctx.getSystemService(NotificationManager::class.java).cancel(ID)
+        // keep the session itself (Android Auto stays connected to it), just switch it off
         session?.isActive = false
-        session?.release()
-        session = null
         lastKey = ""
     }
 
