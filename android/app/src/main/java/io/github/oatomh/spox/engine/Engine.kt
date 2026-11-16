@@ -259,6 +259,93 @@ class Engine private constructor(private val ctx: Context) {
 
     @Volatile private var audioServer: android.net.LocalServerSocket? = null
 
+    // ---- the real visualizer: a copy of the sound, read where the speaker is right now -------
+
+    private val ring = FloatArray(1 shl 16)
+    @Volatile private var ringFrames = 0L
+    @Volatile private var playing: android.media.AudioTrack? = null
+    @Volatile private var rate = 44100
+    private var carry = 0
+    private val carryBuf = ByteArray(8)
+
+    private fun tap(b: ByteArray, n: Int, float: Boolean, ch: Int) {
+        val bps = if (float) 4 else 2
+        val fb = bps * ch
+        var i = 0
+        val bb = java.nio.ByteBuffer.wrap(b, 0, n).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        // (reads arrive in any size: frames split across reads are simply dropped, it's only for the picture)
+        val frames = n / fb
+        var f = ringFrames
+        while (i < frames) {
+            var sum = 0f
+            for (c in 0 until ch) {
+                val o = i * fb + c * bps
+                sum += if (float) bb.getFloat(o) else bb.getShort(o) / 32768f
+            }
+            ring[(f and 0xffff).toInt()] = sum / ch
+            f++; i++
+        }
+        ringFrames = f
+    }
+
+    private val win = FloatArray(1024) { (0.5 - 0.5 * Math.cos(2 * Math.PI * it / 1023)).toFloat() }
+    private val re = FloatArray(1024)
+    private val im = FloatArray(1024)
+
+    /** Loudness of [out].size frequency bands (0..1) of what the speaker plays right now. */
+    @Synchronized
+    fun spectrum(out: FloatArray): Boolean {
+        val t = playing ?: return false
+        val head = runCatching { t.playbackHeadPosition.toLong() and 0xffffffffL }.getOrNull() ?: return false
+        val end = minOf(head, ringFrames)
+        if (end < 1024) return false
+        for (k in 0 until 1024) { re[k] = ring[((end - 1024 + k) and 0xffff).toInt()] * win[k]; im[k] = 0f }
+        fft(re, im)
+        val nyq = rate / 2f
+        val lo = 40f; val hi = minOf(16000f, nyq)
+        for (b in out.indices) {
+            val f0 = lo * Math.pow((hi / lo).toDouble(), b.toDouble() / out.size).toFloat()
+            val f1 = lo * Math.pow((hi / lo).toDouble(), (b + 1).toDouble() / out.size).toFloat()
+            val i0 = (f0 / nyq * 512).toInt().coerceIn(1, 511)
+            val i1 = (f1 / nyq * 512).toInt().coerceIn(i0 + 1, 512)
+            var m = 0f
+            for (k in i0 until i1) m = maxOf(m, re[k] * re[k] + im[k] * im[k])
+            // decibels, -60..0 dB -> 0..1
+            val db = 10f * kotlin.math.log10(m + 1e-12f) - 24f
+            out[b] = ((db + 60f) / 60f).coerceIn(0f, 1f)
+        }
+        return true
+    }
+
+    private fun fft(x: FloatArray, y: FloatArray) {
+        val n = x.size
+        var j = 0
+        for (i in 1 until n) {
+            var bit = n shr 1
+            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
+            j = j xor bit
+            if (i < j) { val a = x[i]; x[i] = x[j]; x[j] = a; val c = y[i]; y[i] = y[j]; y[j] = c }
+        }
+        var len = 2
+        while (len <= n) {
+            val ang = -2 * Math.PI / len
+            val wr = Math.cos(ang).toFloat(); val wi = Math.sin(ang).toFloat()
+            var i = 0
+            while (i < n) {
+                var cr = 1f; var ci = 0f
+                for (k in 0 until len / 2) {
+                    val ar = x[i + k + len / 2] * cr - y[i + k + len / 2] * ci
+                    val ai = x[i + k + len / 2] * ci + y[i + k + len / 2] * cr
+                    x[i + k + len / 2] = x[i + k] - ar; y[i + k + len / 2] = y[i + k] - ai
+                    x[i + k] += ar; y[i + k] += ai
+                    val nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr
+                }
+                i += len
+            }
+            len = len shl 1
+        }
+    }
+
     /** Sound written to Android's player but not heard yet (ms). */
     @Volatile var audioLagMs = 120L
 
@@ -300,6 +387,8 @@ class Engine private constructor(private val ctx: Context) {
                 .setTransferMode(android.media.AudioTrack.MODE_STREAM)
                 .build()
             track.play()
+            this.rate = rate
+            ringFrames = 0
             log("[audio] playing on the phone: $rate Hz, $ch channels, ${if (fmt == 0x11b) "float" else "16-bit"}")
             val buf = java.nio.ByteBuffer.allocateDirect(16384).order(java.nio.ByteOrder.LITTLE_ENDIAN)
             val arr = ByteArray(16384)
@@ -310,6 +399,8 @@ class Engine private constructor(private val ctx: Context) {
                 val n = input.read(arr)
                 if (n <= 0) break
                 buf.clear(); buf.put(arr, 0, n); buf.flip()
+                tap(arr, n, fmt == 0x11b, ch)
+                playing = track
                 while (buf.hasRemaining()) {
                     val w = track.write(buf, buf.remaining(), android.media.AudioTrack.WRITE_BLOCKING)
                     if (w < 0) { log("[audio] write error $w"); return }
@@ -325,6 +416,7 @@ class Engine private constructor(private val ctx: Context) {
         } catch (e: Throwable) {
             log("[audio] ${e.javaClass.simpleName}: ${e.message}")
         } finally {
+            playing = null
             runCatching { track?.stop(); track?.release() }
             runCatching { sock.close() }
         }
@@ -392,7 +484,7 @@ class Engine private constructor(private val ctx: Context) {
 
     // ---- what's playing, from Soloist's messages ---------------------------------------------
 
-    class Track(val uri: String, val title: String, val artist: String, val album: String, val durationMs: Long, val cover: String)
+    class Track(val uri: String, val title: String, val artist: String, val album: String, val durationMs: Long, val cover: String, val provider: String = "")
 
     inner class Now {
         @Volatile var track: Track? = null
@@ -404,6 +496,8 @@ class Engine private constructor(private val ctx: Context) {
         @Volatile var repeat = "off"
         @Volatile var active = false
         @Volatile var queue: List<Track> = emptyList()
+        @Volatile var contextUri = ""
+        @Volatile var contextName = ""
         @Volatile var art: android.graphics.Bitmap? = null
         private var artFor = ""
         val listeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
@@ -423,7 +517,13 @@ class Engine private constructor(private val ctx: Context) {
 
         private fun name(o: org.json.JSONObject?): String = o?.optJSONObject("decorations")?.optJSONObject("identity")?.optString("name").orEmpty()
 
-        private fun parse(o: org.json.JSONObject?): Track? {
+        private fun context(c: org.json.JSONObject?) {
+            if (c == null) return
+            contextUri = c.optString("uri")
+            contextName = name(c)
+        }
+
+        private fun parse(o: org.json.JSONObject?, provider: String = ""): Track? {
             if (o == null || !o.has("uri")) return null
             val d = o.optJSONObject("decorations")
             val artist = d?.optJSONArray("creators")?.let { a -> (0 until a.length()).map { name(a.optJSONObject(it)?.optJSONObject("entity")) }.filter { it.isNotEmpty() }.joinToString(", ") }.orEmpty()
@@ -433,7 +533,7 @@ class Engine private constructor(private val ctx: Context) {
                 (list.firstOrNull { it.optString("size") == "large" } ?: list.firstOrNull { it.optString("size") == "default" } ?: list.firstOrNull())?.optString("url")
             }.orEmpty()
             return Track(o.optString("uri"), name(o), artist, name(d?.optJSONObject("parent")?.optJSONObject("entity")),
-                d?.optJSONObject("playback")?.optLong("duration_ms") ?: 0, cover)
+                d?.optJSONObject("playback")?.optLong("duration_ms") ?: 0, cover, provider)
         }
 
         private fun pos(p: org.json.JSONObject?) {
@@ -457,8 +557,10 @@ class Engine private constructor(private val ctx: Context) {
                     parse(m.optJSONObject("item"))?.let { track = it }
                     pos(m.optJSONObject("position"))
                     options(m.optJSONObject("options"))
+                    context(m.optJSONObject("context"))
                     if (m.has("is_active")) active = m.optBoolean("is_active")
                 }
+                "context_changed" -> context(m.optJSONObject("context"))
                 "track_changed" -> { parse(m.optJSONObject("item"))?.let { track = it }; posMs = 0.0; posAt = System.currentTimeMillis() }
                 "playback_changed" -> { val p = position(); posMs = p.toDouble(); posAt = System.currentTimeMillis(); status = m.optString("status", status) }
                 "position_sync" -> pos(m.optJSONObject("position"))
@@ -468,7 +570,7 @@ class Engine private constructor(private val ctx: Context) {
             // the queue comes as its own message or as the answer to get_queue
             val up = m.optJSONArray("upcoming") ?: m.optJSONObject("queue")?.optJSONArray("upcoming")
                 ?: m.optJSONObject("result")?.optJSONArray("upcoming") ?: m.optJSONObject("data")?.optJSONArray("upcoming")
-            if (up != null) queue = (0 until up.length()).mapNotNull { i -> up.optJSONObject(i)?.let { e -> parse(e.optJSONObject("item")) ?: parse(e) } }
+            if (up != null) queue = (0 until up.length()).mapNotNull { i -> up.optJSONObject(i)?.let { e -> val pv = e.optString("provider"); parse(e.optJSONObject("item"), pv) ?: parse(e, pv) } }
             val t = track
             if (t != null && t.uri != before) command("get_queue", mapOf("limit" to 50))
             if (t != null && t.cover.isNotEmpty() && t.cover != artFor) {

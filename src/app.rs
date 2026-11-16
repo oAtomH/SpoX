@@ -114,6 +114,8 @@ pub struct App {
     smart: Option<Sender<crate::smart::Cmd>>,
     smart_on: bool,
     smart_new: std::collections::HashSet<String>,
+    /// every song you've listened to for 10 s or more (kept on disk): the rest show as "new"
+    heard: std::collections::HashSet<String>,
     tb: Option<crate::tb::TbShared>,
     hold_shuffle: Option<(bool, Instant)>,
     hold_repeat: Option<(String, Instant)>,
@@ -288,6 +290,7 @@ impl App {
             smart: smart_tx,
             smart_on: false,
             smart_new: Default::default(),
+            heard: load_heard(),
             tb: tb_shared,
             hold_shuffle: None,
             hold_repeat: None,
@@ -631,6 +634,10 @@ impl App {
         }
         if self.history.first().map(|h| h.0.uri == t.uri).unwrap_or(false) {
             return;
+        }
+        if self.heard.insert(t.uri.clone()) {
+            let u = t.uri.clone();
+            std::thread::spawn(move || note_heard(&u));
         }
         self.history.retain(|h| h.0.uri != t.uri);
         self.history.insert(0, (t.clone(), config::now_secs()));
@@ -2216,10 +2223,14 @@ impl App {
                         q_map.push(None);
                         last_group = group;
                     }
-                    let is_new = self.smart_new.contains(&t.uri);
+                    // highlighted: songs you've never listened to, and songs that aren't from your
+                    // playlist (smart shuffle / Spotify's autoplay picks)
+                    let never = !self.heard.is_empty() && !self.heard.contains(&t.uri);
+                    let outside = self.smart_new.contains(&t.uri) || p.contains("autoplay") || p.contains("recommend");
+                    let is_new = never || outside;
                     rows.push(Row {
                         left: format!("{} - {}", t.artists, t.name),
-                        right: if is_new { "new".into() } else if t.duration_ms > 0 { fmt_time(t.duration_ms as f64) } else { String::new() },
+                        right: if never { "new to you".into() } else if outside { "new".into() } else if t.duration_ms > 0 { fmt_time(t.duration_ms as f64) } else { String::new() },
                         color: if is_new { new_col } else { list_col },
                         center: false,
                     });
@@ -2531,8 +2542,22 @@ impl App {
                 }
             }
             CtxAct::SkipTo(i) => {
-                // Soloist has no "jump to": skip forward the right number of times, one at a time
-                // (sent all at once, Soloist drops most of them while the next song loads)
+                // a song from the playlist itself: start the playlist right at that song (one jump,
+                // nothing skipped through, other devices see it straight away)
+                if let Some(t) = self.play.upcoming.get(i).cloned() {
+                    let ctx_uri = self.play.context_uri.clone();
+                    if self.signed_in && !ctx_uri.is_empty() && t.provider.contains("context") && !ctx_uri.contains(":collection") {
+                        let _ = self.web.send(Req::PlayIn { context: ctx_uri, track: t.uri.clone(), device_name: self.device_name(), fallback_uris: Vec::new() });
+                        let tx = self.solo.cmd.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1500));
+                            let _ = tx.send(command_with("get_queue", "limit", json!(50)));
+                        });
+                        return;
+                    }
+                }
+                // otherwise Soloist has no "jump to": skip forward the right number of times, one at
+                // a time (sent all at once, Soloist drops most of them while the next song loads)
                 let n = i.min(40) + 1;
                 crate::smart::hold_for(Duration::from_millis(450 * n as u64 + 2500));
                 let tx = self.solo.cmd.clone();
@@ -3707,6 +3732,28 @@ fn load_history() -> Vec<(Track, i64)> {
         })
         .collect()
 }
+fn heard_path() -> std::path::PathBuf {
+    config::cache_dir().join("heard.txt")
+}
+
+/// Songs listened to before (one uri per line), for the "new to you" marks.
+fn load_heard() -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> = std::fs::read_to_string(heard_path()).unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    // songs already in Recently played count too
+    for (t, _) in load_history() {
+        set.insert(t.uri);
+    }
+    set
+}
+
+fn note_heard(uri: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(config::cache_dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(heard_path()) {
+        let _ = writeln!(f, "{}", uri);
+    }
+}
+
 fn save_history(h: &[(Track, i64)]) {
     let v: Vec<serde_json::Value> = h.iter().map(|(t, at)| json!([t.uri, t.name, t.artists, t.album, t.duration_ms, at, t.cover_small])).collect();
     let _ = std::fs::create_dir_all(config::cache_dir());

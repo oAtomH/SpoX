@@ -77,6 +77,8 @@ object Player {
         val nowT = SystemClock.elapsedRealtime()
         // the speaker is a little behind Soloist: show (and sync lyrics to) what you hear
         val heard = (n.position() - if (n.playing) e.audioLagMs else 0).coerceAtLeast(0)
+        // a song counts as listened to after 10 s
+        if (n.playing && heard > 10_000) noteHeard(t.uri)
         return State(
             title = t.title, artist = t.artist, album = t.album, art = n.art,
             durationMs = t.durationMs, positionMs = heard, positionAt = nowT,
@@ -304,7 +306,62 @@ object Player {
         Triple(q.queueId, t, q.description.subtitle?.toString().orEmpty())
     } ?: emptyList()
 
-    fun playQueueItem(id: Long) { eng?.let { it.skipAhead(id.toInt() + 1); return }; tc?.skipToQueueItem(id) }
+    fun playQueueItem(id: Long) {
+        val e = eng ?: run { tc?.skipToQueueItem(id); return }
+        val i = id.toInt()
+        val t = e.now.queue.getOrNull(i) ?: return
+        val ctx = e.now.contextUri
+        // a song from the playlist itself: start the playlist right at it (one jump, nothing
+        // skipped through, and other devices see it straight away). Otherwise: paced skips.
+        if (Web.signedIn && ctx.isNotEmpty() && t.provider.contains("context") && !ctx.contains(":collection")) {
+            kotlin.concurrent.thread {
+                if (!Web.playIn(ctx, t.uri)) e.skipAhead(i + 1)
+                Thread.sleep(1500); e.command("get_queue", mapOf("limit" to 50))
+            }
+        } else e.skipAhead(i + 1)
+    }
+
+    // ---- "new" songs: never listened to before, or not from your playlist -------------------------
+
+    class QRow(val id: Long, val title: String, val artist: String, val group: String, val neverHeard: Boolean, val outside: Boolean)
+
+    private val heard = HashSet<String>()
+    private var heardLoaded = false
+    private fun heardFile() = java.io.File(app.filesDir, "heard.txt")
+    private fun loadHeard() {
+        if (heardLoaded) return
+        heardLoaded = true
+        runCatching { heardFile().readLines().forEach { if (it.isNotBlank()) heard += it.trim() } }
+    }
+    private fun noteHeard(uri: String) {
+        loadHeard()
+        if (heard.add(uri)) kotlin.concurrent.thread { runCatching { heardFile().appendText(uri + "\n") } }
+    }
+
+    /** Up next for the list, grouped like Spotify's queue, with "new" marks. */
+    fun queueRows(): List<QRow> {
+        val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, t, a, "", false, false) }
+        loadHeard()
+        val name = e.now.contextName.ifEmpty { "this playlist" }
+        return e.now.queue.mapIndexed { i, t ->
+            val p = t.provider
+            val group = when {
+                p.contains("queue") -> "Next in queue"
+                p.contains("autoplay") || p.contains("recommend") -> "Autoplay (Spotify's picks)"
+                p.contains("context") -> "Next from $name"
+                else -> ""
+            }
+            QRow(i.toLong(), t.title, t.artist, group, heard.isNotEmpty() && t.uri !in heard, p.contains("autoplay") || p.contains("recommend"))
+        }
+    }
+
+    // ---- playing things by link (library, search, shared links) -------------------------------
+
+    fun engineTrackUri(): String? = eng?.now?.track?.uri
+
+    /** Plays a Spotify link/uri (song, album, playlist, artist) on SpoX Engine. */
+    fun playUri(uri: String) { engine?.command("play", mapOf("uri" to uri)) }
+    fun addToQueue(uri: String) { engine?.command("add_to_queue", mapOf("uri" to uri)) }
 
     // ---- sleep timer ---------------------------------------------------------------------
 

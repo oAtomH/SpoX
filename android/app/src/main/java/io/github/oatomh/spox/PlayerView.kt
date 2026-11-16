@@ -29,7 +29,7 @@ import kotlin.math.sin
 class PlayerView(ctx: Context) : View(ctx) {
     private val skin get() = Skin.get(context)
 
-    enum class Tab(val label: String) { PLAYER("Player"), LYRICS("Lyrics"), QUEUE("Up next"), SETTINGS("Settings") }
+    enum class Tab(val label: String) { PLAYER("Player"), LYRICS("Lyrics"), QUEUE("Up next"), LIBRARY("Library"), SETTINGS("Settings") }
     var tab = Tab.PLAYER
         set(v) { field = v; scroll = 0f; fling = 0f; invalidate() }
 
@@ -115,6 +115,7 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     /** Back button: other tabs go back to the player first. */
     fun back(): Boolean {
+        if (tab == Tab.LIBRARY && pages.size > 1) { pages.removeAt(pages.size - 1); scroll = 0f; invalidate(); return true }
         if (tab == Tab.PLAYER) return false
         tab = Tab.PLAYER
         return true
@@ -224,6 +225,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             Tab.PLAYER -> drawPlayer(cv, st, now)
             Tab.LYRICS -> drawLyrics(cv, st, now)
             Tab.QUEUE -> drawQueue(cv)
+            Tab.LIBRARY -> drawLibrary(cv)
             Tab.SETTINGS -> drawSettings(cv)
         }
 
@@ -261,6 +263,7 @@ class PlayerView(ctx: Context) : View(ctx) {
                 Tab.PLAYER -> spr(cv, "icon", cx - 8 * u, iconY, u)
                 Tab.LYRICS -> spr(cv, if (on) "tab_lyrics_on" else "tab_lyrics", cx - 8 * u, iconY, u)
                 Tab.QUEUE -> spr(cv, if (on) "tab_queue_on" else "tab_queue", cx - 8 * u, iconY, u)
+                Tab.LIBRARY -> spr(cv, if (on) "tab_playlist_on" else "tab_playlist", cx - 8 * u, iconY, u)
                 Tab.SETTINGS -> spr(cv, if (on) "btn_menu_down" else "btn_menu", cx - 8 * u, iconY, 2 * u)
             }
             val lw = tw(t.label, u)
@@ -331,8 +334,20 @@ class PlayerView(ctx: Context) : View(ctx) {
         val src = when (st.app) { "io.github.oatomh.spox.engine" -> "Playing on SpoX Engine"; "com.spotify.music", "com.spotify.lite" -> "Playing on Spotify"; "" -> "SpoX"; else -> "Playing" }
         txt(cv, src, pad, top + 4 * u, u, cDim)
         val lw = sprW("btn_link", u)
-        spr(cv, if (pressed == "link") "btn_link_down" else "btn_link", width - pad - lw, top, u)
-        hit(width - pad - lw - 4 * u, top - 4 * u, width.toFloat(), top + 20 * u, "link")
+        if (Player.fromEngine) {
+            // share the song, and like it (heart) when signed in to Spotify
+            spr(cv, if (pressed == "share") "btn_link_down" else "btn_link", width - pad - lw, top, u)
+            hit(width - pad - lw - 2 * u, top - 4 * u, width.toFloat(), top + 20 * u, "share")
+            if (Web.signedIn) {
+                checkLiked()
+                val lx = width - pad - 2 * lw - 6 * u
+                spr(cv, if (liked == true || pressed == "like") "btn_like_down" else "btn_like", lx, top, u)
+                hit(lx - 2 * u, top - 4 * u, lx + lw + 2 * u, top + 20 * u, "like")
+            }
+        } else {
+            spr(cv, if (pressed == "link") "btn_link_down" else "btn_link", width - pad - lw, top, u)
+            hit(width - pad - lw - 4 * u, top - 4 * u, width.toFloat(), top + 20 * u, "link")
+        }
 
         // everything below the cover, from the bottom up
         val ctrlH = 16 * bu
@@ -408,6 +423,11 @@ class PlayerView(ctx: Context) : View(ctx) {
         if (vh >= 12 * u) drawVis(cv, st, now, pad, y, w, vh)
     }
 
+    private var spec = FloatArray(0)
+    private var level = FloatArray(0)
+    private var peak = FloatArray(0)
+    private var peakHold = LongArray(0)
+    private var visAt = 0L
     private var visColors: IntArray? = null
     private var visFor: Skin? = null
     private fun visCol(frac: Float): Int {
@@ -424,14 +444,29 @@ class PlayerView(ctx: Context) : View(ctx) {
         val x0 = x + floor((w - (bars * (bw + gap) - gap)) / 2 / u) * u
         val t = (now - t0) / 1000f
         val rows = (h / u).toInt()
+        // the real sound when SpoX Engine plays it; a gentle stand-in for the Spotify app
+        if (spec.size != bars) { spec = FloatArray(bars); level = FloatArray(bars); peak = FloatArray(bars); peakHold = LongArray(bars) }
+        val real = Player.fromEngine && st.playing && io.github.oatomh.spox.engine.Engine.get(context).spectrum(spec)
+        val dt = min(100f, (now - visAt).toFloat()).coerceAtLeast(1f)
+        visAt = now
         for (i in 0 until bars) {
             val xr = i / bars.toFloat()
-            val v = if (st.playing) ((0.15f + 0.55f * (sin(t * 3.1f + xr * 9f) * 0.5f + 0.5f) * (sin(t * 5.3f - xr * 4f) * 0.5f + 0.5f)) * (1f - abs(xr - 0.5f) * 0.6f)) else 0.02f
-            val bh = max(1, (v * rows).toInt())
-            for (yy in 0 until bh) {
-                box(cv, x0 + i * (bw + gap), y + h - (yy + 1) * u, bw, u, visCol(1f - yy.toFloat() / rows))
+            val target = when {
+                real -> spec[i]
+                st.playing -> (0.15f + 0.55f * (sin(t * 3.1f + xr * 9f) * 0.5f + 0.5f) * (sin(t * 5.3f - xr * 4f) * 0.5f + 0.5f)) * (1f - abs(xr - 0.5f) * 0.6f)
+                else -> 0f
             }
+            // bars jump up at once and fall smoothly; a peak pixel hangs on top, then drops
+            level[i] = if (target > level[i]) target else max(target, level[i] - dt / 600f)
+            if (level[i] >= peak[i]) { peak[i] = level[i]; peakHold[i] = now + 350 }
+            else if (now > peakHold[i]) peak[i] = max(level[i], peak[i] - dt / 900f)
+            val bh = max(1, (level[i] * rows).toInt())
+            val bx = x0 + i * (bw + gap)
+            for (yy in 0 until bh) box(cv, bx, y + h - (yy + 1) * u, bw, u, visCol(1f - yy.toFloat() / rows))
+            val py = (peak[i] * rows).toInt()
+            if (py > bh) box(cv, bx, y + h - (py + 1) * u, bw, u, skin.color("vis_peak", cHeader))
         }
+        if (st.playing || level.any { it > 0.01f }) animating = true
     }
 
     // ---- lists ----------------------------------------------------------------------------
@@ -538,7 +573,7 @@ class PlayerView(ctx: Context) : View(ctx) {
     }
 
     /** A scrolling list of two-line rows. */
-    private fun drawRows(cv: Canvas, top: Float, rows: List<Triple<String, String, String>>, empty: String, valueRight: Boolean) {
+    private fun drawRows(cv: Canvas, top: Float, rows: List<Triple<String, String, String>>, empty: String, valueRight: Boolean, accent: Set<String> = emptySet()) {
         if (rows.isEmpty()) {
             txt(cv, empty, (width - tw(empty, u)) / 2, top + 20 * u, u, cDim)
             return
@@ -565,19 +600,137 @@ class PlayerView(ctx: Context) : View(ctx) {
                 txt(cv, fit(a, width - 2 * pad - vw - 8 * u, u), pad, ry + 9 * u, u, cList)
                 txt(cv, b, width - pad - vw, ry + 9 * u, u, cDim)
             } else {
-                txt(cv, fit(a, width - 2 * pad, u), pad, ry + 5 * u, u, cList)
+                txt(cv, fit(a, width - 2 * pad, u), pad, ry + 5 * u, u, if (id in accent) skin.color("list_new", cTitle) else cList)
                 txt(cv, fit(b, width - 2 * pad, u), pad, ry + 16 * u, u, cDim)
             }
             box(cv, pad, ry + rh - max(1f, u / 2), width - 2 * pad, max(1f, u / 2), cLine)
             if (id.isNotEmpty()) hit(0f, max(top, ry), width.toFloat(), min(contentBottom, ry + rh), id)
+            // songs in the library get a "+" on the right: add to queue
+            if (id.startsWith("lib:") && libItem(id)?.kind == "track") {
+                val px = width - pad - 12 * u
+                box(cv, px - 4 * u, ry + 4 * u, 20 * u, rh - 8 * u, if (pressed == "q$id") cLine else cBg)
+                txt(cv, "+", px + 2 * u, ry + 10 * u, u, cTitle)
+                hit(px - 6 * u, max(top, ry), width.toFloat(), min(contentBottom, ry + rh), "q$id")
+            }
         }
         cv.restore()
     }
 
     private fun drawQueue(cv: Canvas) {
         val top = header(cv, "Up next")
-        val rows = Player.queueItems().map { (id, t, a) -> Triple(t, a, "queue:$id") }
-        drawRows(cv, top, rows, "Spotify didn't share its queue.", valueRight = false)
+        val rows = mutableListOf<Triple<String, String, String>>()
+        val accent = HashSet<String>()
+        var group = ""
+        for (q in Player.queueRows()) {
+            if (q.group.isNotEmpty() && q.group != group) { rows += Triple("#" + q.group, "", ""); group = q.group }
+            val id = "queue:${q.id}"
+            val mark = when { q.neverHeard -> " · new to you"; q.outside -> " · new"; else -> "" }
+            if (mark.isNotEmpty()) accent += id
+            rows += Triple(q.title, q.artist + mark, id)
+        }
+        drawRows(cv, top, rows, "Nothing queued.", valueRight = false, accent = accent)
+    }
+
+    // ---- library: playlists, Liked Songs, search (Spotify account) -----------------------------
+
+    class Page(val title: String, val list: Web.Item?, @Volatile var items: List<Web.Item> = emptyList(), @Volatile var loading: Boolean = true)
+    private val pages = mutableListOf<Page>()
+    var onSearch: (() -> Unit)? = null
+    var onSignIn: (() -> Unit)? = null
+
+    private fun libItem(id: String): Web.Item? {
+        val i = id.removePrefix("lib:").toIntOrNull() ?: return null
+        return pages.lastOrNull()?.items?.getOrNull(i)
+    }
+
+    private fun load(p: Page, f: () -> List<Web.Item>) {
+        kotlin.concurrent.thread { val r = runCatching(f).getOrDefault(emptyList()); post { p.items = r; p.loading = false; invalidate() } }
+    }
+
+    /** Opens a list (or search results) on top of the library. */
+    fun openPage(title: String, list: Web.Item?, f: () -> List<Web.Item>) {
+        val p = Page(title, list)
+        pages += p
+        scroll = 0f
+        tab = Tab.LIBRARY
+        load(p, f)
+    }
+
+    fun search(q: String) = openPage("Search: $q", null) { Web.search(q) }
+
+    private fun drawLibrary(cv: Canvas) {
+        if (!Web.signedIn) {
+            val top = header(cv, "Library", Web.status)
+            drawRows(cv, top, listOf(
+                Triple("Sign in to Spotify", "for your playlists, Liked Songs, search and likes", "libsignin"),
+                Triple("#Uses your own Spotify developer Client ID,", "", ""),
+                Triple("#the same one as SpoX on Windows.", "", ""),
+            ), "", valueRight = false)
+            return
+        }
+        if (pages.isEmpty()) { pages += Page("Library", null); load(pages[0]) { Web.playlists() } }
+        val p = pages.last()
+        val top = header(cv, p.title, if (p.loading) "Loading..." else if (pages.size > 1) "< Back" else Web.userName())
+        if (pages.size > 1) hit(0f, contentTop, width.toFloat(), top, "libback")
+        val rows = mutableListOf<Triple<String, String, String>>()
+        if (pages.size == 1) rows += Triple("Search", "songs, artists, albums, playlists", "libsearch")
+        if (p.list != null && p.items.isNotEmpty()) rows += Triple("Play all", "${p.items.size} songs", "libplayall")
+        p.items.forEachIndexed { i, it -> rows += Triple(it.title, it.sub, "lib:$i") }
+        drawRows(cv, top, rows, if (p.loading) "" else "Nothing here.", valueRight = false)
+    }
+
+    private fun libTap(id: String) {
+        val p = pages.lastOrNull() ?: return
+        when {
+            id == "libsignin" -> onSignIn?.invoke()
+            id == "libsearch" -> onSearch?.invoke()
+            id == "libback" -> back()
+            id == "libplayall" -> p.list?.let { l -> val uris = p.items.map { it.uri }; kotlin.concurrent.thread { if (!Web.playIn(l.uri, null, uris)) Player.playUri(l.uri) } }
+            id.startsWith("qlib:") -> libItem(id.drop(1))?.let { Player.addToQueue(it.uri); android.widget.Toast.makeText(context, "Added to queue: ${it.title}", android.widget.Toast.LENGTH_SHORT).show() }
+            id.startsWith("lib:") -> libItem(id)?.let { item ->
+                when (item.kind) {
+                    "playlist", "liked", "album" -> openPage(item.title, item) { Web.tracks(item) }
+                    "artist" -> Player.playUri(item.uri)
+                    else -> {
+                        val ctxUri = p.list?.uri
+                        val uris = p.items.filter { it.kind == "track" }.map { it.uri }
+                        kotlin.concurrent.thread { if (ctxUri == null || !Web.playIn(ctxUri, item.uri, uris)) Player.playUri(item.uri) }
+                        tab = Tab.PLAYER
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- like + share (player header) -----------------------------------------------------
+
+    private var liked: Boolean? = null
+    private var likedFor = ""
+    private fun trackId() = Player.engineTrackUri()?.substringAfterLast(':').orEmpty()
+    private fun checkLiked() {
+        val id = trackId()
+        if (id.isEmpty() || id == likedFor) return
+        likedFor = id
+        liked = null
+        kotlin.concurrent.thread { val r = Web.isLiked(id); post { if (likedFor == id) { liked = r; invalidate() } } }
+    }
+
+    private fun toggleLike() {
+        val id = trackId()
+        if (id.isEmpty()) return
+        val on = liked != true
+        liked = on
+        kotlin.concurrent.thread { if (!Web.setLiked(id, on)) post { liked = !on; invalidate() } }
+    }
+
+    private fun share() {
+        val uri = Player.engineTrackUri() ?: return
+        val parts = uri.split(':')
+        val link = if (parts.size >= 3) "https://open.spotify.com/${parts[1]}/${parts[2]}" else return
+        val st = Player.state
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain")
+            .putExtra(android.content.Intent.EXTRA_TEXT, "${st.title} - ${st.artist}\n$link")
+        context.startActivity(android.content.Intent.createChooser(send, "Send this song"))
     }
 
     private fun drawSettings(cv: Canvas) {
@@ -669,6 +822,9 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "btn_shuffle" -> Player.toggleShuffle()
             id == "btn_repeat" -> Player.toggleRepeat()
             id == "link" -> Player.openApp(context)
+            id == "share" -> share()
+            id == "like" -> toggleLike()
+            id.startsWith("lib") || id.startsWith("qlib") -> libTap(id)
             id == "time" -> showRemaining = !showRemaining
             id == "lyroff:-" -> nudgeLyrics(-250)
             id == "lyroff:+" -> nudgeLyrics(250)

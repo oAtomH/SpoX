@@ -16,7 +16,11 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Player.init(this)
+        Web.init(this)
         view = PlayerView(this)
+        Web.listeners += { runOnUiThread { view.invalidate() } }
+        view.onSearch = { askSearch() }
+        view.onSignIn = { signIn() }
         // full screen: SpoX draws under the status and navigation bars and keeps clear of them itself
         if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false)
         @Suppress("DEPRECATION")
@@ -31,6 +35,7 @@ class MainActivity : Activity() {
             }
         }
         view.fps = getSharedPreferences("spox", 0).getInt("fps", 30)
+        handle(intent)
 
         view.settingsRows = {
             val prefs = getSharedPreferences("spox", 0)
@@ -41,10 +46,13 @@ class MainActivity : Activity() {
                 "Engine" to when { !hasKey -> "add your key"; Player.fromEngine -> "on, playing"; eng.isLive -> "on"; else -> "off" },
                 "Soloist key" to if (hasKey) "set (change...)" else "add...",
                 "Engine report" to "copy",
+                "#Spotify account (library, search, likes)" to "",
+                "Account" to if (Web.signedIn) Web.userName().ifEmpty { "signed in" } else Web.status.ifEmpty { "sign in..." },
+                "Client ID" to if (Web.clientId().isEmpty()) "add..." else "set (change...)",
                 "#Look" to "",
                 "Colour pack" to Skin.packName(this),
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's player"; else -> "off" },
-                "Pixel cover on lock screen" to if (SpoxNotification.pixelCover(this)) "on" else "off",
+                "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "card" -> "SpoX card"; else -> "pixel cover" },
                 "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
                 "#Listening" to "",
                 "Sleep timer" to Player.sleepLabel(),
@@ -87,7 +95,13 @@ class MainActivity : Activity() {
                     Skin.reload()
                     PlayerWidget.updateAll(this)
                 }
-                "Pixel cover on lock screen" -> { prefs.edit().putBoolean("pixel_cover", !SpoxNotification.pixelCover(this)).apply(); SpoxNotification.update(this) }
+                "Lock screen art" -> SpoxNotification.cycleLockArt(this)
+                "Account" -> if (Web.signedIn) {
+                    android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                        .setTitle("Spotify account").setMessage("Signed in as ${Web.userName()}.")
+                        .setPositiveButton("Sign out") { _, _ -> Web.signOut() }.setNegativeButton("Keep", null).show()
+                } else signIn()
+                "Client ID" -> askClientId { }
                 "Sleep timer" -> Player.cycleSleep()
                 "Updates" -> Updater.check(this, true) { runOnUiThread { view.invalidate() } }
                 "Smoothness" -> {
@@ -122,6 +136,73 @@ class MainActivity : Activity() {
     @Deprecated("still the simplest way for a plain Activity")
     override fun onBackPressed() {
         if (!view.back()) @Suppress("DEPRECATION") super.onBackPressed()
+    }
+
+    private fun signIn() {
+        if (Web.clientId().isEmpty()) askClientId { Web.signIn(this) } else Web.signIn(this)
+    }
+
+    /** Your Spotify developer app's Client ID: the same one as SpoX on Windows. */
+    private fun askClientId(then: () -> Unit) {
+        val box = android.widget.EditText(this).apply { hint = "Client ID"; setText(Web.clientId()) }
+        android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Spotify Client ID")
+            .setMessage("The Client ID of your Spotify developer app (the same one SpoX on Windows uses). " +
+                "Its Redirect URIs must include ${Web.REDIRECT} (already there if Windows SpoX signs in).")
+            .setView(box)
+            .setPositiveButton("Save") { _, _ -> Web.setClientId(box.text.toString()); view.invalidate(); if (Web.clientId().isNotEmpty()) then() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun askSearch() {
+        val box = android.widget.EditText(this).apply { hint = "Song, artist, album, playlist"; isSingleLine = true }
+        val d = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Search")
+            .setView(box)
+            .setPositiveButton("Search") { _, _ -> box.text.toString().trim().takeIf { it.isNotEmpty() }?.let { view.search(it) } }
+            .setNegativeButton("Cancel", null)
+            .create()
+        box.setOnEditorActionListener { _, _, _ -> d.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick(); true }
+        d.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        d.show()
+    }
+
+    // ---- links from other apps: songs people send you, "Share > SpoX" -----------------------
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handle(intent)
+    }
+
+    private fun handle(intent: Intent?) {
+        intent ?: return
+        val text = when (intent.action) {
+            Intent.ACTION_VIEW -> intent.dataString
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
+            else -> null
+        } ?: return
+        if (text.startsWith("spox://")) return  // back from signing in
+        val m = Regex("(?:open\\.spotify\\.com/(?:intl-[a-z]+/)?|spotify:)(track|album|playlist|artist|episode|show)[/:]([A-Za-z0-9]+)").find(text)
+            ?: run { android.widget.Toast.makeText(this, "That isn't a Spotify link", android.widget.Toast.LENGTH_SHORT).show(); return }
+        val uri = "spotify:${m.groupValues[1]}:${m.groupValues[2]}"
+        intent.action = null
+        val eng = io.github.oatomh.spox.engine.Engine.get(this)
+        if (!eng.isLive) {
+            android.widget.Toast.makeText(this, "Turn on SpoX Engine (Settings) to play links", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        if (m.groupValues[1] == "track") {
+            android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Song from a link")
+                .setItems(arrayOf("Play now", "Add to queue")) { _, which ->
+                    if (which == 0) { Player.playUri(uri); view.tab = PlayerView.Tab.PLAYER } else Player.addToQueue(uri)
+                }.show()
+        } else {
+            Player.playUri(uri)
+            view.tab = PlayerView.Tab.PLAYER
+        }
     }
 
     /** The Soloist key: same one as SpoX on Windows; it stays on this phone. */

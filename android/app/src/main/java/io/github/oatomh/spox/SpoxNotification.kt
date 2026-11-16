@@ -67,12 +67,47 @@ object SpoxNotification {
     private var artDone: Bitmap? = null
 
     /** Pixel-art cover on the lock screen / phone's player (Settings > Pixel cover). */
-    fun pixelCover(ctx: Context) = ctx.getSharedPreferences("spox", 0).getBoolean("pixel_cover", true)
+    /** What the lock screen / phone's player shows as the picture: "cover", "pixel" or "card". */
+    fun lockArt(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("lock_art", "pixel") ?: "pixel"
 
+    fun cycleLockArt(ctx: Context) {
+        val next = when (lockArt(ctx)) { "pixel" -> "card"; "card" -> "cover"; else -> "pixel" }
+        ctx.getSharedPreferences("spox", 0).edit().putString("lock_art", next).apply()
+        artFor = null; lastKey = ""
+        update(ctx)
+    }
+
+    private var artTitle = ""
     private fun pixelArt(src: Bitmap?, ctx: Context): Bitmap? {
-        if (!pixelCover(ctx)) return src
-        if (src != null && src === artFor) return artDone
-        return pixelArtNew(src, ctx).also { artFor = src; artDone = it }
+        val mode = lockArt(ctx)
+        if (mode == "cover") return src
+        val key = if (mode == "card") "${Skin.packName(ctx)}|${Player.state.title}|${Player.state.artist}" else ""
+        if (src != null && src === artFor && key == artTitle) return artDone
+        artTitle = key
+        return (if (mode == "card") card(src, ctx) else pixelArtNew(src, ctx)).also { artFor = src; artDone = it }
+    }
+
+    /** "SpoX card": the picture Android puts behind the player is drawn by SpoX: the skin's
+     *  background, the pixel cover and the song in the pixel font. Android takes its colours
+     *  from this picture, so the whole player follows your colour pack. */
+    private fun card(src: Bitmap?, ctx: Context): Bitmap {
+        val skin = Skin.get(ctx)
+        val st = Player.state
+        val k = 8f
+        val size = 64
+        val out = Bitmap.createBitmap((size * k).toInt(), (size * k).toInt(), Bitmap.Config.ARGB_8888)
+        val cv = Canvas(out)
+        cv.drawColor(skin.color("anim_bg", android.graphics.Color.rgb(10, 10, 11)))
+        val n = skin.json.optInt("art_pixels", 24)
+        val art = src?.let { Bitmap.createScaledBitmap(it, n, n, true) } ?: skin.sprite("art_empty")
+        art?.let { cv.drawBitmap(it, null, android.graphics.RectF(12 * k, 8 * k, 52 * k, 48 * k), Paint().apply { isFilterBitmap = false }) }
+        skin.nine(cv, "tb_frame", 11f, 7f, 42f, 42f, k, 2)
+        val half = k / 2
+        val title = skin.fit(st.title, (size - 4) * 2)
+        val artist = skin.fit(st.artist, (size - 4) * 2)
+        skin.text(cv, title, (size * 2 - skin.textWidth(title)) / 2f, 104f, half, skin.color("title"))
+        skin.text(cv, artist, (size * 2 - skin.textWidth(artist)) / 2f, 114f, half, skin.color("info"))
+        return out
     }
 
     private fun pixelArtNew(src: Bitmap?, ctx: Context): Bitmap? {
@@ -189,7 +224,9 @@ object SpoxNotification {
             .setContentIntent(open)
             .setOngoing(st.playing)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setColor(Skin.get(ctx).color("title"))
+            .setColor(Skin.get(ctx).color("menu_bg", Skin.get(ctx).color("anim_bg")))
+            // a coloured card in the skin's colours where the phone allows it (media players only)
+            .setColorized(true)
             .addAction(action("prev", R.drawable.ic_px_prev, "Previous"))
             .addAction(if (st.playing) action("toggle", R.drawable.ic_px_pause, "Pause") else action("toggle", R.drawable.ic_px_play, "Play"))
             .addAction(action("next", R.drawable.ic_px_next, "Next"))
