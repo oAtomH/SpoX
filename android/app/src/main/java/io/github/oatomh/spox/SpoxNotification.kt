@@ -36,6 +36,20 @@ object SpoxNotification {
         update(ctx)
     }
 
+    /** Why the lock screen player is (not) there, for Settings. */
+    fun lockStatus(ctx: Context): String {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        if (!nm.areNotificationsEnabled()) return "blocked: tap to allow"
+        val ch = nm.getNotificationChannel(CHANNEL)
+        if (ch != null && ch.importance == NotificationManager.IMPORTANCE_NONE) return "blocked: tap to allow"
+        if (ch != null && ch.lockscreenVisibility == Notification.VISIBILITY_SECRET) return "blocked: tap to allow"
+        return when (style(ctx)) {
+            "pixel" -> "pixel card has none: tap to fix"
+            "off" -> "off: tap to turn on"
+            else -> if (nm.activeNotifications.any { it.id == ID && it.notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION) }) "on" else "not posted: tap to retry"
+        }
+    }
+
     /** The SpoX player's session (also what Android Auto connects to). */
     fun token(ctx: Context): MediaSession.Token = session(ctx).sessionToken
 

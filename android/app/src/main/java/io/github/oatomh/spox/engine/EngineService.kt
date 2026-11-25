@@ -143,21 +143,54 @@ class EngineService : Service() {
         if (engine.now.playing) {
             runCatching { if (wake?.isHeld != true) wake?.acquire(6 * 60 * 60 * 1000L) }
             runCatching { if (wifi?.isHeld != true) wifi?.acquire() }
+            pausedForCall = false
             if (focus == null) {
                 val f = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                     .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                    .setOnAudioFocusChangeListener { c -> if (c == AudioManager.AUDIOFOCUS_LOSS || c == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) engine.command("pause") }
+                    .setWillPauseWhenDucked(false)
+                    .setOnAudioFocusChangeListener { c ->
+                        when (c) {
+                            // another app plays music / a video: stop for good
+                            AudioManager.AUDIOFOCUS_LOSS -> { pausedForCall = false; engine.command("pause") }
+                            // a call, a voice note, navigation...: pause, and carry on after
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> { if (engine.now.playing) { pausedForCall = true; engine.command("pause") } }
+                            AudioManager.AUDIOFOCUS_GAIN -> { if (pausedForCall) { pausedForCall = false; engine.command("play") } }
+                        }
+                    }
                     .build()
                 getSystemService(AudioManager::class.java).requestAudioFocus(f)
                 focus = f
             }
+            if (!noisyOn) {
+                // headphones / Bluetooth / car disconnect: pause straight away (like every music app)
+                runCatching { registerReceiver(noisy, android.content.IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)); noisyOn = true }
+            }
         } else {
+            // paused by a call: keep the focus so the music comes back after it
+            if (pausedForCall) {
+                runCatching { wake?.release() }
+                runCatching { wifi?.release() }
+                return
+            }
             release()
             if (closed) { main.removeCallbacks(idleQuit); main.postDelayed(idleQuit, 3 * 60_000) }
         }
     }
 
+    @Volatile private var pausedForCall = false
+    private var noisyOn = false
+    private val noisy = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            if (i.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                pausedForCall = false
+                engine.hush()
+                io.github.oatomh.spox.PlayerView.say(c, "Paused: headphones disconnected")
+            }
+        }
+    }
+
     private fun release() {
+        if (noisyOn) { runCatching { unregisterReceiver(noisy) }; noisyOn = false }
         runCatching { wake?.release() }
         runCatching { wifi?.release() }
         focus?.let { getSystemService(AudioManager::class.java).abandonAudioFocusRequest(it) }

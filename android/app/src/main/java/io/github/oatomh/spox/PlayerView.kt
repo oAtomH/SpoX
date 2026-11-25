@@ -155,14 +155,29 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     private val playerChanged: () -> Unit = { invalidate() }
 
+    // volume changed by anything (Bluetooth headphones, a car, the phone): show it SpoX's way too
+    private var lastVolSeen = -1f
+    private val volumeWatch = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: Context, i: android.content.Intent) {
+            if (i.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) != android.media.AudioManager.STREAM_MUSIC) return
+            val v = Player.volume(context)
+            if (kotlin.math.abs(v - lastVolSeen) < 0.001f) return
+            lastVolSeen = v
+            showVolume(v)
+        }
+    }
+
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         current = this
+        lastVolSeen = Player.volume(context)
+        runCatching { context.registerReceiver(volumeWatch, android.content.IntentFilter("android.media.VOLUME_CHANGED_ACTION")) }
         Player.listen(playerChanged)
         requestApplyInsets()
     }
 
     override fun onDetachedFromWindow() {
+        runCatching { context.unregisterReceiver(volumeWatch) }
         if (current === this) current = null
         if (tab == Tab.LIBRARY) pages.lastOrNull()?.scroll = scroll
         saveLibrary()
@@ -483,7 +498,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             val active = (b == "btn_shuffle" && st.shuffle) || (b == "btn_repeat" && st.repeat)
             val sprite = when {
                 pressed == b && skin.sprite("${b}_down") != null -> "${b}_down"
-                b == "btn_shuffle" && st.shuffle && Smart.on && skin.sprite("btn_shuffle_smart") != null -> "btn_shuffle_smart"
+                b == "btn_shuffle" && st.shuffle && Smart.on && Smart.shuffled && skin.sprite("btn_shuffle_smart") != null -> "btn_shuffle_smart"
                 active && skin.sprite("${b}_on") != null -> "${b}_on"
                 active && skin.sprite("${b}_down") != null -> "${b}_down"
                 else -> b
@@ -502,7 +517,8 @@ class PlayerView(ctx: Context) : View(ctx) {
         val iconY = y + (volH - spk.size * u) / 2
         drawIcon(cv, spk, pad, floor(iconY / u) * u, u, if (muted || flash || pressed == "mute") cTitle else cDim)
         hit(0f, y - 8 * u, pad + 12 * u, y + volH + 8 * u, "mute")
-        val pctW = if (flash) tw("100", u) + 6 * u else 0f
+        // the number is always there; it lights up while the volume changes
+        val pctW = tw("100", u) + 6 * u
         val vbx = pad + 13 * u
         val vbw = w - 13 * u - pctW
         volRect = RectF(vbx, y, vbx + vbw, y + volH)
@@ -510,11 +526,9 @@ class PlayerView(ctx: Context) : View(ctx) {
         val vw = floor(vbw * vol / u) * u
         if (vw > 0) nine(cv, "vol_fill", vbx, y, vw, volH, u, 2)
         spr(cv, "vol_thumb", (vbx + vw - 4 * u).coerceIn(vbx, vbx + vbw - 8 * u), y, u)
-        if (flash) {
-            val pct = "${(vol * 100).roundToInt()}"
-            txt(cv, pct, pad + w - tw(pct, u), y, u, cTitle)
-            animating = true
-        }
+        val pct = "${(vol * 100).roundToInt()}"
+        txt(cv, pct, pad + w - tw(pct, u), y, u, if (flash || muted) cTitle else cDim)
+        if (flash) animating = true
         y += volH + 8 * u
 
         // visualizer in the space that's left
@@ -757,7 +771,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         }
         val top = y
         if (rows.isEmpty()) {
-            val msg = if (Smart.busy.isNotEmpty()) Smart.busy else "Nothing queued."
+            val msg = if (Smart.busy.isNotEmpty()) Smart.busy else if (Smart.on) "Planning what's next..." else "Nothing queued."
             txt(cv, msg, (width - tw(msg, u)) / 2, top + 20 * u, u, cDim)
             return
         }
@@ -1019,6 +1033,8 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     /** Which list is open (and how it's sorted / searched), saved for next time. */
     private fun saveLibrary() {
+        // the library isn't loaded yet (e.g. a tab switch at start): nothing to save, keep what's saved
+        if (pages.isEmpty()) return
         val top = pages.lastOrNull()
         val e = libPrefs.edit()
         val open = pages.drop(1).lastOrNull { it.list != null }
@@ -1517,7 +1533,7 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var volOsd = -1f
     private var volOsdUntil = 0L
 
-    fun showVolume(f: Float) { vol = f; volAt = SystemClock.elapsedRealtime(); volOsd = f; volOsdUntil = volAt + 1400; invalidate() }
+    fun showVolume(f: Float) { lastVolSeen = f; vol = f; volAt = SystemClock.elapsedRealtime(); volOsd = f; volOsdUntil = volAt + 1400; invalidate() }
 
     private fun drawVolumeOsd(cv: Canvas, now: Long) {
         if (now < osdUntil && osdText.isNotEmpty()) {

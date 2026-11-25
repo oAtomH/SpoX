@@ -334,9 +334,10 @@ object Web {
 
     /** Plays exactly these songs, in this order, on SpoX Phone (SpoX's own shuffle and sorting).
      *  [positionMs] starts the first one part-way (to carry on without a jump). */
-    fun playUris(uris: List<String>, positionMs: Long = 0): Boolean {
+    fun playUris(uris: List<String>, positionMs: Long = 0, offset: Int = 0): Boolean {
         if (uris.isEmpty()) return false
         val body = JSONObject().put("uris", JSONArray(uris.take(100)))
+        if (offset > 0) body.put("offset", JSONObject().put("position", offset))
         if (positionMs > 0) body.put("position_ms", positionMs)
         return playOnPhone(body)
     }
