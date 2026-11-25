@@ -415,10 +415,17 @@ impl Api {
             artists,
             album: t.pointer("/album/name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             duration_ms: t.get("duration_ms").and_then(|x| x.as_u64()).unwrap_or(0),
-            cover_small: None,
-            cover_large: None,
-            provider: String::new(),
+            ..Default::default()
         })
+    }
+
+    /// One entry of a playlist / Liked Songs page, with when it was added and its place.
+    fn parse_entry(e: &Value, order: usize) -> Option<Track> {
+        let t = e.get("item").or_else(|| e.get("track")).cloned().unwrap_or(Value::Null);
+        let mut t = Self::parse_track(&t)?;
+        t.added = e.get("added_at").and_then(|x| x.as_str()).map(iso_secs).unwrap_or(0);
+        t.order = order as u32;
+        Some(t)
     }
 
     fn tracks(&self, p: &Playlist) {
@@ -434,8 +441,7 @@ impl Api {
             match self.get(&url) {
                 Ok(v) => {
                     for e in v.get("items").and_then(|x| x.as_array()).cloned().unwrap_or_default() {
-                        let t = e.get("item").or_else(|| e.get("track")).cloned().unwrap_or(Value::Null);
-                        if let Some(t) = Self::parse_track(&t) {
+                        if let Some(t) = Self::parse_entry(&e, all.len()) {
                             all.push(t);
                         }
                     }
@@ -464,8 +470,7 @@ impl Api {
             match self.get(&url) {
                 Ok(v) => {
                     for e in v.get("items").and_then(|x| x.as_array()).cloned().unwrap_or_default() {
-                        let t = e.get("item").or_else(|| e.get("track")).cloned().unwrap_or(Value::Null);
-                        if let Some(t) = Self::parse_track(&t) {
+                        if let Some(t) = Self::parse_entry(&e, all.len()) {
                             all.push(t);
                         }
                     }
@@ -484,6 +489,21 @@ impl Api {
             .iter()
             .find(|d| d.get("name").and_then(|n| n.as_str()) == Some(name))
             .and_then(|d| d.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
+    }
+
+    /// Plays exactly these songs (up to 100), in order, on the SpoX device: SpoX shuffle and
+    /// playing a list in your own sort order. `position_ms` starts the first one part-way.
+    pub fn play_uris(&self, device: &str, uris: &[String], position_ms: u64) -> Result<(), String> {
+        if uris.is_empty() {
+            return Err("nothing to play".into());
+        }
+        let id = self.device_id(device).ok_or("device not found")?;
+        let window: Vec<&String> = uris.iter().take(100).collect();
+        let mut body = json!({ "uris": window });
+        if position_ms > 0 {
+            body["position_ms"] = json!(position_ms);
+        }
+        self.put(&format!("/me/player/play?device_id={}", enc(&id)), body)
     }
 
     fn play_in(&self, context: &str, track: &str, device: &str, fallback: &[String]) -> Result<(), String> {
@@ -650,5 +670,29 @@ pub fn web_log(line: &str) {
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
         let _ = writeln!(f, "{} {}", crate::config::now_ms(), line);
+    }
+}
+
+/// "2025-03-01T12:34:56Z" -> unix seconds (0 if it doesn't look like that).
+pub fn iso_secs(s: &str) -> i64 {
+    let n = |a: usize, b: usize| s.get(a..b).and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d)) = (n(0, 4), n(5, 7), n(8, 10)) else { return 0 };
+    let (hh, mm, ss) = (n(11, 13).unwrap_or(0), n(14, 16).unwrap_or(0), n(17, 19).unwrap_or(0));
+    // days from 1970-01-01 (proleptic Gregorian)
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + hh * 3600 + mm * 60 + ss
+}
+
+#[cfg(test)]
+mod iso_tests {
+    #[test]
+    fn iso() {
+        assert_eq!(super::iso_secs("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(super::iso_secs("2026-11-25T01:02:03Z"), 1795568523);
     }
 }

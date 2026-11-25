@@ -1,0 +1,47 @@
+# Test-builds work branches (anything but main) for Windows and Android, without publishing.
+# Build errors show up as annotations on the run, so they can be read without the full log.
+name: Check
+
+on:
+  push:
+    branches-ignore: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --message-format short 2>&1 | tee check.log || {
+            grep -E '^(src|build).*(error|warning: unused)' check.log | head -40 | sed 's/^/::error::/'
+            exit 1
+          }
+          grep -E '^src.*warning' check.log | head -20 | sed 's/^/::warning::/' || true
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Build
+        run: |
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu >/dev/null
+          sh android/native/build.sh
+          set -o pipefail
+          gradle -p android assembleRelease --no-daemon 2>&1 | tee build.log || {
+            grep -E '^e: ' build.log | head -40 | sed 's/^e: /::error::/'
+            grep -E 'ERROR|What went wrong' -A3 build.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          }
+          grep -E '^w: .*(unused|deprecated)?' build.log | head -10 | sed 's/^w: /::warning::/' || true

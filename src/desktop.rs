@@ -34,15 +34,59 @@ pub fn hwnd() -> isize {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const WM_SPOX_SHOW: u32 = 0x8000 + 77;
 
+/// Window position before hiding (physical pixels), so it comes back in the same place.
+static SAVED_POS: Mutex<Option<[i32; 4]>> = Mutex::new(None);
+#[cfg_attr(not(windows), allow(dead_code))]
+static SAVED_EX: AtomicIsize = AtomicIsize::new(0);
+#[cfg_attr(not(windows), allow(dead_code))]
+static SAVED_TOP: AtomicBool = AtomicBool::new(false);
+/// "hide" requests from the tray / taskbar player, run by the app (with the pixel animation)
+pub static PENDING: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Hide to the tray. Windows stops sending a truly hidden window any updates, so SpoX would
+/// "fall asleep" (shuffle, taskbar buttons... waiting until it's shown). Instead the window stays
+/// alive: fully see-through, click-through, off-screen, and out of the taskbar and Alt+Tab.
 pub fn hide_window() {
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
         let h = hwnd();
-        if h != 0 {
-            ShowWindow(h as _, SW_HIDE);
-            HIDDEN.store(true, Ordering::SeqCst);
+        if h == 0 || HIDDEN.swap(true, Ordering::SeqCst) {
+            return;
         }
+        let h = h as windows_sys::Win32::Foundation::HWND;
+        let mut r: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut r) != 0 && IsIconic(h) == 0 {
+            *SAVED_POS.lock().unwrap() = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+        }
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        SAVED_EX.store(ex, Ordering::SeqCst);
+        SAVED_TOP.store(ex & WS_EX_TOPMOST as isize != 0, Ordering::SeqCst);
+        ShowWindow(h, SW_HIDE);
+        let soft = (ex | (WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) as isize) & !(WS_EX_APPWINDOW as isize);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, soft);
+        SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+        SetWindowPos(h, HWND_NOTOPMOST, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        ShowWindow(h, SW_SHOWNOACTIVATE);
+    }
+    #[cfg(not(windows))]
+    HIDDEN.store(true, Ordering::SeqCst);
+}
+
+/// Undo [hide_window] (no-op if it isn't hidden).
+#[cfg(windows)]
+unsafe fn unhide(h: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    if !HIDDEN.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    ShowWindow(h, SW_HIDE);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, SAVED_EX.load(Ordering::SeqCst) & !(WS_EX_TOPMOST as isize));
+    let after = if SAVED_TOP.load(Ordering::SeqCst) { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    if let Some([x, y, _, _]) = *SAVED_POS.lock().unwrap() {
+        SetWindowPos(h, after, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        SetWindowPos(h, after, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
     }
 }
 
@@ -52,6 +96,7 @@ pub fn show_window(ctx: &egui::Context) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
         let h = hwnd();
         if h != 0 {
+            unhide(h as _);
             ShowWindow(h as _, SW_SHOW);
             ShowWindow(h as _, SW_RESTORE);
             SetForegroundWindow(h as _);
@@ -61,15 +106,13 @@ pub fn show_window(ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
+/// Ask the app to hide with its close animation (from the tray icon / taskbar player).
+pub fn request_hide(ctx: &egui::Context) {
+    PENDING.lock().unwrap().push("hide");
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
 fn is_hidden() -> bool {
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
-        let h = hwnd();
-        if h != 0 {
-            return IsWindowVisible(h as _) == 0;
-        }
-    }
     HIDDEN.load(Ordering::SeqCst)
 }
 
@@ -214,7 +257,7 @@ pub fn start_tray(icon: &image::RgbaImage, solo: Sender<String>, ctx: egui::Cont
             if is_hidden() {
                 show_window(&ctx);
             } else {
-                hide_window();
+                request_hide(&ctx);
             }
         }
     }));
@@ -272,6 +315,12 @@ pub fn wake(ctx: &egui::Context) {
 
 /// Main window rect on screen in physical pixels: [x, y, w, h].
 pub fn window_rect() -> Option<[i32; 4]> {
+    // hidden off-screen: where it will come back
+    if HIDDEN.load(Ordering::SeqCst) {
+        if let Some(r) = *SAVED_POS.lock().unwrap() {
+            return Some(r);
+        }
+    }
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::RECT;
@@ -301,7 +350,7 @@ unsafe extern "system" fn no_redraw_on_move(
     if msg == WM_SPOX_SHOW {
         // SpoX was started again while already running: bring this one forward instead
         use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
-        HIDDEN.store(false, Ordering::SeqCst);
+        unhide(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
@@ -346,7 +395,7 @@ pub fn window_unseen() -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
         let h = hwnd();
         if h != 0 {
-            return IsWindowVisible(h as _) == 0 || IsIconic(h as _) != 0;
+            return HIDDEN.load(Ordering::SeqCst) || IsWindowVisible(h as _) == 0 || IsIconic(h as _) != 0;
         }
         return false;
     }

@@ -59,7 +59,10 @@ Open Spotify on your phone or PC, open the **Devices** list and pick **SpoX**. S
 | `←` / `→` | Seek back / forward 5 seconds |
 | `Ctrl+←` / `Ctrl+→` | Previous / next track |
 | `↑` / `↓` | Volume up / down |
-| `S` / `R` | Shuffle / repeat on-off |
+| `S` / `R` | SpoX shuffle / repeat on-off |
+| `Ctrl+F` (or `/`) | Find in the open playlist: type, `Enter` plays, `Esc` closes |
+| `O` | Sort the open playlist: newest first, title, artist, album, length, playlist order |
+| `Ctrl` + click in Up next | Pick several songs; right-click or `Delete` removes them or plays them next |
 | `P` / `Q` / `L` | Playlist / Up next / Lyrics tab |
 | `T` | Always on top |
 | `1`–`4` | Window size |
@@ -114,6 +117,24 @@ Each friend needs:
 - OBS overlays: compact, standard, extended, lyrics and minimal layouts. These will be served from SpoX's existing playback state over a local WebSocket and HTTP, with no second Spotify connection.
 - Tray mode, global media keys and launch on startup.
 
+
+## New in v0.7 (Windows + Android)
+
+- **SpoX shuffle, rebuilt.** SpoX decides the order itself instead of Spotify:
+  - Every song plays once before any repeats, duplicates are merged, and the same artist is spread out.
+  - New songs (not in your Liked Songs, the list or recent plays) are slipped in by the **new songs** share: 0% (just your list), 25, 50, 75 or **100% (only new songs)**. They come from Spotify's own autoplay picks and from artists similar to what's playing right now.
+  - The order is **saved**: close SpoX or restart the PC/phone and it carries on where you were.
+  - Shuffle is now simply off ↔ SpoX shuffle. Turning it off carries on with the list in its own order.
+- **Up next:** new songs are marked `NEW` (never heard) or `pick` (brought in by SpoX/Spotify). Pick songs to **remove** them or **play them next** (phone: long-press; PC: Ctrl+click). Removed songs are skipped if Spotify already had them.
+- **Library / playlists:** sort by recently added (the default), title, artist, album, length or the list's own order, remembered per list. Find songs inside a list. With shuffle off, a song plays the list **in the order you see**.
+- **Lyrics** for the next song are looked up while this one plays: no "looking for lyrics" flash on skip.
+- **PC:** SpoX stays awake while hidden in the tray (taskbar shuffle and buttons react at once). Hiding from the tray icon or taskbar player plays the hide animation too.
+- **Phone:**
+  - Closing SpoX (swipe it away) quits it, once the music is paused (Settings → *When you close SpoX*).
+  - Says *Playing on SpoX Phone*, with a Bluetooth / car / headphones icon and the speaker's name. Device picker, search, keys and menus are SpoX-styled, not Android's.
+  - Volume buttons show SpoX's own pixel volume instead of the phone's slider (Settings → *Volume buttons*).
+  - The player only follows Spotify (no more YouTube or PDF readers showing up), and the lock screen player is re-posted so it stays.
+  - The like button uses Spotify's new library API (it had stopped working), and +/- flips straight away.
 
 ## New in v0.4
 

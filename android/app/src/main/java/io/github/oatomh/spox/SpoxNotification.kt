@@ -173,6 +173,14 @@ object SpoxNotification {
             .build()
     }
 
+    /** Post the player again even if nothing changed (Android sometimes drops a media player
+     *  that hasn't been updated for a while, especially on the lock screen). */
+    fun refresh(ctx: Context) {
+        lastKey = ""
+        session?.let { if (!it.isActive) it.isActive = true }
+        update(ctx)
+    }
+
     fun update(ctx: Context) {
         val st = Player.state
         if (!enabled(ctx)) {
@@ -181,7 +189,14 @@ object SpoxNotification {
             return
         }
         if (!st.hasTrack) {
-            if (!Player.fromEngine) clear(ctx)
+            // nothing playing anywhere (Spotify closed, SpoX Engine off): no player left behind
+            val live = io.github.oatomh.spox.engine.Engine.get(ctx).isLive
+            if (!live) clear(ctx)
+            else if (lastKey.isNotEmpty()) {
+                lastKey = ""
+                session?.isActive = false
+                runCatching { ctx.getSystemService(NotificationManager::class.java).notify(ID, placeholder(ctx, "Ready · pick a song")) }
+            }
             return
         }
         val nm = ctx.getSystemService(NotificationManager::class.java)
@@ -233,7 +248,9 @@ object SpoxNotification {
             .setContentText(st.artist)
             .setSubText(if (Player.fromEngine) "SpoX" else "SpoX · Spotify")
             .setContentIntent(open)
-            .setOngoing(st.playing)
+            // SpoX Engine keeps its player put (it's the engine's notification); the Spotify-app
+            // mirror can be swiped away while paused
+            .setOngoing(st.playing || io.github.oatomh.spox.engine.Engine.get(ctx).isLive)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setColor(Skin.get(ctx).color("menu_bg", Skin.get(ctx).color("anim_bg")))
             // a coloured card in the skin's colours where the phone allows it (media players only)

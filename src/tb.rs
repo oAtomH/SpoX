@@ -122,7 +122,8 @@ fn act(sh: &TbShared, ctx: &egui::Context, action: &str, p: &Play) {
             if crate::desktop::HIDDEN.load(Ordering::SeqCst) {
                 crate::desktop::show_window(ctx);
             } else {
-                crate::desktop::hide_window();
+                // same pixel close animation as the window's own "-" button
+                crate::desktop::request_hide(ctx);
             }
         }
         "show_main" => crate::desktop::show_window(ctx),

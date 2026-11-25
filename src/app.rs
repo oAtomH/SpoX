@@ -72,6 +72,10 @@ pub struct App {
     lyrics: Option<Lyrics>,
     lyrics_uri: String,
     lyrics_loading: bool,
+    lyrics_since: Instant,
+    liked_checked: Instant,
+    /// the next song whose lyrics were looked up ahead of time
+    lyrics_next: String,
     lyric_offset: i64,
     lyric_rows: Vec<(usize, String)>,
     lyric_rows_key: String,
@@ -114,6 +118,22 @@ pub struct App {
     smart: Option<Sender<crate::smart::Cmd>>,
     smart_on: bool,
     smart_new: std::collections::HashSet<String>,
+    smart_shuffled: bool,
+    smart_list: String,
+    smart_upcoming: Vec<(Track, String)>,
+    smart_busy: String,
+    /// Up next as shown (SpoX shuffle's own order, or Soloist's queue)
+    q_list: Vec<Track>,
+    /// Up next songs picked with Ctrl+click (remove / play next)
+    q_picked: std::collections::HashSet<String>,
+    /// songs taken out of Up next (hidden; skipped when they come up)
+    q_removed: std::collections::HashSet<String>,
+    /// the open playlist's songs in its own order (self.tracks = sorted + searched view of it)
+    tracks_all: Vec<Track>,
+    /// how the open playlist is sorted: added / title / artist / album / length / custom
+    pl_sort: String,
+    /// typing to find in the open playlist (None = not finding)
+    pl_find: Option<String>,
     /// last time the whole Up next list was asked for (it's refreshed while you look at it)
     queue_asked: Instant,
     tb: Option<crate::tb::TbShared>,
@@ -149,6 +169,14 @@ pub struct App {
 #[derive(Clone)]
 enum CtxAct {
     PlayTrack(usize),
+    /// take these out of Up next
+    RemoveQ(Vec<String>),
+    /// sort the open playlist the next way
+    Sort,
+    /// type to find in the open playlist
+    Find,
+    /// play these right after the current song
+    PlayNextQ(Vec<String>),
     PlayUri(String),
     QueueTrack(String),
     SkipTo(usize),
@@ -250,6 +278,9 @@ impl App {
             lyrics: None,
             lyrics_uri: String::new(),
             lyrics_loading: false,
+            lyrics_since: Instant::now(),
+            liked_checked: Instant::now(),
+            lyrics_next: String::new(),
             lyric_offset: 0,
             lyric_rows: Vec::new(),
             lyric_rows_key: String::new(),
@@ -292,6 +323,16 @@ impl App {
             smart: smart_tx,
             smart_on: false,
             smart_new: Default::default(),
+            smart_shuffled: true,
+            smart_list: String::new(),
+            smart_upcoming: Vec::new(),
+            smart_busy: String::new(),
+            q_list: Vec::new(),
+            q_picked: Default::default(),
+            q_removed: Default::default(),
+            tracks_all: Vec::new(),
+            pl_sort: String::new(),
+            pl_find: None,
             queue_asked: Instant::now(),
             tb: tb_shared,
             hold_shuffle: None,
@@ -340,7 +381,7 @@ impl App {
     fn demo(&mut self) {
         let mode = std::env::var("SPOX_DEMO").unwrap_or_default();
         self.install_page = mode == "install";
-        let t = |i: usize, n: &str, a: &str, al: &str, d: u64| Track { uri: format!("spotify:track:demo{}", i), name: n.into(), artists: a.into(), album: al.into(), duration_ms: d, cover_small: None, cover_large: None, provider: String::new() };
+        let t = |i: usize, n: &str, a: &str, al: &str, d: u64| Track { uri: format!("spotify:track:demo{}", i), name: n.into(), artists: a.into(), album: al.into(), duration_ms: d, ..Default::default() };
         self.tracks = vec![
             t(0, "Trouble", "Cage The Elephant", "Tell Me I'm Pretty", 225_000),
             t(1, "cough drops", "almost monday", "cough drops", 164_000),
@@ -494,6 +535,8 @@ impl App {
                 }
                 if changed {
                     self.on_track_changed();
+                } else if self.play.status == "playing" {
+                    self.prefetch_lyrics();
                 }
             }
             Ev::Playlists(p) => {
@@ -543,13 +586,14 @@ impl App {
                     save_tracks_cache(&playlist, &tracks);
                 }
                 if self.sel.as_ref().map(|p| p.uri == playlist).unwrap_or(false) {
-                    self.tracks = tracks;
+                    self.tracks_all = tracks;
                     self.tracks_for = playlist.clone();
                     self.tracks_listable = listable;
                     self.tracks_loading = !done;
                     if done && listable {
-                        save_tracks_cache(&playlist, &self.tracks);
+                        save_tracks_cache(&playlist, &self.tracks_all);
                     }
+                    self.apply_view();
                 }
             }
             Ev::Lyrics { uri, lyrics } => {
@@ -566,9 +610,17 @@ impl App {
                 }
             }
             Ev::Osd(m) => self.osd(m),
-            Ev::Smart { on, new_uris, pool: _ } => {
+            Ev::Smart { on, shuffled, list, new_uris, upcoming, busy } => {
+                if on != self.smart_on {
+                    self.play.shuffle = on && shuffled;
+                    self.hold_shuffle = Some((on && shuffled, Instant::now()));
+                }
                 self.smart_on = on;
+                self.smart_shuffled = shuffled;
+                self.smart_list = list;
                 self.smart_new = new_uris.into_iter().collect();
+                self.smart_upcoming = upcoming;
+                self.smart_busy = busy;
             }
             Ev::Profile { name, img, small } => {
                 if !name.is_empty() {
@@ -668,6 +720,7 @@ impl App {
                 self.lyric_offset = load_lyric_offset(&t.uri);
                 self.lyrics = None;
                 self.lyrics_loading = true;
+                self.lyrics_since = Instant::now();
                 self.scroll[SCROLL_LY] = 0.0;
                 self.lyric_rows_key.clear();
                 lyrics::request(t, self.tx.clone(), self.ctx.clone());
@@ -675,6 +728,18 @@ impl App {
         }
         if self.queue_visible() {
             self.send(command_with("get_queue", "limit", json!(0)));
+        }
+        self.prefetch_lyrics();
+    }
+
+    /// Looks up the next song's lyrics while this one plays, so they show the moment it starts.
+    fn prefetch_lyrics(&mut self) {
+        let next = if self.smart_on { self.smart_upcoming.first().map(|x| x.0.clone()) } else { self.play.upcoming.first().cloned() };
+        if let Some(t) = next {
+            if t.uri != self.lyrics_next && t.uri != self.lyrics_uri && t.duration_ms > 0 {
+                self.lyrics_next = t.uri.clone();
+                lyrics::request(t, self.tx.clone(), self.ctx.clone());
+            }
         }
     }
 
@@ -687,14 +752,76 @@ impl App {
             let mut c = self.cfg.lock().unwrap();
             c.last_playlist = if p.id == "liked" { "liked".into() } else { p.uri.clone() };
         }
-        self.tracks = load_tracks_cache(&p.uri).unwrap_or_default();
+        self.tracks_all = load_tracks_cache(&p.uri).unwrap_or_default();
+        self.pl_sort = self.cfg.lock().unwrap().sorts.get(&p.uri).cloned().unwrap_or_else(|| "added".into());
+        if p.id != "liked" && self.pl_find.is_some() {
+            self.pl_find = None;
+        }
         self.tracks_for = p.uri.clone();
         self.tracks_listable = true;
         self.tracks_loading = true;
         self.scroll[SCROLL_PL] = 0.0;
         self.selected = None;
         self.sel = Some(p.clone());
+        self.apply_view();
         let _ = self.web.send(Req::LoadTracks(p));
+    }
+
+    /// The open playlist as shown: found (type to find), then sorted.
+    fn apply_view(&mut self) {
+        let words: Vec<String> = self.pl_find.as_deref().unwrap_or("").to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
+        let mut v: Vec<Track> = self
+            .tracks_all
+            .iter()
+            .filter(|t| {
+                if words.is_empty() {
+                    return true;
+                }
+                let hay = format!("{} {} {}", t.name, t.artists, t.album).to_lowercase();
+                words.iter().all(|w| hay.contains(w.as_str()))
+            })
+            .cloned()
+            .collect();
+        let low = |s: &str| s.to_lowercase();
+        match self.pl_sort.as_str() {
+            "added" => v.sort_by(|a, b| b.added.cmp(&a.added).then(a.order.cmp(&b.order))),
+            "title" => v.sort_by_key(|t| low(&t.name)),
+            "artist" => v.sort_by(|a, b| low(&a.artists).cmp(&low(&b.artists)).then(low(&a.album).cmp(&low(&b.album))).then(a.order.cmp(&b.order))),
+            "album" => v.sort_by(|a, b| low(&a.album).cmp(&low(&b.album)).then(a.order.cmp(&b.order))),
+            "length" => v.sort_by_key(|t| t.duration_ms),
+            _ => v.sort_by_key(|t| t.order),
+        }
+        // keep the same song selected after re-sorting
+        let sel_uri = self.selected.and_then(|i| self.tracks.get(i)).map(|t| t.uri.clone());
+        self.tracks = v;
+        self.selected = sel_uri.and_then(|u| self.tracks.iter().position(|t| t.uri == u));
+    }
+
+    /// Start typing to find songs in the open playlist.
+    fn start_find(&mut self) {
+        if self.sel.is_none() {
+            self.osd("OPEN A PLAYLIST FIRST");
+            return;
+        }
+        self.picker = false;
+        self.pl_drop = false;
+        self.set_tab(Tab::Playlist);
+        self.pl_find = Some(String::new());
+        self.osd("TYPE TO FIND \u{b7} ENTER PLAYS \u{b7} ESC CLOSES");
+    }
+
+    /// Sort the open playlist the next way (remembered per playlist).
+    fn cycle_sort(&mut self) {
+        let order = ["added", "title", "artist", "album", "length", "custom"];
+        let i = order.iter().position(|o| *o == self.pl_sort).unwrap_or(0);
+        self.pl_sort = order[(i + 1) % order.len()].to_string();
+        if let Some(p) = &self.sel {
+            self.cfg.lock().unwrap().sorts.insert(p.uri.clone(), self.pl_sort.clone());
+        }
+        self.scroll[SCROLL_PL] = 0.0;
+        self.apply_view();
+        let name = sort_name(&self.pl_sort);
+        self.osd(format!("SORTED BY {}", name.to_uppercase()));
     }
 
     fn play_playlist(&mut self, p: &Playlist) {
@@ -710,11 +837,22 @@ impl App {
     }
 
     fn play_track(&mut self, idx: usize) {
+        let Some(t) = self.tracks.get(idx).cloned() else { return };
+        let Some(p) = self.sel.clone() else { return };
+        // shuffle on: SpoX shuffle from this song. Off and sorted or searched: the list exactly as
+        // you see it (like Spotify's own sorting). Off in the list's own order: Spotify plays the list.
+        let shuffle = (self.smart_on && self.smart_shuffled) || self.play.shuffle;
+        let as_shown = self.pl_sort != "custom" || self.pl_find.as_deref().map(|f| !f.is_empty()).unwrap_or(false);
+        if self.signed_in && (shuffle || as_shown) {
+            if let Some(sm) = &self.smart {
+                let tracks = if shuffle { self.tracks_all.clone() } else { self.tracks.clone() };
+                let _ = sm.send(crate::smart::Cmd::Start { playlist: p, tracks, first: Some(t.uri.clone()), shuffle, position: 0 });
+                return;
+            }
+        }
         if self.smart_on {
             self.stop_smart();
         }
-        let Some(t) = self.tracks.get(idx).cloned() else { return };
-        let Some(p) = self.sel.clone() else { return };
         if self.signed_in {
             let fallback = if p.id == "liked" { self.tracks.iter().map(|t| t.uri.clone()).collect() } else { Vec::new() };
             let _ = self.web.send(Req::PlayIn {
@@ -739,6 +877,13 @@ impl App {
     fn resume(&mut self) {
         if !self.play.is_active {
             self.send(command("activate"));
+        }
+        if self.play.track.is_none() && self.smart_on {
+            // SpoX shuffle saved from last time: carry on where you were
+            if let Some(s) = &self.smart {
+                let _ = s.send(crate::smart::Cmd::Resume);
+                return;
+            }
         }
         if self.play.track.is_none() {
             if let Some(p) = self.sel.clone() {
@@ -782,15 +927,15 @@ impl App {
     fn smart_source(&self) -> Option<(Playlist, Vec<Track>)> {
         let ctx = self.play.context_uri.clone();
         if let Some(pl) = self.playlists.iter().find(|p| self.playlist_uri(p) == ctx && !ctx.is_empty()) {
-            if self.sel.as_ref().map(|s| s.id == pl.id).unwrap_or(false) && !self.tracks.is_empty() {
-                return Some((pl.clone(), self.tracks.clone()));
+            if self.sel.as_ref().map(|s| s.id == pl.id).unwrap_or(false) && !self.tracks_all.is_empty() {
+                return Some((pl.clone(), self.tracks_all.clone()));
             }
             if let Some(t) = load_tracks_cache(&ctx).filter(|t| !t.is_empty()) {
                 return Some((pl.clone(), t));
             }
         }
         let pl = self.sel.clone()?;
-        (self.tracks_listable && !self.tracks.is_empty()).then(|| (pl, self.tracks.clone()))
+        (self.tracks_listable && !self.tracks_all.is_empty()).then(|| (pl, self.tracks_all.clone()))
     }
 
     fn vis_running(&self) -> bool {
@@ -807,7 +952,7 @@ impl App {
     fn toggle_smart(&mut self) {
         if self.smart_on {
             self.stop_smart();
-            self.osd("SMART SHUFFLE OFF");
+            self.osd("SPOX SHUFFLE OFF");
             return;
         }
         // inspiration = the playlist you're listening to (else the one open in the list)
@@ -816,8 +961,11 @@ impl App {
             return;
         };
         if let Some(s) = &self.smart {
-            let _ = s.send(crate::smart::Cmd::Start { playlist: pl, tracks });
+            let cur = self.play.track.as_ref().map(|t| t.uri.clone());
+            let at = if cur.as_ref().map(|u| tracks.iter().any(|t| &t.uri == u)).unwrap_or(false) { self.play.position(now_ms()) as u64 } else { 0 };
+            let _ = s.send(crate::smart::Cmd::Start { playlist: pl, tracks, first: cur, shuffle: true, position: at });
             self.smart_on = true;
+            self.smart_shuffled = true;
             self.play.shuffle = true;
             self.hold_shuffle = Some((true, Instant::now()));
         }
@@ -847,22 +995,29 @@ impl App {
         }
     }
 
-    /// Shuffle button: off -> Spotify shuffle -> SpoX smart shuffle -> off
+    /// Shuffle button: off <-> SpoX shuffle (signed in, on one of your lists); else Spotify's.
     fn cycle_shuffle(&mut self) {
-        if self.smart_on {
-            self.stop_smart();
-            self.send(command_with("set_shuffle", "enabled", json!(false)));
+        if self.smart_on && self.smart_shuffled {
+            // back to the list in its own order, carrying on with the song playing now
+            match (self.smart_source(), &self.smart) {
+                (Some((pl, tracks)), Some(sm)) => {
+                    let mut tracks = tracks;
+                    tracks.sort_by_key(|t| t.order);
+                    let cur = self.play.track.as_ref().map(|t| t.uri.clone());
+                    let at = self.play.position(now_ms()) as u64;
+                    let _ = sm.send(crate::smart::Cmd::Start { playlist: pl, tracks, first: cur, shuffle: false, position: at });
+                }
+                _ => self.stop_smart(),
+            }
             self.play.shuffle = false;
             self.hold_shuffle = Some((false, Instant::now()));
             self.osd("SHUFFLE OFF");
-        } else if self.play.shuffle {
-            let ok = self.smart_source().is_some();
-            if ok {
-                self.toggle_smart();
-            } else {
-                self.toggle_shuffle();
-                self.osd("SHUFFLE OFF (SMART NEEDS A PLAYLIST YOU OWN)");
+        } else if self.signed_in && self.smart_source().is_some() {
+            if self.play.shuffle {
+                self.send(command_with("set_shuffle", "enabled", json!(false)));
             }
+            self.smart_on = false;
+            self.toggle_smart();
         } else {
             self.toggle_shuffle();
         }
@@ -2038,8 +2193,19 @@ impl App {
                             let ms: u64 = self.tracks.iter().map(|t| t.duration_ms).sum();
                             let mins = ms / 60_000;
                             let dur = if ms == 0 { String::new() } else if mins >= 60 { format!("  \u{b7}  {}h {}m", mins / 60, mins % 60) } else { format!("  \u{b7}  {}m", mins) };
-                            let smart = if self.smart_on { "  \u{b7}  smart" } else { "" };
-                            format!("{}  \u{b7}  {} songs{}{}", pl.name, n, dur, smart)
+                            let smart = if self.smart_on && self.smart_shuffled { "  \u{b7}  SpoX shuffle" } else { "" };
+                            let sort = match self.pl_sort.as_str() {
+                                "added" => "  \u{b7}  newest",
+                                "title" => "  \u{b7}  A-Z",
+                                "artist" => "  \u{b7}  by artist",
+                                "album" => "  \u{b7}  by album",
+                                "length" => "  \u{b7}  by length",
+                                _ => "",
+                            };
+                            match &self.pl_find {
+                                Some(f) => format!("Find: {}_  \u{b7}  {} of {}", f, self.tracks.len(), self.tracks_all.len()),
+                                None => format!("{}  \u{b7}  {} songs{}{}{}", pl.name, n, dur, sort, smart),
+                            }
                         }
                         None => "Playlists".into(),
                     },
@@ -2159,6 +2325,8 @@ impl App {
         let scroll_idx;
         let mut current_row: Option<usize> = None;
         let mut q_map: Vec<Option<usize>> = Vec::new();
+        // rows picked with Ctrl+click (Up next)
+        let mut picked_rows: Vec<usize> = Vec::new();
         match tab {
             Tab::Playlist if self.picker || self.sel.is_none() => {
                 scroll_idx = SCROLL_PICK;
@@ -2211,9 +2379,27 @@ impl App {
                 let mut last_group = String::new();
                 // songs smart shuffle brought in: a soft cyan, so they stand out from your own songs
                 let new_col = self.skin.json["colors"]["list_new"].as_str().and_then(crate::skin::parse_color).unwrap_or(Color32::from_rgb(126, 214, 230));
-                for (i, t) in self.play.upcoming.iter().enumerate() {
+                // SpoX shuffle: its own order (the whole rest of the list); else Soloist's queue
+                self.q_list = if self.smart_on {
+                    self.smart_upcoming
+                        .iter()
+                        .map(|(t, k)| {
+                            let mut t = t.clone();
+                            t.provider = if k == "user" { "queue".into() } else { "spox".into() };
+                            t
+                        })
+                        .collect()
+                } else {
+                    self.play.upcoming.iter().filter(|t| !self.q_removed.contains(&t.uri)).cloned().collect()
+                };
+                self.q_picked.retain(|u| self.q_list.iter().any(|t| &t.uri == u));
+                let list = self.q_list.clone();
+                for (i, t) in list.iter().enumerate() {
                     let p = &t.provider;
-                    let group = if p.contains("queue") {
+                    let group = if p.contains("spox") {
+                        let n = if self.smart_list.is_empty() { "your list".to_string() } else { self.smart_list.clone() };
+                        if self.smart_shuffled { format!("SpoX shuffle \u{b7} {}", n) } else { format!("Next from {}", n) }
+                    } else if p.contains("queue") {
                         "Next in queue".to_string()
                     } else if p.contains("autoplay") || p.contains("recommend") {
                         "Autoplay (Spotify's picks)".to_string()
@@ -2233,16 +2419,19 @@ impl App {
                     let never = crate::smart::knows(&t.name, &t.artists) == Some(false);
                     let outside = self.smart_new.contains(&t.uri) || p.contains("autoplay") || p.contains("recommend");
                     let is_new = never || outside;
+                    if self.q_picked.contains(&t.uri) {
+                        picked_rows.push(rows.len());
+                    }
                     rows.push(Row {
                         left: format!("{} - {}", t.artists, t.name),
-                        right: if never { "new to you".into() } else if outside { "new".into() } else if t.duration_ms > 0 { fmt_time(t.duration_ms as f64) } else { String::new() },
+                        right: if never { "NEW".into() } else if outside { "pick".into() } else if t.duration_ms > 0 { fmt_time(t.duration_ms as f64) } else { String::new() },
                         color: if is_new { new_col } else { list_col },
                         center: false,
                     });
                     q_map.push(Some(i));
                 }
                 if rows.is_empty() {
-                    empty_msg = vec![if self.connected { "Nothing queued.".into() } else { "Waiting for Soloist...".into() }];
+                    empty_msg = vec![if !self.smart_busy.is_empty() { self.smart_busy.clone() } else if self.connected { "Nothing queued.".into() } else { "Waiting for Soloist...".into() }];
                 }
             }
             Tab::History => {
@@ -2309,6 +2498,10 @@ impl App {
                 if rows.is_empty() {
                     empty_msg = vec![if self.play.track.is_none() {
                         "Play something to see lyrics.".into()
+                    } else if self.lyrics_loading && self.lyrics_since.elapsed() < Duration::from_millis(900) {
+                        // usually found in a moment (looked up ahead of time): no message flashing
+                        self.ctx.request_repaint_after(Duration::from_millis(150));
+                        String::new()
                     } else if self.lyrics_loading {
                         "Looking for lyrics...".into()
                     } else {
@@ -2383,7 +2576,7 @@ impl App {
         };
         for (i, r) in rows.iter().enumerate().skip(first).take(rows_vis) {
             let y = lr[1] + (i - first) as f32 * lh;
-            if sel_row == Some(i) {
+            if sel_row == Some(i) || picked_rows.contains(&i) {
                 self.fill(&cp, o, s, lr[0], y, lr[2], lh, sel_bg);
             }
             let ty = y + 1.0;
@@ -2417,6 +2610,8 @@ impl App {
                             ("Save to Liked Songs".into(), CtxAct::Like(u.clone())),
                             ("Add to playlist...".into(), CtxAct::AddTo(u.clone())),
                             ("Copy song link".into(), CtxAct::CopyLink(u)),
+                            (format!("Sort: {}  (O)", sort_name(&self.pl_sort)), CtxAct::Sort),
+                            ("Find in playlist  (Ctrl+F)".into(), CtxAct::Find),
                         ];
                     }
                 }
@@ -2435,10 +2630,15 @@ impl App {
                 }
                 Tab::Queue => {
                     if let Some(Some(qi)) = clicked.and_then(|r| q_map.get(r).cloned()) {
-                        let u = self.play.upcoming[qi].uri.clone();
+                        let u = self.q_list[qi].uri.clone();
                         self.q_selected = Some(qi);
+                        // the picked songs (Ctrl+click), or just this one
+                        let picks: Vec<String> = if self.q_picked.contains(&u) { self.q_list.iter().filter(|t| self.q_picked.contains(&t.uri)).map(|t| t.uri.clone()).collect() } else { vec![u.clone()] };
+                        let n = picks.len();
                         items = vec![
                             ("Skip to this song".into(), CtxAct::SkipTo(qi)),
+                            (if n > 1 { format!("Play these {} next", n) } else { "Play next".into() }, CtxAct::PlayNextQ(picks.clone())),
+                            (if n > 1 { format!("Remove {} from Up next", n) } else { "Remove from Up next".into() }, CtxAct::RemoveQ(picks)),
                             ("Save to Liked Songs".into(), CtxAct::Like(u.clone())),
                             ("Add to playlist...".into(), CtxAct::AddTo(u.clone())),
                             ("Copy song link".into(), CtxAct::CopyLink(u)),
@@ -2518,7 +2718,14 @@ impl App {
                     if let Some(Some(qi)) = clicked.and_then(|r| q_map.get(r).cloned()) {
                         if inp.dbl {
                             self.run_ctx(CtxAct::SkipTo(qi));
+                        } else if inp.ctrl {
+                            // Ctrl+click: pick several (then right-click or Delete)
+                            let u = self.q_list[qi].uri.clone();
+                            if !self.q_picked.remove(&u) {
+                                self.q_picked.insert(u);
+                            }
                         } else {
+                            self.q_picked.clear();
                             self.q_selected = Some(qi);
                         }
                     }
@@ -2541,12 +2748,61 @@ impl App {
             }
             CtxAct::QueueTrack(u) => {
                 self.send(command_with("add_to_queue", "uri", json!(u)));
+                if self.smart_on {
+                    let t = self.tracks_all.iter().chain(self.history.iter().map(|h| &h.0)).find(|t| t.uri == u).cloned();
+                    if let (Some(t), Some(sm)) = (t, &self.smart) {
+                        let _ = sm.send(crate::smart::Cmd::Queued(t));
+                    }
+                }
                 self.osd("ADDED TO QUEUE");
                 if self.queue_visible() {
                     self.send(command_with("get_queue", "limit", json!(0)));
                 }
             }
+            CtxAct::Sort => self.cycle_sort(),
+            CtxAct::Find => self.start_find(),
+            CtxAct::RemoveQ(uris) => {
+                let n = uris.len();
+                if !self.smart_on {
+                    self.q_removed.extend(uris.iter().cloned());
+                }
+                if let Some(sm) = &self.smart {
+                    let _ = sm.send(crate::smart::Cmd::Remove(uris));
+                }
+                self.q_picked.clear();
+                self.q_selected = None;
+                self.osd(if n == 1 { "REMOVED FROM UP NEXT".to_string() } else { format!("REMOVED {} FROM UP NEXT", n) });
+            }
+            CtxAct::PlayNextQ(uris) => {
+                let picks: Vec<Track> = uris.iter().filter_map(|u| self.q_list.iter().find(|t| &t.uri == u).cloned()).collect();
+                if self.smart_on {
+                    if let Some(sm) = &self.smart {
+                        let _ = sm.send(crate::smart::Cmd::PlayNext(picks));
+                    }
+                } else {
+                    // Spotify's queue: queue them again in front (their old spot is skipped)
+                    self.q_removed.extend(uris.iter().cloned());
+                    if let Some(sm) = &self.smart {
+                        let _ = sm.send(crate::smart::Cmd::Remove(uris.clone()));
+                    }
+                    for u in &uris {
+                        self.send(command_with("add_to_queue", "uri", json!(u)));
+                    }
+                }
+                self.q_picked.clear();
+                self.osd("PLAYING NEXT");
+                self.send(command_with("get_queue", "limit", json!(0)));
+            }
             CtxAct::SkipTo(i) => {
+                if self.smart_on {
+                    if let (Some(t), Some(sm)) = (self.q_list.get(i), &self.smart) {
+                        let _ = sm.send(crate::smart::Cmd::JumpTo(t.uri.clone()));
+                        self.q_selected = None;
+                        return;
+                    }
+                }
+                // position in Soloist's own queue (Up next hides songs you removed)
+                let i = self.q_list.get(i).and_then(|t| self.play.upcoming.iter().position(|u| u.uri == t.uri)).unwrap_or(i);
                 // a song from the playlist itself: start the playlist right at that song (one jump,
                 // nothing skipped through, other devices see it straight away)
                 if let Some(t) = self.play.upcoming.get(i).cloned() {
@@ -2683,7 +2939,7 @@ impl App {
             ("Hide animation".into(), match c.collapse_anim.as_str() { "dissolve" => "pixel dissolve", "shutter" => "shutter", "none" => "none", _ => "TV switch-off" }.into(), 19),
             ("@lab".into(), String::new(), 0),
             ("Smart shuffle".into(), String::new(), 0),
-            ("New songs in the mix".into(), format!("{}%", c.smart_ratio), 20),
+            ("SpoX shuffle: new songs".into(), format!("{}%", c.smart_ratio), 20),
             ("Same artist twice in a row".into(), if c.smart_avoid_artist { "avoid" } else { "allow" }.into(), 21),
             ("Last.fm key (more new songs)".into(), if c.lastfm_key.is_empty() { "add...".into() } else { "set".into() }, 22),
             ("Taskbar player".into(), String::new(), 0),
@@ -2895,7 +3151,12 @@ impl App {
                 63 => c.auto_update = !c.auto_update,
                 96 => crate::update::check_now(self.tx.clone(), self.ctx.clone()),
                 64 => c.hide_tray_with_player = !c.hide_tray_with_player,
-                20 => c.smart_ratio = cycle(&c.smart_ratio.to_string(), &["25", "50", "75", "100"]).parse().unwrap_or(50),
+                20 => {
+                    c.smart_ratio = cycle(&c.smart_ratio.to_string(), &["0", "25", "50", "75", "100"]).parse().unwrap_or(50);
+                    if let Some(sm) = &self.smart {
+                        let _ = sm.send(crate::smart::Cmd::Ratio);
+                    }
+                }
                 21 => c.smart_avoid_artist = !c.smart_avoid_artist,
                 30 => c.tb_on = !c.tb_on,
                 31 => c.tb_pos = cycle(&c.tb_pos, &["auto", "left", "custom"]),
@@ -3345,9 +3606,53 @@ impl App {
             }
             return;
         }
+        // typing to find in the open playlist
+        if let Some(mut f) = self.pl_find.clone() {
+            let mut close = false;
+            let mut play_first = false;
+            for e in &events {
+                match e {
+                    egui::Event::Text(t) => f.push_str(&t.replace(['\r', '\n'], "")),
+                    egui::Event::Paste(t) => f.push_str(t.trim()),
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => match key {
+                        egui::Key::Backspace if modifiers.ctrl => f.clear(),
+                        egui::Key::Backspace => {
+                            if f.pop().is_none() {
+                                close = true;
+                            }
+                        }
+                        egui::Key::Escape => close = true,
+                        egui::Key::Enter => play_first = true,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            self.pl_find = if close { None } else { Some(f) };
+            self.scroll[SCROLL_PL] = 0.0;
+            self.apply_view();
+            if play_first && !self.tracks.is_empty() {
+                let i = self.selected.unwrap_or(0).min(self.tracks.len() - 1);
+                self.play_track(i);
+            }
+            return;
+        }
         for e in events {
             if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
                 match key {
+                    egui::Key::F if modifiers.ctrl => self.start_find(),
+                    egui::Key::F3 | egui::Key::Slash => self.start_find(),
+                    egui::Key::O if self.sel.is_some() && !self.picker => self.cycle_sort(),
+                    egui::Key::Delete if self.queue_visible() => {
+                        let picks: Vec<String> = if !self.q_picked.is_empty() {
+                            self.q_picked.iter().cloned().collect()
+                        } else {
+                            self.q_selected.and_then(|i| self.q_list.get(i)).map(|t| vec![t.uri.clone()]).unwrap_or_default()
+                        };
+                        if !picks.is_empty() {
+                            self.run_ctx(CtxAct::RemoveQ(picks));
+                        }
+                    }
                     egui::Key::Space => self.toggle_play(),
                     egui::Key::ArrowLeft if modifiers.ctrl => self.send(command("skip_prev")),
                     egui::Key::ArrowRight if modifiers.ctrl => self.send(command("skip_next")),
@@ -3370,7 +3675,7 @@ impl App {
                     egui::Key::M => self.toggle_mute(),
                     egui::Key::H => {
                         if self._tray.is_some() {
-                            crate::desktop::hide_window();
+                            self.start_collapse(true);
                         }
                     }
                     egui::Key::R => self.cycle_repeat(),
@@ -3397,8 +3702,10 @@ impl App {
                             self.menu = false;
                             self.add_menu = false;
                             self.picker = false;
+                        } else if !self.q_picked.is_empty() {
+                            self.q_picked.clear();
                         } else if self._tray.is_some() && self.cfg.lock().unwrap().tray {
-                            crate::desktop::hide_window();
+                            self.start_collapse(true);
                         }
                     }
                     _ => {}
@@ -3441,6 +3748,20 @@ impl eframe::App for App {
             }
         }
         self.note_history();
+        // likes change on other devices too: ask again every 30 s while something plays
+        if self.signed_in && self.play.status == "playing" && self.liked_checked.elapsed() > Duration::from_secs(30) {
+            self.liked_checked = Instant::now();
+            if let Some(t) = self.play.track.as_ref().filter(|t| t.uri.starts_with("spotify:track:")) {
+                let _ = self.web.send(Req::CheckLiked(t.uri.clone()));
+            }
+        }
+        // "hide" from the tray icon / taskbar player: with the close animation
+        let pending: Vec<&str> = std::mem::take(&mut *crate::desktop::PENDING.lock().unwrap());
+        for a in pending {
+            if a == "hide" && !crate::desktop::HIDDEN.load(std::sync::atomic::Ordering::SeqCst) {
+                self.start_collapse(true);
+            }
+        }
         // actions coming from the taskbar player
         let acts: Vec<String> = self.tb.as_ref().map(|t| std::mem::take(&mut *t.app_actions.lock().unwrap())).unwrap_or_default();
         for a in acts {
@@ -3621,8 +3942,10 @@ impl eframe::App for App {
         let unseen = crate::desktop::window_unseen();
         let pace = |ms: u64| crate::desktop::PACE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
         if unseen && self.collapse.is_none() {
+            // hidden: nothing to draw, but stay awake for Soloist, SpoX shuffle and the taskbar
+            // player (a slow tick, plus every event wakes it at once)
             self.vis.sleep();
-            pace(0);
+            pace(1000);
             return;
         }
         if animating && self.vis_running() {
@@ -3668,12 +3991,23 @@ impl eframe::App for App {
     }
 }
 
+fn sort_name(k: &str) -> &'static str {
+    match k {
+        "added" => "Recently added",
+        "title" => "Title",
+        "artist" => "Artist",
+        "album" => "Album",
+        "length" => "Length",
+        _ => "Playlist order",
+    }
+}
+
 fn tracks_cache_path(uri: &str) -> std::path::PathBuf {
     let id: String = uri.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     config::cache_dir().join("tracks").join(format!("{}.json", id))
 }
 fn save_tracks_cache(uri: &str, t: &[Track]) {
-    let v: Vec<serde_json::Value> = t.iter().map(|t| json!([t.uri, t.name, t.artists, t.album, t.duration_ms])).collect();
+    let v: Vec<serde_json::Value> = t.iter().map(|t| json!([t.uri, t.name, t.artists, t.album, t.duration_ms, t.added, t.order])).collect();
     let p = tracks_cache_path(uri);
     let _ = std::fs::create_dir_all(p.parent().unwrap());
     let _ = std::fs::write(p, serde_json::Value::Array(v).to_string());
@@ -3690,9 +4024,9 @@ fn load_tracks_cache(uri: &str) -> Option<Vec<Track>> {
                     artists: e.get(2)?.as_str()?.into(),
                     album: e.get(3)?.as_str()?.into(),
                     duration_ms: e.get(4)?.as_u64()?,
-                    cover_small: None,
-                    cover_large: None,
-                    provider: String::new(),
+                    added: e.get(5).and_then(|x| x.as_i64()).unwrap_or(0),
+                    order: e.get(6).and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                    ..Default::default()
                 })
             })
             .collect(),
@@ -3738,6 +4072,7 @@ fn load_history() -> Vec<(Track, i64)> {
                     cover_small: e.get(6).and_then(|x| x.as_str()).map(|s| s.to_string()),
                     cover_large: None,
                     provider: String::new(),
+                    ..Default::default()
                 },
                 e.get(5)?.as_i64()?,
             ))

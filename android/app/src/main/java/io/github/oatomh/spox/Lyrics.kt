@@ -12,7 +12,17 @@ import kotlin.math.abs
 object Lyrics {
     data class Result(val synced: Boolean, val lines: List<Pair<Long, String>>)
 
-    private val cache = HashMap<String, Result?>()
+    private val cache: MutableMap<String, Result?> = java.util.Collections.synchronizedMap(HashMap())
+    private val inFlight: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /** Already looked up (found or not)? Then [fetch] answers at once. */
+    fun cached(title: String, artist: String) = cache.containsKey("$artist|$title")
+
+    /** Look up the next song's lyrics ahead of time, so they're there the moment it starts. */
+    fun prefetch(title: String, artist: String, album: String, durationMs: Long) {
+        if (title.isEmpty() || cached(title, artist) || !inFlight.add("$artist|$title")) return
+        fetch(title, artist, album, durationMs) { inFlight.remove("$artist|$title") }
+    }
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 

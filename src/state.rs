@@ -11,6 +11,10 @@ pub struct Track {
     pub cover_large: Option<String>,
     /// where a queued item comes from: "queue", "context", "autoplay"... (empty if unknown)
     pub provider: String,
+    /// when it was added to the playlist / Liked Songs (unix seconds, 0 = unknown)
+    pub added: i64,
+    /// its place in the playlist's own order
+    pub order: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -46,8 +50,9 @@ pub enum Ev {
     Added { playlist: String, uri: String },
     Removed { playlist: String, uri: String, key: String },
     UpdateReady(String),
-    /// smart shuffle state: on/off, songs it picked as "new", how many new songs are waiting
-    Smart { on: bool, new_uris: Vec<String>, #[allow(dead_code)] pool: usize },
+    /// SpoX shuffle state: on/off, shuffled or in your order, the list's name, songs it picked as
+    /// "new", and what's coming (the whole rest of its order: (song, kind "list"/"new"/"user"))
+    Smart { on: bool, shuffled: bool, list: String, new_uris: Vec<String>, upcoming: Vec<(Track, String)>, busy: String },
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +138,7 @@ pub fn parse_entity(v: &Value) -> Option<Track> {
         small = pick(&["small", "default", "large", "xlarge"]);
         large = pick(&["default", "large", "small", "xlarge"]);
     }
-    Some(Track { uri, name: name_of(v), artists, album, duration_ms, cover_small: small, cover_large: large, provider: String::new() })
+    Some(Track { uri, name: name_of(v), artists, album, duration_ms, cover_small: small, cover_large: large, ..Default::default() })
 }
 
 impl Play {

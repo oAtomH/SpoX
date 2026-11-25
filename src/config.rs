@@ -108,6 +108,8 @@ pub struct Config {
     pub cfg_version: u32,
     pub color_hue: i32,
     pub installed_asked: bool,
+    /// how each playlist is sorted (playlist uri -> added / title / artist / album / length / custom)
+    pub sorts: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -181,6 +183,7 @@ impl Default for Config {
             text_shadow: false,
             text_style: "normal".into(),
             color_over: Default::default(),
+            sorts: Default::default(),
             cfg_version: 6,
             color_hue: 0,
             installed_asked: false,

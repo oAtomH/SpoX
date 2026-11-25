@@ -10,7 +10,12 @@ import android.graphics.RectF
 import android.os.Build
 import android.os.SystemClock
 import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import android.view.VelocityTracker
 import android.view.View
 import android.view.WindowInsets
@@ -31,7 +36,14 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     enum class Tab(val label: String) { PLAYER("Player"), LYRICS("Lyrics"), QUEUE("Up next"), LIBRARY("Library"), SETTINGS("Settings") }
     var tab = Tab.PLAYER
-        set(v) { field = v; scroll = 0f; fling = 0f; queueAsked = 0L; invalidate() }
+        set(v) {
+            if (field == Tab.LIBRARY) pages.lastOrNull()?.scroll = scroll
+            field = v
+            scroll = if (v == Tab.LIBRARY) pages.lastOrNull()?.scroll ?: 0f else 0f
+            fling = 0f; queueAsked = 0L; selected.clear()
+            saveLibrary()
+            invalidate()
+        }
 
     /** Frames per second while something moves: Settings > Smoothness. */
     var fps = 30
@@ -61,6 +73,16 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var lyricsKey = ""
     private var lyrics: Lyrics.Result? = null
     private var lyricsState = "Play something to see lyrics."
+    private var lyricsSince = 0L
+    private var prefetchFor = ""
+
+    /** The next song's lyrics, looked up while this one plays. */
+    private fun prefetchNext() {
+        val next = io.github.oatomh.spox.engine.Engine.get(context).now.queue.firstOrNull { !Player.isSkipped(it.uri) } ?: return
+        if (next.uri == prefetchFor) return
+        prefetchFor = next.uri
+        Lyrics.prefetch(next.title, next.artist, next.album, next.durationMs)
+    }
     private var wrapKey = ""
     private var wrapCache: List<Pair<Int, String>> = emptyList()
 
@@ -92,12 +114,17 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var miniRect = RectF()
     private var contentTop = 0f
     private var contentBottom = 0f
+    /** the on-screen keyboard's height (SpoX's text boxes sit above it) */
+    private var imeBottom = 0f
 
     init {
+        isFocusable = true
+        isFocusableInTouchMode = true
         setOnApplyWindowInsetsListener { _, ins ->
             if (Build.VERSION.SDK_INT >= 30) {
                 val b = ins.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
                 insetTop = b.top.toFloat(); insetBottom = b.bottom.toFloat()
+                imeBottom = ins.getInsets(WindowInsets.Type.ime()).bottom.toFloat()
             } else {
                 @Suppress("DEPRECATION")
                 insetTop = ins.systemWindowInsetTop.toFloat()
@@ -118,6 +145,8 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     /** Back button: other tabs go back to the player first. */
     fun back(): Boolean {
+        if (sheet != null) { closeSheet(); return true }
+        if (selected.isNotEmpty()) { selected.clear(); invalidate(); return true }
         if (tab == Tab.LIBRARY && pages.size > 1) { pages.removeAt(pages.size - 1); scroll = 0f; invalidate(); return true }
         if (tab == Tab.PLAYER) return false
         tab = Tab.PLAYER
@@ -128,11 +157,15 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        current = this
         Player.listen(playerChanged)
         requestApplyInsets()
     }
 
     override fun onDetachedFromWindow() {
+        if (current === this) current = null
+        if (tab == Tab.LIBRARY) pages.lastOrNull()?.scroll = scroll
+        saveLibrary()
         Player.unlisten(playerChanged)
         super.onDetachedFromWindow()
     }
@@ -230,10 +263,13 @@ class PlayerView(ctx: Context) : View(ctx) {
         else when (tab) {
             Tab.PLAYER -> drawPlayer(cv, st, now)
             Tab.LYRICS -> drawLyrics(cv, st, now)
-            Tab.QUEUE -> drawQueue(cv)
+            Tab.QUEUE -> drawQueue(cv, now)
             Tab.LIBRARY -> drawLibrary(cv)
             Tab.SETTINGS -> drawSettings(cv)
         }
+        if (Player.fromEngine && st.playing) prefetchNext()
+        drawVolumeOsd(cv, now)
+        sheet?.let { drawSheet(cv, it, now) }
 
         // Pixel art moves in whole pixels, so drawing at the phone's full 120 Hz mostly repeats the
         // same picture and costs battery. Dragging stays at full speed; otherwise the chosen rate.
@@ -345,10 +381,32 @@ class PlayerView(ctx: Context) : View(ctx) {
     private fun drawPlayer(cv: Canvas, st: Player.State, now: Long) {
         val w = width - 2 * pad
         val top = contentTop
-        // header: where the music comes from, and a shortcut to the app
-        val src = when (st.app) { "io.github.oatomh.spox.engine" -> "Playing on SpoX Engine"; "com.spotify.music", "com.spotify.lite" -> "Playing on Spotify"; "" -> "SpoX"; else -> "Playing" }
-        txt(cv, src + if (Web.signedIn) "  >" else "", pad, top + 4 * u, u, cDim)
-        if (Web.signedIn) hit(0f, top - 4 * u, pad + tw(src, u) + 20 * u, top + 16 * u, "devices")
+        // header: where it plays (SpoX Phone, your PC, a speaker) and through what (Bluetooth, car...)
+        val out = Player.output(context)
+        val elsewhere = if (!Player.fromEngine) otherDevice() else ""
+        val src = when {
+            st.app == "io.github.oatomh.spox.engine" -> "Playing on SpoX Phone"
+            elsewhere.isNotEmpty() -> "Playing on $elsewhere"
+            st.app == "com.spotify.music" || st.app == "com.spotify.lite" -> "Playing on Spotify"
+            st.app.isEmpty() -> "SpoX"
+            else -> "Playing"
+        }
+        var hx = pad
+        val iconCol = if (out.kind == "phone") cDim else cTitle
+        if (st.hasTrack || Player.fromEngine) {
+            val ic = icon(out.kind)
+            drawIcon(cv, ic, hx, top + 3 * u, u, iconCol)
+            hx += (ic[0].length + 4) * u
+        }
+        val lineW = width - pad - 3 * sprW("btn_link", u) - 20 * u - hx
+        val label = fit(src + if (out.kind != "phone" && out.name.isNotEmpty()) " · ${out.name}" else "", lineW - 10 * u, u)
+        txt(cv, label, hx, top + 4 * u, u, cDim)
+        if (Web.signedIn || Player.fromEngine) {
+            // a small "v": tap to move the music to another device
+            val ax = hx + tw(label, u) + 4 * u
+            for (i in 0..2) box(cv, ax + i * u, top + 8 * u + i * u, (5 - 2 * i) * u, u, cDim)
+            hit(0f, top - 4 * u, ax + 10 * u, top + 16 * u, "devices")
+        }
         val lw = sprW("btn_link", u)
         if (Player.fromEngine) {
             // share the song, and like it (heart) when signed in to Spotify
@@ -360,9 +418,8 @@ class PlayerView(ctx: Context) : View(ctx) {
                 spr(cv, if (liked == true || pressed == "like") "btn_like_down" else "btn_like", lx, top, u)
                 hit(lx - 2 * u, top - 4 * u, lx + lw + 2 * u, top + 20 * u, "like")
                 // + / -: add the song to the playlist that's playing, or take it out
-                val ctxUri = io.github.oatomh.spox.engine.Engine.get(context).now.contextUri
                 val uri = Player.engineTrackUri()
-                val inPl = if (uri != null) Web.inPlaylist(ctxUri, uri) else null
+                val inPl = if (uri != null) Web.inPlaylist(plusList(), uri) else null
                 if (inPl != null) {
                     val px = lx - lw - 6 * u
                     val b = if (inPl) "btn_remove" else "btn_add"
@@ -503,22 +560,29 @@ class PlayerView(ctx: Context) : View(ctx) {
         val key = "${st.artist}|${st.title}"
         if (key != lyricsKey && st.hasTrack) {
             lyricsKey = key
-            lyrics = null
-            lyricsState = "Looking for lyrics..."
+            lyricsSince = now
             scroll = 0f
+            wrapKey = ""
+            // already looked up (prefetched while the last song played): swap straight over, no
+            // "loading" in between
+            var instant = false
             Lyrics.fetch(st.title, st.artist, st.album, st.durationMs) { r ->
-                post {
+                val apply = {
                     if (key == lyricsKey) {
                         lyrics = r
                         lyricsState = if (r == null) "No lyrics for this song." else ""
                         invalidate()
                     }
                 }
+                if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) { apply(); instant = true } else post(apply)
             }
+            if (!instant) { lyrics = null; lyricsState = "" }
         }
         val l = lyrics
         if (l == null) {
-            txt(cv, lyricsState, (width - tw(lyricsState, u)) / 2, top + 20 * u, u, cDim)
+            // only say "looking" if it takes a moment (a quick answer shouldn't flash a message)
+            val msg = lyricsState.ifEmpty { if (now - lyricsSince > 900) "Looking for lyrics..." else "" }
+            if (msg.isNotEmpty()) txt(cv, msg, (width - tw(msg, u)) / 2, top + 20 * u, u, cDim) else animating = true
             return
         }
         val k = tu
@@ -623,53 +687,295 @@ class PlayerView(ctx: Context) : View(ctx) {
     }
 
     private var queueAsked = 0L
+    /** Up next songs you've picked (long-press a song to start picking). */
+    private val selected = LinkedHashSet<String>()
+    private var qRows: List<Player.QRow> = emptyList()
 
-    private fun drawQueue(cv: Canvas) {
-        val top = header(cv, "Up next")
+    private fun drawQueue(cv: Canvas, now: Long) {
         // keep it the same as on your other devices: ask again every few seconds while it's open
         if (Player.fromEngine && SystemClock.elapsedRealtime() - queueAsked > 5000) {
             queueAsked = SystemClock.elapsedRealtime()
             io.github.oatomh.spox.engine.Engine.get(context).command("get_queue", mapOf("limit" to 0))
         }
-        val rows = mutableListOf<Triple<String, String, String>>()
-        val accent = HashSet<String>()
-        var group = ""
-        for (q in Player.queueRows()) {
-            if (q.group.isNotEmpty() && q.group != group) { rows += Triple("#" + q.group, "", ""); group = q.group }
-            val id = "queue:${q.id}"
-            val mark = when { q.neverHeard -> " · new to you"; q.outside -> " · new"; else -> "" }
-            if (mark.isNotEmpty()) accent += id
-            rows += Triple(q.title, q.artist + mark, id)
+        val rows = Player.queueRows()
+        qRows = rows
+        selected.retainAll(rows.map { it.uri }.toSet())
+        val newCount = rows.count { it.neverHeard || it.outside }
+        // header: what's playing it, and the new-songs mix (tap to change it)
+        var y = contentTop + 4 * u
+        txt(cv, "Up next", pad, y, tu, cHeader)
+        val mode = when {
+            Smart.busy.isNotEmpty() -> Smart.busy
+            Smart.on && Smart.shuffled -> "SpoX shuffle · ${Smart.ratio(context)}% new  v"
+            Smart.on -> "In order · ${Smart.listName}"
+            else -> ""
         }
-        drawRows(cv, top, rows, "Nothing queued.", valueRight = false, accent = accent)
+        if (mode.isNotEmpty()) {
+            val mw = tw(mode, u)
+            txt(cv, mode, width - pad - mw, y + 3 * u, u, if (Smart.on && Smart.shuffled) cTitle else cDim)
+            if (Smart.on && Smart.shuffled) hit(width - pad - mw - 8 * u, y - 4 * u, width.toFloat(), y + 16 * u, "qmix")
+        }
+        y += 12 * tu
+        if (selected.isNotEmpty()) {
+            // picking songs: what to do with them
+            val bh = 18 * u
+            box(cv, 0f, y - 2 * u, width.toFloat(), bh, cLine)
+            txt(cv, "${selected.size} picked", pad, y + 3 * u, u, cTitle)
+            var bx = width - pad
+            for ((label, id) in listOf("Cancel" to "qcancel", "Remove" to "qremove", "Play next" to "qnext")) {
+                val w = tw(label, u) + 12 * u
+                bx -= w
+                if (pressed == id) box(cv, bx, y - 2 * u, w, bh, cBg)
+                txt(cv, label, bx + 6 * u, y + 3 * u, u, if (id == "qremove") skin.color("list_new", cTitle) else cList)
+                hit(bx, y - 4 * u, bx + w, y + bh, id)
+            }
+            y += bh + 2 * u
+        } else {
+            val mins = rows.size
+            val sub = when {
+                rows.isEmpty() -> ""
+                newCount > 0 -> "$mins songs · $newCount new · long-press to pick"
+                else -> "$mins songs · long-press to pick"
+            }
+            if (sub.isNotEmpty()) txt(cv, fit(sub, width - 2 * pad, u), pad, y, u, cDim)
+            y += 14 * u
+        }
+        val top = y
+        if (rows.isEmpty()) {
+            val msg = if (Smart.busy.isNotEmpty()) Smart.busy else "Nothing queued."
+            txt(cv, msg, (width - tw(msg, u)) / 2, top + 20 * u, u, cDim)
+            return
+        }
+        // rows, with a heading where the group changes
+        val rh = 28 * u
+        val gh = 18 * u
+        data class Line(val y: Float, val h: Float, val head: String?, val row: Player.QRow?)
+        val lines = ArrayList<Line>(rows.size + 4)
+        var yy = 0f
+        var group = ""
+        for (q in rows) {
+            if (q.group.isNotEmpty() && q.group != group) { lines += Line(yy, gh, q.group, null); yy += gh; group = q.group }
+            lines += Line(yy, rh, null, q); yy += rh
+        }
+        val viewH = contentBottom - top
+        maxScroll = max(0f, yy - viewH + 8 * u)
+        scroll = scroll.coerceIn(0f, maxScroll)
+        val accent = skin.color("list_new", cTitle)
+        cv.save()
+        cv.clipRect(0f, top, width.toFloat(), contentBottom)
+        for (ln in lines) {
+            val ry = top + ln.y - scroll
+            if (ry + ln.h < top) continue
+            if (ry > contentBottom) break
+            if (ln.head != null) {
+                txt(cv, fit(ln.head, width - 2 * pad, u), pad, ry + 7 * u, u, cHeader)
+                continue
+            }
+            val q = ln.row!!
+            val id = "qrow:${q.id}:${q.uri}"
+            val isSel = q.uri in selected
+            val isNew = q.neverHeard || q.outside
+            if (isSel || pressed == id) box(cv, 0f, ry, width.toFloat(), rh, cLine)
+            var tx = pad
+            if (selected.isNotEmpty()) {
+                // tick box while picking
+                box(cv, pad, ry + 9 * u, 10 * u, 10 * u, if (isSel) cTitle else cDim)
+                box(cv, pad + u, ry + 10 * u, 8 * u, 8 * u, if (isSel) cTitle else cBg)
+                if (isSel) drawIcon(cv, ICON_CHECK, pad + 2 * u, ry + 12 * u, u, cBg)
+                tx += 16 * u
+            } else if (isNew) {
+                // a bar on the left: songs you haven't heard stand out at a glance
+                box(cv, 0f, ry + 4 * u, 2 * u, rh - 8 * u, accent)
+            }
+            // tag on the right: NEW = never heard; "pick" = SpoX/Spotify brought it in
+            val tag = when { q.neverHeard -> "NEW"; q.outside -> "pick"; else -> "" }
+            var tagW = 0f
+            if (tag.isNotEmpty()) {
+                tagW = tw(tag, u) + 8 * u
+                val tx2 = width - pad - tagW
+                if (tag == "NEW") {
+                    box(cv, tx2, ry + 8 * u, tagW, 12 * u, accent)
+                    txt(cv, tag, tx2 + 4 * u, ry + 9 * u, u, cBg)
+                } else txt(cv, tag, tx2 + 4 * u, ry + 9 * u, u, cDim)
+            }
+            val textW = width - pad - tx - tagW - 6 * u
+            txt(cv, fit(q.title, textW, u), tx, ry + 5 * u, u, if (isNew) accent else cList)
+            txt(cv, fit(q.artist, textW, u), tx, ry + 16 * u, u, cDim)
+            box(cv, pad, ry + rh - max(1f, u / 2), width - 2 * pad, max(1f, u / 2), cLine)
+            hit(0f, max(top, ry), width.toFloat(), min(contentBottom, ry + rh), id)
+        }
+        cv.restore()
+    }
+
+    private fun queueTap(id: String) {
+        val parts = id.split(":", limit = 3)
+        val qid = parts.getOrNull(1)?.toLongOrNull() ?: return
+        val uri = parts.getOrNull(2).orEmpty()
+        if (selected.isNotEmpty() && uri.isNotEmpty()) {
+            if (!selected.remove(uri)) selected += uri
+            return
+        }
+        Player.playQueueItem(qid, uri)
+    }
+
+    private fun queueLong(id: String) {
+        val uri = id.split(":", limit = 3).getOrNull(2).orEmpty()
+        if (uri.isEmpty()) return
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        if (!selected.remove(uri)) selected += uri
+        invalidate()
+    }
+
+    private fun queueAction(id: String) {
+        when (id) {
+            "qcancel" -> selected.clear()
+            "qremove" -> {
+                val n = selected.size
+                Player.removeFromQueue(selected.toSet())
+                selected.clear()
+                say("Removed $n from Up next")
+            }
+            "qnext" -> {
+                val pick = qRows.filter { it.uri in selected }
+                if (Smart.on) Smart.playNext(pick.map { Smart.Entry(it.uri, it.title, it.artist, if (it.outside) "new" else "user") })
+                else {
+                    // Spotify's queue: queue them again (the old spot is skipped when it comes up)
+                    Player.removeFromQueue(pick.map { it.uri }.toSet())
+                    pick.forEach { Player.addToQueue(it.uri, it.title, it.artist) }
+                }
+                selected.clear()
+                say("Playing next: ${pick.size} songs")
+            }
+            "qmix" -> mixSheet()
+        }
+    }
+
+    /** SpoX shuffle: how many new songs (0% = just your list, 100% = only new songs). */
+    fun mixSheet() {
+        val r = Smart.ratio(context)
+        show(Sheet("New songs in SpoX shuffle", listOf("New = not in your Liked Songs, this list", "or what you played lately."),
+            listOf(0 to "Just my list", 25 to "A few new songs", 50 to "Half new", 75 to "Mostly new", 100 to "Only new songs").map { (v, l) ->
+                SheetItem(l, "$v%", v == r) { Smart.setRatio(context, v) }
+            }))
     }
 
     // ---- library: playlists, Liked Songs, search (Spotify account) -----------------------------
 
-    class Page(val title: String, val list: Web.Item?, @Volatile var items: List<Web.Item> = emptyList(), @Volatile var loading: Boolean = true)
+    /**
+     * One list in the library. [sort]: "added" (newest first), "title", "artist", "album",
+     * "length" or "custom" (the list's own order). [filter]: words to look for in the list.
+     */
+    class Page(val title: String, val list: Web.Item?, @Volatile var items: List<Web.Item> = emptyList(), @Volatile var loading: Boolean = true,
+               var sort: String = "", var filter: String = "", var scroll: Float = 0f) {
+        private var viewKey = ""
+        private var viewCache: List<Web.Item> = emptyList()
+        private var index: Map<Web.Item, String> = emptyMap()
+        /** The songs as shown: searched, then sorted. Worked out once per change, not per frame. */
+        fun view(): List<Web.Item> {
+            val k = "${System.identityHashCode(items)}|$sort|$filter"
+            if (k == viewKey) return viewCache
+            if (index.size != items.size || index.keys.firstOrNull() !== items.firstOrNull()) {
+                index = items.associateWith { "${it.title} ${it.sub} ${it.album}".lowercase() }
+            }
+            val words = filter.lowercase().split(' ').filter { it.isNotBlank() }
+            var v = if (words.isEmpty()) items else items.filter { t -> val hay = index[t].orEmpty(); words.all { hay.contains(it) } }
+            v = when (sort) {
+                "added" -> v.sortedByDescending { it.added }
+                "title" -> v.sortedBy { it.title.lowercase() }
+                "artist" -> v.sortedWith(compareBy({ it.sub.lowercase() }, { it.album.lowercase() }, { it.order }))
+                "album" -> v.sortedWith(compareBy({ it.album.lowercase() }, { it.order }))
+                "length" -> v.sortedBy { it.durationMs }
+                else -> v
+            }
+            viewCache = v; viewKey = k
+            return v
+        }
+    }
     private val pages = mutableListOf<Page>()
     var onSearch: (() -> Unit)? = null
     var onSignIn: (() -> Unit)? = null
 
+    private val sortNames = linkedMapOf("added" to "Recently added", "title" to "Title", "artist" to "Artist", "album" to "Album", "length" to "Length", "custom" to "List order")
+
     private fun libItem(id: String): Web.Item? {
         val i = id.removePrefix("lib:").toIntOrNull() ?: return null
-        return pages.lastOrNull()?.items?.getOrNull(i)
+        return pages.lastOrNull()?.view()?.getOrNull(i)
     }
 
-    private fun load(p: Page, f: () -> List<Web.Item>) {
-        kotlin.concurrent.thread { val r = runCatching(f).getOrDefault(emptyList()); post { p.items = r; p.loading = false; invalidate() } }
+    // ---- lists kept on the phone, so the library opens instantly where you left it ----
+
+    private fun cacheFile(uri: String) = java.io.File(context.cacheDir, "lists/" + uri.replace(Regex("[^A-Za-z0-9]"), "_") + ".json")
+
+    private fun saveList(uri: String, items: List<Web.Item>) {
+        val a = org.json.JSONArray()
+        items.forEach { a.put(org.json.JSONArray().put(it.uri).put(it.title).put(it.sub).put(it.kind).put(it.id).put(it.album).put(it.durationMs).put(it.added).put(it.order)) }
+        runCatching { cacheFile(uri).also { it.parentFile?.mkdirs() }.writeText(a.toString()) }
+    }
+
+    private fun loadList(uri: String): List<Web.Item>? = runCatching {
+        val a = org.json.JSONArray(cacheFile(uri).readText())
+        (0 until a.length()).mapNotNull { a.optJSONArray(it) }.map {
+            Web.Item(it.optString(0), it.optString(1), it.optString(2), it.optString(3), it.optString(4), it.optString(5), it.optLong(6), it.optLong(7), it.optInt(8))
+        }
+    }.getOrNull()
+
+    private fun load(p: Page, key: String?, f: () -> List<Web.Item>) {
+        // the copy from last time straight away, then Spotify's newest in the background
+        key?.let { k -> loadList(k)?.let { if (it.isNotEmpty()) { p.items = it; p.loading = true } } }
+        kotlin.concurrent.thread {
+            val r = runCatching(f).getOrDefault(emptyList())
+            post {
+                if (r.isNotEmpty() || p.items.isEmpty()) p.items = r
+                p.loading = false
+                if (key != null && r.isNotEmpty()) kotlin.concurrent.thread { saveList(key, r) }
+                invalidate()
+            }
+        }
     }
 
     /** Opens a list (or search results) on top of the library. */
     fun openPage(title: String, list: Web.Item?, f: () -> List<Web.Item>) {
-        val p = Page(title, list)
+        pages.lastOrNull()?.scroll = scroll
+        val saved = list?.let { libPrefs.getString("sort:" + it.uri, null) }
+        val p = Page(title, list, sort = saved ?: if (list?.kind == "album" || list == null) "custom" else "added")
         pages += p
         scroll = 0f
         tab = Tab.LIBRARY
-        load(p, f)
+        load(p, list?.uri?.takeIf { list.kind != "search" }, f)
+        saveLibrary()
     }
 
     fun search(q: String) = openPage("Search: $q", null) { Web.search(q) }
+
+    private val libPrefs get() = context.getSharedPreferences("library", 0)
+
+    /** Which list is open (and how it's sorted / searched), saved for next time. */
+    private fun saveLibrary() {
+        val top = pages.lastOrNull()
+        val e = libPrefs.edit()
+        val open = pages.drop(1).lastOrNull { it.list != null }
+        if (open?.list != null) {
+            val l = open.list
+            e.putString("open", org.json.JSONArray().put(l.uri).put(l.title).put(l.kind).put(l.id).toString())
+            e.putString("open_filter", open.filter)
+            e.putFloat("open_scroll", if (top === open && tab == Tab.LIBRARY) scroll else open.scroll)
+        } else e.remove("open")
+        pages.firstOrNull()?.let { e.putString("top_sort", it.sort).putString("top_filter", it.filter) }
+        e.apply()
+    }
+
+    private fun restoreLibrary() {
+        val top = Page("Library", null, sort = libPrefs.getString("top_sort", "custom") ?: "custom", filter = libPrefs.getString("top_filter", "") ?: "")
+        pages += top
+        load(top, "library") { Web.playlists() }
+        val o = libPrefs.getString("open", null)?.let { runCatching { org.json.JSONArray(it) }.getOrNull() } ?: return
+        val item = Web.Item(o.optString(0), o.optString(1), "", o.optString(2), o.optString(3))
+        val p = Page(item.title, item, sort = libPrefs.getString("sort:" + item.uri, null) ?: if (item.kind == "album") "custom" else "added",
+            filter = libPrefs.getString("open_filter", "") ?: "", scroll = libPrefs.getFloat("open_scroll", 0f))
+        pages += p
+        if (tab == Tab.LIBRARY) scroll = p.scroll
+        load(p, item.uri) { Web.tracks(item) }
+    }
 
     private fun drawLibrary(cv: Canvas) {
         if (!Web.signedIn) {
@@ -681,15 +987,46 @@ class PlayerView(ctx: Context) : View(ctx) {
             ), "", valueRight = false)
             return
         }
-        if (pages.isEmpty()) { pages += Page("Library", null); load(pages[0]) { Web.playlists() } }
+        if (pages.isEmpty()) restoreLibrary()
         val p = pages.last()
-        val top = header(cv, p.title, if (p.loading) "Loading..." else if (pages.size > 1) "< Back" else Web.userName())
+        val v = p.view()
+        val sub = when {
+            p.loading && p.items.isEmpty() -> "Loading..."
+            pages.size > 1 -> "< Back" + if (p.loading) " · updating..." else ""
+            else -> Web.userName()
+        }
+        var top = header(cv, p.title, sub)
         if (pages.size > 1) hit(0f, contentTop, width.toFloat(), top, "libback")
+        // tools: sort + search in this list
+        val th = 20 * u
+        val sortLabel = "Sort: " + (if (p.list == null && pages.size == 1) (if (p.sort == "title") "A-Z" else "Recent") else sortNames[p.sort] ?: "List order")
+        val findLabel = if (p.filter.isEmpty()) "Find in list" else "\"${p.filter}\" · ${v.size}  x"
+        val sw = tw(sortLabel, u) + 12 * u
+        nine(cv, "list_bg", pad, top, sw, th, u, 4)
+        txt(cv, sortLabel, pad + 6 * u, top + 5 * u, u, cList)
+        hit(pad, top, pad + sw, top + th, "libsort")
+        val fx = pad + sw + 4 * u
+        val fw = width - pad - fx
+        nine(cv, "list_bg", fx, top, fw, th, u, 4)
+        txt(cv, fit(findLabel, fw - 12 * u, u), fx + 6 * u, top + 5 * u, u, if (p.filter.isEmpty()) cDim else cTitle)
+        hit(fx, top, fx + fw, top + th, if (p.filter.isEmpty()) "libfind" else "libfindclear")
+        top += th + 4 * u
         val rows = mutableListOf<Triple<String, String, String>>()
-        if (pages.size == 1) rows += Triple("Search", "songs, artists, albums, playlists", "libsearch")
-        if (p.list != null && p.items.isNotEmpty()) rows += Triple("Play all", "${p.items.size} songs", "libplayall")
-        p.items.forEachIndexed { i, it -> rows += Triple(it.title, it.sub, "lib:$i") }
-        drawRows(cv, top, rows, if (p.loading) "" else "Nothing here.", valueRight = false)
+        if (pages.size == 1) rows += Triple("Search Spotify", "songs, artists, albums, playlists", "libsearch")
+        if (p.list != null && v.isNotEmpty()) {
+            val how = if (Smart.on && Smart.shuffled || Player.state.shuffle) "SpoX shuffle" else "in this order"
+            rows += Triple("Play all", "${v.size} songs · $how", "libplayall")
+        }
+        v.forEachIndexed { i, it ->
+            val extra = if (it.kind == "track" && p.sort == "added" && it.added > 0) " · " + ago(it.added) else if (it.kind == "track" && p.sort == "album" && it.album.isNotEmpty()) " · " + it.album else ""
+            rows += Triple(it.title, it.sub + extra, "lib:$i")
+        }
+        drawRows(cv, top, rows, if (p.loading) "" else if (p.filter.isNotEmpty()) "Nothing matches \"${p.filter}\"." else "Nothing here.", valueRight = false)
+    }
+
+    private fun ago(t: Long): String {
+        val d = (System.currentTimeMillis() - t) / 86_400_000L
+        return when { d < 1 -> "today"; d < 2 -> "yesterday"; d < 31 -> "${d}d ago"; d < 365 -> "${d / 30}mo ago"; else -> "${d / 365}y ago" }
     }
 
     private fun libTap(id: String) {
@@ -698,16 +1035,30 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "libsignin" -> onSignIn?.invoke()
             id == "libsearch" -> onSearch?.invoke()
             id == "libback" -> back()
-            id == "libplayall" -> p.list?.let { l -> val uris = p.items.map { it.uri }; kotlin.concurrent.thread { if (!Web.playIn(l.uri, null, uris)) Player.playUri(l.uri) } }
-            id.startsWith("qlib:") -> libItem(id.drop(1))?.let { Player.addToQueue(it.uri); android.widget.Toast.makeText(context, "Added to queue: ${it.title}", android.widget.Toast.LENGTH_SHORT).show() }
+            id == "libsort" -> {
+                val opts = if (p.list == null && pages.size == 1) linkedMapOf("custom" to "Recent (like Spotify)", "title" to "A-Z")
+                    else if (p.list == null) linkedMapOf("custom" to "Best match", "title" to "Title")
+                    else sortNames
+                show(Sheet("Sort by", emptyList(), opts.map { (k, l) ->
+                    SheetItem(l, "", k == p.sort) {
+                        p.sort = k
+                        p.list?.let { libPrefs.edit().putString("sort:" + it.uri, k).apply() }
+                        scroll = 0f
+                        saveLibrary()
+                    }
+                }))
+            }
+            id == "libfind" -> ask("Find in ${p.title}", "title, artist or album", p.filter) { q -> p.filter = q.trim(); scroll = 0f; saveLibrary() }
+            id == "libfindclear" -> { p.filter = ""; scroll = 0f; saveLibrary() }
+            id == "libplayall" -> p.list?.let { l -> playFrom(p, l, null) }
+            id.startsWith("qlib:") -> libItem(id.drop(1))?.let { Player.addToQueue(it.uri, it.title, it.sub); say("Added to queue: ${it.title}") }
             id.startsWith("lib:") -> libItem(id)?.let { item ->
                 when (item.kind) {
                     "playlist", "liked", "album" -> openPage(item.title, item) { Web.tracks(item) }
                     "artist" -> Player.playUri(item.uri)
                     else -> {
-                        val ctxUri = p.list?.uri
-                        val uris = p.items.filter { it.kind == "track" }.map { it.uri }
-                        kotlin.concurrent.thread { if (ctxUri == null || !Web.playIn(ctxUri, item.uri, uris)) Player.playUri(item.uri) }
+                        val l = p.list
+                        if (l == null) { kotlin.concurrent.thread { Player.playUri(item.uri) } } else playFrom(p, l, item.uri)
                         tab = Tab.PLAYER
                     }
                 }
@@ -715,42 +1066,101 @@ class PlayerView(ctx: Context) : View(ctx) {
         }
     }
 
+    /**
+     * Play a list from a song. Shuffle on: SpoX shuffle (starting with that song). Off: the list
+     * in the order you see it (your sort and search), like Spotify does with its own sorting.
+     */
+    private fun playFrom(p: Page, l: Web.Item, first: String?) {
+        val songs = p.view().filter { it.kind == "track" }
+        val shuffle = (Smart.on && Smart.shuffled) || Player.state.shuffle
+        val plain = !shuffle && p.sort == "custom" && p.filter.isEmpty() && l.kind != "liked"
+        if (shuffle && Web.signedIn) {
+            Smart.start(context, l, p.items.filter { it.kind == "track" }, first, true)
+        } else if (plain) {
+            // the list's own order: Spotify plays the list itself (shows as "playing from" it everywhere)
+            if (Smart.on) Smart.stop()
+            kotlin.concurrent.thread { if (!Web.playIn(l.uri, first ?: songs.firstOrNull()?.uri)) Player.playUri(l.uri) }
+        } else {
+            Smart.start(context, l, songs, first ?: songs.firstOrNull()?.uri, false)
+        }
+        if (first == null) tab = Tab.PLAYER
+    }
+
     // ---- like + share (player header) -----------------------------------------------------
 
     private var liked: Boolean? = null
     private var likedFor = ""
+    private var likedAt = 0L
+    @Volatile private var likeBusy = false
+    private var likeWant: Boolean? = null
     private fun trackId() = Player.engineTrackUri()?.substringAfterLast(':').orEmpty()
+
+    /** Asks Spotify when the song changes, and again every 30 s (you may like it on another device). */
     private fun checkLiked() {
         val id = trackId()
-        if (id.isEmpty() || id == likedFor) return
+        val now = SystemClock.elapsedRealtime()
+        if (id.isEmpty() || likeBusy || (id == likedFor && now - likedAt < 30_000)) return
+        if (id != likedFor) liked = null
         likedFor = id
-        liked = null
-        kotlin.concurrent.thread { val r = Web.isLiked(id); post { if (likedFor == id) { liked = r; invalidate() } } }
+        likedAt = now
+        kotlin.concurrent.thread { val r = Web.isLiked(id); post { if (likedFor == id && !likeBusy && r != null) { liked = r; invalidate() } } }
     }
 
-    var onDevices: (() -> Unit)? = null
-
-    private fun togglePlaylist() {
-        val ctxUri = io.github.oatomh.spox.engine.Engine.get(context).now.contextUri
-        val uri = Player.engineTrackUri() ?: return
-        val inPl = Web.inPlaylist(ctxUri, uri) ?: return
-        val name = io.github.oatomh.spox.engine.Engine.get(context).now.contextName.ifEmpty { "the playlist" }
-        kotlin.concurrent.thread {
-            val ok = if (inPl) Web.removeFrom(ctxUri, uri) else Web.addTo(ctxUri, uri)
-            post {
-                android.widget.Toast.makeText(context, if (!ok) "Couldn't change $name (is it yours?)" else if (inPl) "Removed from $name" else "Added to $name", android.widget.Toast.LENGTH_SHORT).show()
-                invalidate()
-            }
-        }
-    }
-
+    /** Flips at once; taps while Spotify is still answering are kept (the last one wins). */
     private fun toggleLike() {
         val id = trackId()
         if (id.isEmpty()) return
         val on = liked != true
         liked = on
-        kotlin.concurrent.thread { if (!Web.setLiked(id, on)) post { liked = !on; invalidate() } }
+        likeWant = on
+        if (likeBusy) return
+        likeBusy = true
+        kotlin.concurrent.thread {
+            var sent: Boolean? = null
+            var ok = true
+            while (likeWant != sent) {
+                val want = likeWant ?: break
+                ok = Web.setLiked(id, want)
+                sent = want
+                if (!ok) break
+            }
+            post {
+                likeBusy = false
+                likedAt = SystemClock.elapsedRealtime()
+                if (!ok) {
+                    liked = sent != true
+                    toast("Couldn't change Liked Songs (sign in again in Settings?)")
+                } else toast(if (sent == true) "Saved to Liked Songs" else "Removed from Liked Songs")
+                invalidate()
+            }
+        }
     }
+
+    var onDevices: (() -> Unit)? = null
+
+    /** The playlist + / - works on: SpoX shuffle's list, else the one playing. */
+    private fun plusList(): String = Smart.listUri.takeIf { Smart.on && it.startsWith("spotify:playlist:") }
+        ?: io.github.oatomh.spox.engine.Engine.get(context).now.contextUri
+
+    private fun togglePlaylist() {
+        val ctxUri = plusList()
+        val uri = Player.engineTrackUri() ?: return
+        val inPl = Web.inPlaylist(ctxUri, uri) ?: return
+        val name = (if (Smart.on) Smart.listName else io.github.oatomh.spox.engine.Engine.get(context).now.contextName).ifEmpty { "the playlist" }
+        // the button flips straight away; put back if Spotify says no
+        Web.markInPlaylist(ctxUri, uri, !inPl)
+        invalidate()
+        kotlin.concurrent.thread {
+            val ok = if (inPl) Web.removeFrom(ctxUri, uri) else Web.addTo(ctxUri, uri)
+            post {
+                if (!ok) Web.markInPlaylist(ctxUri, uri, inPl)
+                toast(if (!ok) "Couldn't change $name (is it yours?)" else if (inPl) "Removed from $name" else "Added to $name")
+                invalidate()
+            }
+        }
+    }
+
+    private fun toast(t: String) = say(t)
 
     private fun share() {
         val uri = Player.engineTrackUri() ?: return
@@ -765,6 +1175,299 @@ class PlayerView(ctx: Context) : View(ctx) {
     private fun drawSettings(cv: Canvas) {
         val top = header(cv, "Settings")
         drawRows(cv, top, settingsRows().map { (l, v) -> Triple(l, v, "set:$l") }, "", valueRight = true)
+    }
+
+    // ---- SpoX's own pop-ups (instead of Android's dialogs) -----------------------------------
+
+    class SheetItem(val label: String, val value: String = "", val checked: Boolean = false, val run: () -> Unit)
+    class SheetInput(val hint: String, var text: String, val password: Boolean = false, val done: (String) -> Unit)
+    class Sheet(val title: String, val lines: List<String> = emptyList(), val items: List<SheetItem> = emptyList(),
+                val input: SheetInput? = null, val buttons: List<SheetItem> = emptyList())
+
+    private var sheet: Sheet? = null
+    private var sheetScroll = 0f
+    private var sheetMax = 0f
+    private var sheetListRect = RectF()
+    private var composing = ""
+
+    fun show(s: Sheet) {
+        sheet = s
+        sheetScroll = 0f
+        composing = ""
+        val imm = context.getSystemService(InputMethodManager::class.java)
+        if (s.input != null) {
+            requestFocus()
+            imm.restartInput(this)
+            post { imm.showSoftInput(this, 0) }
+        } else imm.hideSoftInputFromWindow(windowToken, 0)
+        invalidate()
+    }
+
+    fun closeSheet() {
+        if (sheet?.input != null) context.getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(windowToken, 0)
+        sheet = null
+        invalidate()
+    }
+
+    /** A question with buttons. */
+    fun confirm(title: String, text: String, yes: String, no: String = "Cancel", onYes: () -> Unit) =
+        show(Sheet(title, wrapText(text), buttons = listOf(SheetItem(no) {}, SheetItem(yes, run = onYes))))
+
+    /** A text box (search, keys...). */
+    fun ask(title: String, hint: String, initial: String = "", password: Boolean = false, message: String = "", ok: String = "OK", done: (String) -> Unit) {
+        val inp = SheetInput(hint, initial, password, done)
+        show(Sheet(title, if (message.isEmpty()) emptyList() else wrapText(message), input = inp,
+            buttons = listOf(SheetItem("Cancel") {}, SheetItem(ok) { done(inp.text + composing) })))
+    }
+
+    private fun wrapText(t: String): List<String> {
+        val maxW = width - 4 * pad - 8 * u
+        val out = ArrayList<String>()
+        for (para in t.split('\n')) {
+            var line = ""
+            for (w in para.split(' ')) {
+                val tryL = if (line.isEmpty()) w else "$line $w"
+                if (maxW > 0 && tw(tryL, u) > maxW && line.isNotEmpty()) { out += line; line = w } else line = tryL
+            }
+            out += line
+        }
+        return out
+    }
+
+    private fun sheetDone() {
+        val inp = sheet?.input ?: return
+        val text = inp.text + composing
+        closeSheet()
+        inp.done(text)
+    }
+
+    private fun drawSheet(cv: Canvas, sh: Sheet, now: Long) {
+        hits.clear()
+        // the rest of the screen dims; tapping it closes the pop-up
+        box(cv, 0f, 0f, width.toFloat(), height.toFloat(), Color.argb(170, 0, 0, 0))
+        hit(0f, 0f, width.toFloat(), height.toFloat(), "sheet:out")
+        val x = pad
+        val w = width - 2 * pad
+        val rh = 24 * u
+        val bh = 22 * u
+        val inner = 6 * u
+        val bottomLimit = height - max(insetBottom, imeBottom) - 8 * u
+        val titleH = 12 * tu + 2 * u
+        val linesH = sh.lines.size * 12f * u + if (sh.lines.isNotEmpty()) 4 * u else 0f
+        val inputH = if (sh.input != null) 24 * u + 6 * u else 0f
+        val btnH = if (sh.buttons.isNotEmpty()) bh + 6 * u else 0f
+        val listFull = sh.items.size * rh
+        val room = bottomLimit - (insetTop + 24 * u) - titleH - linesH - inputH - btnH - 2 * inner
+        val listH = min(listFull, max(rh * 2, room))
+        val h = titleH + linesH + inputH + listH + btnH + 2 * inner
+        val y0 = floor((bottomLimit - h) / u) * u
+        nine(cv, "list_bg", x, y0, w, h, u, 4)
+        hit(x, y0, x + w, y0 + h, "sheet:in")
+        var y = y0 + inner
+        txt(cv, fit(sh.title, w - 2 * inner, tu), x + inner, y, tu, cHeader)
+        y += titleH
+        for (l in sh.lines) { txt(cv, fit(l, w - 2 * inner, u), x + inner, y, u, cList); y += 12 * u }
+        if (sh.lines.isNotEmpty()) y += 4 * u
+        sh.input?.let { inp ->
+            val ih = 24 * u
+            box(cv, x + inner, y, w - 2 * inner, ih, cTitle)
+            box(cv, x + inner + u, y + u, w - 2 * inner - 2 * u, ih - 2 * u, skin.color("input_bg", cBg))
+            val raw = inp.text + composing
+            val shown = if (inp.password) "*".repeat(raw.length) else raw
+            val tx = x + inner + 5 * u
+            val maxW = w - 2 * inner - 14 * u
+            if (shown.isEmpty()) txt(cv, inp.hint, tx, y + 7 * u, u, cDim)
+            else {
+                // keep the end (where you type) in view
+                var t = shown
+                while (t.isNotEmpty() && tw(t, u) > maxW) t = t.drop(1)
+                txt(cv, t, tx, y + 7 * u, u, cList)
+            }
+            val cx = tx + if (shown.isEmpty()) 0f else min(maxW, tw(shown, u)) + u
+            if ((now / 500) % 2 == 0L) box(cv, cx, y + 6 * u, u, 12 * u, cTitle)
+            animating = true
+            hit(x + inner, y, x + w - inner, y + ih, "sheet:input")
+            y += ih + 6 * u
+        }
+        if (sh.items.isNotEmpty()) {
+            sheetListRect = RectF(x, y, x + w, y + listH)
+            sheetMax = max(0f, listFull - listH)
+            sheetScroll = sheetScroll.coerceIn(0f, sheetMax)
+            cv.save()
+            cv.clipRect(x, y, x + w, y + listH)
+            for ((i, it) in sh.items.withIndex()) {
+                val ry = y + i * rh - sheetScroll
+                if (ry + rh < y || ry > y + listH) continue
+                val id = "sheet:item:$i"
+                if (pressed == id) box(cv, x + u, ry, w - 2 * u, rh, cLine)
+                val vw = if (it.value.isEmpty()) 0f else tw(it.value, u) + 6 * u
+                if (it.checked) drawIcon(cv, ICON_CHECK, x + inner, ry + 9 * u, u, cTitle)
+                val lx = x + inner + 12 * u
+                txt(cv, fit(it.label, w - 2 * inner - 12 * u - vw, u), lx, ry + 7 * u, u, if (it.checked) cTitle else cList)
+                if (it.value.isNotEmpty()) txt(cv, it.value, x + w - inner - tw(it.value, u), ry + 7 * u, u, cDim)
+                if (i < sh.items.size - 1) box(cv, lx, ry + rh - max(1f, u / 2), w - inner - lx + x - inner, max(1f, u / 2), cLine)
+                hit(x, max(y, ry), x + w, min(y + listH, ry + rh), id)
+            }
+            cv.restore()
+            y += listH
+        } else sheetListRect = RectF()
+        if (sh.buttons.isNotEmpty()) {
+            y += 6 * u
+            val n = sh.buttons.size
+            val gap = 4 * u
+            val bw = (w - 2 * inner - (n - 1) * gap) / n
+            for ((i, b) in sh.buttons.withIndex()) {
+                val bx = x + inner + i * (bw + gap)
+                val id = "sheet:btn:$i"
+                val main = i == n - 1
+                box(cv, bx, y, bw, bh, if (main) cTitle else cLine)
+                if (pressed == id) box(cv, bx + u, y + u, bw - 2 * u, bh - 2 * u, cBg)
+                val lw = tw(b.label, u)
+                txt(cv, fit(b.label, bw - 4 * u, u), bx + max(2 * u, floor((bw - lw) / 2 / u) * u), y + 6 * u, u, if (main && pressed != id) cBg else cList)
+                hit(bx, y, bx + bw, y + bh, id)
+            }
+        }
+    }
+
+    private fun sheetTap(id: String) {
+        val sh = sheet ?: return
+        when {
+            id == "sheet:out" -> closeSheet()
+            id == "sheet:input" -> context.getSystemService(InputMethodManager::class.java).showSoftInput(this, 0)
+            id.startsWith("sheet:item:") -> {
+                val it = sh.items.getOrNull(id.removePrefix("sheet:item:").toInt()) ?: return
+                closeSheet(); it.run()
+            }
+            id.startsWith("sheet:btn:") -> {
+                val i = id.removePrefix("sheet:btn:").toInt()
+                val b = sh.buttons.getOrNull(i) ?: return
+                // the main button of a text box hands over what you typed
+                if (sh.input != null && i == sh.buttons.size - 1) sheetDone() else { closeSheet(); b.run() }
+            }
+        }
+    }
+
+    // typing into SpoX's own text box (the phone's keyboard, SpoX's pixel font)
+    override fun onCheckIsTextEditor() = sheet?.input != null
+
+    override fun onCreateInputConnection(out: EditorInfo): InputConnection? {
+        val inp = sheet?.input ?: return null
+        val variant = if (inp.password) android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD else android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        out.inputType = android.text.InputType.TYPE_CLASS_TEXT or variant
+        out.imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
+        return object : BaseInputConnection(this, false) {
+            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                inp.text += text?.toString().orEmpty().replace("\n", ""); composing = ""; invalidate(); return true
+            }
+            override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean { composing = text?.toString().orEmpty(); invalidate(); return true }
+            override fun finishComposingText(): Boolean { inp.text += composing; composing = ""; invalidate(); return true }
+            override fun deleteSurroundingText(before: Int, after: Int): Boolean {
+                if (composing.isNotEmpty()) composing = composing.dropLast(before) else inp.text = inp.text.dropLast(before)
+                invalidate(); return true
+            }
+            override fun getTextBeforeCursor(n: Int, flags: Int): CharSequence = (inp.text + composing).takeLast(n)
+            override fun getTextAfterCursor(n: Int, flags: Int): CharSequence = ""
+            override fun performEditorAction(actionCode: Int): Boolean { sheetDone(); return true }
+            override fun sendKeyEvent(e: KeyEvent): Boolean {
+                if (e.action == KeyEvent.ACTION_DOWN) when (e.keyCode) {
+                    KeyEvent.KEYCODE_DEL -> deleteSurroundingText(1, 0)
+                    KeyEvent.KEYCODE_ENTER -> sheetDone()
+                    else -> e.unicodeChar.takeIf { it > 0 }?.let { commitText(it.toChar().toString(), 1) }
+                }
+                return true
+            }
+        }
+    }
+
+    // ---- a SpoX message at the bottom (instead of Android's grey toast) ----------------------
+
+    private var osdText = ""
+    private var osdUntil = 0L
+
+    fun say(t: String) { osdText = t; osdUntil = SystemClock.elapsedRealtime() + 2200; invalidate() }
+
+    // ---- volume: SpoX's own pixel volume, like a handheld player (not the phone's slider) ----
+
+    private var volOsd = -1f
+    private var volOsdUntil = 0L
+
+    fun showVolume(f: Float) { vol = f; volAt = SystemClock.elapsedRealtime(); volOsd = f; volOsdUntil = volAt + 1400; invalidate() }
+
+    private fun drawVolumeOsd(cv: Canvas, now: Long) {
+        if (now < osdUntil && osdText.isNotEmpty()) {
+            val t = fit(osdText, width - 4 * pad, u)
+            val w = tw(t, u) + 16 * u
+            val h = 20 * u
+            val x = floor((width - w) / 2 / u) * u
+            val y = contentBottom - h - 8 * u
+            nine(cv, "list_bg", x, y, w, h, u, 4)
+            txt(cv, t, x + 8 * u, y + 5 * u, u, cTitle)
+            animating = true
+        }
+        if (now >= volOsdUntil || volOsd < 0) return
+        animating = true
+        val segs = 16
+        val sw = 5 * u
+        val gap = u
+        val barW = segs * (sw + gap) - gap
+        val w = barW + 40 * u
+        val h = 26 * u
+        val x = floor((width - w) / 2 / u) * u
+        val y = insetTop + 12 * u
+        nine(cv, "list_bg", x, y, w, h, u, 4)
+        drawIcon(cv, ICON_SPEAKER, x + 7 * u, y + 9 * u, u, cTitle)
+        val on = (volOsd * segs + 0.001f).toInt()
+        for (i in 0 until segs) {
+            // little steps that get taller, like an old MP3 player
+            val bh = (4 + i * 10 / segs) * u
+            box(cv, x + 20 * u + i * (sw + gap), y + 18 * u - bh, sw, bh, if (i < on) visCol(1f - i.toFloat() / segs) else cLine)
+        }
+        val pct = "${(volOsd * 100).roundToInt()}"
+        txt(cv, pct, x + w - 6 * u - tw(pct, u), y + 8 * u, u, cDim)
+    }
+
+    // ---- tiny pixel icons -------------------------------------------------------------------
+
+    private fun icon(kind: String): Array<String> = when (kind) {
+        "bt" -> ICON_BT
+        "car" -> ICON_CAR
+        "wired", "usb" -> ICON_HEAD
+        else -> ICON_PHONE
+    }
+
+    private fun drawIcon(cv: Canvas, g: Array<String>, x: Float, y: Float, k: Float, c: Int) {
+        for ((j, row) in g.withIndex()) for ((i, ch) in row.withIndex()) if (ch == 'X') box(cv, x + i * k, y + j * k, k, k, c)
+    }
+
+    companion object {
+        private val ICON_BT = arrayOf("...X...", "...XX..", ".X.X.X.", "..XXX..", "...X...", "..XXX..", ".X.X.X.", "...XX..", "...X...")
+        private val ICON_CAR = arrayOf("..XXXXX..", ".X.X.X.X.", "XXXXXXXXX", "X.XXXXX.X", "XXXXXXXXX", ".XX...XX.")
+        private val ICON_HEAD = arrayOf("..XXXXX..", ".X.....X.", "X.......X", "X.......X", "XX.....XX", "XXX...XXX", "XXX...XXX", ".X.....X.")
+        private val ICON_PHONE = arrayOf("XXXXX", "X...X", "X...X", "X...X", "X...X", "X.X.X", "XXXXX")
+        private val ICON_SPEAKER = arrayOf("...X....", "..XX..X.", "XXXX...X", "XXXX.X.X", "XXXX...X", "..XX..X.", "...X....")
+        val ICON_CHECK = arrayOf("......X", ".....X.", "X...X..", ".X.X...", "..X....")
+
+        /** The SpoX window on screen (for messages from the player and SpoX shuffle). */
+        @Volatile var current: PlayerView? = null
+
+        /** A SpoX message if the app is open, else Android's toast. */
+        fun say(ctx: Context, t: String) {
+            val v = current
+            if (v != null && v.isAttachedToWindow) v.post { v.say(t) }
+            else android.os.Handler(ctx.mainLooper).post { android.widget.Toast.makeText(ctx, t, android.widget.Toast.LENGTH_SHORT).show() }
+        }
+    }
+
+    /** Asks Spotify now and then which device plays, when it isn't this phone. */
+    private var otherName = ""
+    private var otherAt = 0L
+    private fun otherDevice(): String {
+        val now = SystemClock.elapsedRealtime()
+        if (Web.signedIn && now - otherAt > 15_000) {
+            otherAt = now
+            kotlin.concurrent.thread { val d = Web.activeDevice(); post { otherName = d?.name.orEmpty(); invalidate() } }
+        }
+        return otherName
     }
 
     // ---- touch ----------------------------------------------------------------------------
@@ -783,6 +1486,14 @@ class PlayerView(ctx: Context) : View(ctx) {
                 vt?.recycle(); vt = VelocityTracker.obtain().also { it.addMovement(e) }
                 downX = x; downY = y; lastY = y
                 fling = 0f
+                longFired = false
+                removeCallbacks(longPress)
+                if (sheet != null) {
+                    dragging = if (sheetListRect.contains(x, y)) "sheetlist" else null
+                    pressed = hitAt(x, y)
+                    invalidate()
+                    return true
+                }
                 val slop = 6 * u
                 dragging = when {
                     tab == Tab.PLAYER && access && RectF(seekRect.left, seekRect.top - slop, seekRect.right, seekRect.bottom + slop).contains(x, y) -> "seek"
@@ -793,11 +1504,21 @@ class PlayerView(ctx: Context) : View(ctx) {
                     else -> null
                 }
                 pressed = if (dragging == null || dragging == "list" || dragging == "art") hitAt(x, y) else null
+                // hold a song in Up next to pick it; hold shuffle for the new-songs mix
+                pressed?.takeIf { it.startsWith("qrow:") || it == "btn_shuffle" }?.let { postDelayed(longPress, 420) }
                 drag(x)
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
                 vt?.addMovement(e)
+                if (abs(x - downX) > 8 * u || abs(y - downY) > 8 * u) removeCallbacks(longPress)
+                if (dragging == "sheetlist") {
+                    sheetScroll = (sheetScroll - (y - lastY)).coerceIn(0f, sheetMax)
+                    lastY = y
+                    if (abs(y - downY) > 8 * u) pressed = null
+                    invalidate()
+                    return true
+                }
                 if (dragging == "list") {
                     scroll -= y - lastY
                     lastY = y
@@ -808,6 +1529,13 @@ class PlayerView(ctx: Context) : View(ctx) {
             }
             MotionEvent.ACTION_UP -> {
                 vt?.addMovement(e)
+                removeCallbacks(longPress)
+                if (longFired) {
+                    pressed = null; dragging = null; seekPreview = -1
+                    vt?.recycle(); vt = null
+                    invalidate()
+                    return true
+                }
                 if (dragging == "seek" && seekPreview >= 0) Player.seek(seekPreview)
                 if (dragging == "list") {
                     vt?.computeCurrentVelocity(1)
@@ -824,11 +1552,24 @@ class PlayerView(ctx: Context) : View(ctx) {
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPress)
                 pressed = null; dragging = null; seekPreview = -1
                 vt?.recycle(); vt = null
             }
         }
         return true
+    }
+
+    private var longFired = false
+    private val longPress = Runnable {
+        val p = pressed ?: return@Runnable
+        longFired = true
+        when {
+            p.startsWith("qrow:") -> queueLong(p)
+            p == "btn_shuffle" -> { performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); if (Web.signedIn) mixSheet() }
+        }
+        pressed = null
+        invalidate()
     }
 
     private fun drag(x: Float) {
@@ -837,6 +1578,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             "vol" -> {
                 vol = ((x - volRect.left) / volRect.width()).coerceIn(0f, 1f)
                 Player.setVolume(context, vol)
+                volAt = SystemClock.elapsedRealtime()
             }
         }
     }
@@ -846,9 +1588,11 @@ class PlayerView(ctx: Context) : View(ctx) {
     private fun press(id: String) {
         buzz()
         when {
+            id.startsWith("sheet:") -> { if (id != "sheet:in") sheetTap(id) }
+            id.startsWith("qrow:") -> queueTap(id)
+            id == "qcancel" || id == "qremove" || id == "qnext" || id == "qmix" -> queueAction(id)
             id.startsWith("tab:") -> tab = Tab.valueOf(id.removePrefix("tab:"))
             id.startsWith("set:") -> onSettingsAction?.invoke(id.removePrefix("set:"))
-            id.startsWith("queue:") -> id.removePrefix("queue:").toLongOrNull()?.let { Player.playQueueItem(it) }
             id == "btn_prev" || id == "mini_prev" -> Player.prev()
             id == "mini_next" -> Player.next()
             id == "btn_next" -> Player.next()
