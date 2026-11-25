@@ -13,8 +13,22 @@ fn ver(s: &str) -> Vec<u32> {
     s.trim_start_matches('v').split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect()
 }
 
+/// Where SpoX.exe lives, taken at start: once the swap renames the running exe to SpoX.exe.old,
+/// Windows reports that name for it, and "restart" would start the old version again.
+static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn exe() -> std::path::PathBuf {
+    EXE.get_or_init(|| {
+        let p = std::env::current_exe().unwrap_or_else(|_| exe_dir().join("SpoX.exe"));
+        // started from SpoX.exe.old (an older restart bug): the real one is SpoX.exe
+        if p.extension().map(|e| e == "old").unwrap_or(false) { p.with_extension("") } else { p }
+    })
+    .clone()
+}
+
 /// Leftover from the last update.
 pub fn cleanup() {
+    let _ = exe();
     let _ = std::fs::remove_file(exe_dir().join("SpoX.exe.old"));
     let _ = std::fs::remove_file(exe_dir().join("SpoX.exe.new"));
 }
@@ -39,7 +53,7 @@ fn check_once(ev: &Sender<Ev>) -> Option<String> {
     if bytes.len() < 1_000_000 || &bytes[..2] != b"MZ" {
         return None;
     }
-    let me = std::env::current_exe().ok()?;
+    let me = exe();
     let new = exe_dir().join("SpoX.exe.new");
     let old = exe_dir().join("SpoX.exe.old");
     std::fs::write(&new, &bytes).ok()?;
@@ -96,7 +110,5 @@ pub fn start(cfg: crate::config::Shared, ev: Sender<Ev>) {
 
 /// Start the new version and quit this one.
 pub fn restart() {
-    if let Ok(me) = std::env::current_exe() {
-        let _ = std::process::Command::new(me).arg("--after-install").current_dir(exe_dir()).spawn();
-    }
+    let _ = std::process::Command::new(exe()).arg("--after-install").current_dir(exe_dir()).spawn();
 }
