@@ -498,7 +498,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             val active = (b == "btn_shuffle" && st.shuffle) || (b == "btn_repeat" && st.repeat)
             val sprite = when {
                 pressed == b && skin.sprite("${b}_down") != null -> "${b}_down"
-                b == "btn_shuffle" && st.shuffle && Smart.on && Smart.shuffled && skin.sprite("btn_shuffle_smart") != null -> "btn_shuffle_smart"
+                b == "btn_shuffle" && Smart.mode(context) == "spox" && Player.fromEngine && skin.sprite("btn_shuffle_smart") != null -> "btn_shuffle_smart"
                 active && skin.sprite("${b}_on") != null -> "${b}_on"
                 active && skin.sprite("${b}_down") != null -> "${b}_down"
                 else -> b
@@ -735,14 +735,16 @@ class PlayerView(ctx: Context) : View(ctx) {
         txt(cv, "Up next", pad, y, tu, cHeader)
         val mode = when {
             Smart.busy.isNotEmpty() -> Smart.busy
-            Smart.on && Smart.shuffled -> "SpoX shuffle · ${Smart.ratio(context)}% new  v"
-            Smart.on -> "In order · ${Smart.listName}"
+            Smart.mode(context) == "spox" -> "SpoX shuffle · ${Smart.ratio(context)}% new  v"
+            Smart.mode(context) == "shuffle" -> "Shuffle"
+            Smart.on -> "In order"
             else -> ""
         }
         if (mode.isNotEmpty()) {
             val mw = tw(mode, u)
-            txt(cv, mode, width - pad - mw, y + 3 * u, u, if (Smart.on && Smart.shuffled) cTitle else cDim)
-            if (Smart.on && Smart.shuffled) hit(width - pad - mw - 8 * u, y - 4 * u, width.toFloat(), y + 16 * u, "qmix")
+            val spox = Smart.mode(context) == "spox"
+            txt(cv, mode, width - pad - mw, y + 3 * u, u, if (spox) cTitle else cDim)
+            if (spox) hit(width - pad - mw - 8 * u, y - 4 * u, width.toFloat(), y + 16 * u, "qmix")
         }
         y += 12 * tu
         if (selected.isNotEmpty()) {
@@ -1096,7 +1098,17 @@ class PlayerView(ctx: Context) : View(ctx) {
         } else if (!searching) {
             val sortLabel = sortLabel(p)
             val sw = tw(sortLabel, u) + 12 * u
-            val sx = width - pad - sw
+            // a Play button for the open list (plays it the way the shuffle button is set)
+            val playW = if (p.list != null && v.isNotEmpty()) th + 4 * u else 0f
+            if (playW > 0) {
+                val px = width - pad - th
+                box(cv, px, top, th, th, if (pressed == "libplayall") cList else cTitle)
+                // a pixel "play" triangle
+                val tx0 = px + 8 * u; val ty0 = top + 5 * u
+                for (i in 0 until 6) box(cv, tx0 + i * u, ty0 + i * u, u, (12 - 2 * i) * u, cBg)
+                hit(px, top, px + th, top + th, "libplayall")
+            }
+            val sx = width - pad - sw - playW
             nine(cv, "list_bg", sx, top, sw, th, u, 4)
             txt(cv, sortLabel, sx + 6 * u, top + 6 * u, u, if (pressed == "libsort") cTitle else cList)
             hit(sx, top, sx + sw, top + th, "libsort")
@@ -1112,12 +1124,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         }
         val rows = mutableListOf<Triple<String, String, String>>()
         if (pages.size == 1) rows += Triple("Your listening stats", "top artists, songs, time listened" + if (Stats.lastfmOn()) " · Last.fm on" else "", "libstats")
-        if (p.list != null && v.isNotEmpty()) {
-            // three ways to start the list, right here
-            rows += Triple("Play", "${v.size} songs in this order", "libplayall")
-            rows += Triple("Shuffle", "Spotify's shuffle", "libshuffle")
-            if (Web.signedIn) rows += Triple("SpoX shuffle", "your mix, ${Smart.ratio(context)}% new songs (hold to change)", "libspox")
-        }
+
         v.forEachIndexed { i, it ->
             if (it.kind == "header") { rows += Triple("#" + it.title, "", ""); return@forEachIndexed }
             val extra = if (it.kind == "track" && p.sort == "added" && it.added > 0) " · " + ago(it.added) else if (it.kind == "track" && p.sort == "album" && it.album.isNotEmpty()) " · " + it.album else ""
@@ -1185,9 +1192,7 @@ class PlayerView(ctx: Context) : View(ctx) {
                     }
                 }))
             }
-            id == "libplayall" -> p.list?.let { l -> playFrom(p, l, null, "order") }
-            id == "libshuffle" -> p.list?.let { l -> playFrom(p, l, null, "spotify") }
-            id == "libspox" -> p.list?.let { l -> playFrom(p, l, null, "spox") }
+            id == "libplayall" -> p.list?.let { l -> playFrom(p, l, null) }
             id.startsWith("qlib:") -> libItem(id.drop(1))?.let { Player.addToQueue(it.uri, it.title, it.sub); say("Added to queue: ${it.title}") }
             id.startsWith("lib:") -> libItem(id)?.let { item ->
                 when (item.kind) {
@@ -1216,33 +1221,17 @@ class PlayerView(ctx: Context) : View(ctx) {
      * Play a list from a song. Shuffle on: SpoX shuffle (starting with that song). Off: the list
      * in the order you see it (your sort and search), like Spotify does with its own sorting.
      */
-    private fun playFrom(p: Page, l: Web.Item, first: String?, how: String = "") {
+    private fun playFrom(p: Page, l: Web.Item, first: String?) {
         val songs = p.view().filter { it.kind == "track" }
-        // tapping a song keeps the mode you're in (the shuffle button): SpoX shuffle, Spotify's
-        // shuffle, or in order
-        val mode = how.ifEmpty { if (Smart.on && Smart.shuffled) "spox" else if (Player.state.shuffle) "spotify" else "order" }
-        val plain = mode == "order" && p.sort == "custom" && p.filter.isEmpty() && l.kind != "liked"
-        if (mode == "order" && Player.state.shuffle && !Smart.on) io.github.oatomh.spox.engine.Engine.get(context).command("set_shuffle", mapOf("enabled" to false))
-        if (mode == "spox" && Web.signedIn) {
-            Smart.start(context, l, p.items.filter { it.kind == "track" }, first, true)
-        } else if (mode == "spotify") {
-            // Spotify's own shuffle on the list
-            if (Smart.on) Smart.stop()
-            io.github.oatomh.spox.engine.Engine.get(context).command("set_shuffle", mapOf("enabled" to true))
-            kotlin.concurrent.thread {
-                val uris = if (l.kind == "liked") songs.map { it.uri } else emptyList()
-                val start = first ?: songs.randomOrNull()?.uri
-                if (!Web.playIn(l.uri.takeIf { l.kind != "liked" }, start, uris)) Player.playUri(l.uri)
-            }
-        } else if (plain) {
-            // the list's own order: Spotify plays the list itself (shows as "playing from" it everywhere)
-            if (Smart.on) Smart.stop()
-            kotlin.concurrent.thread { if (!Web.playIn(l.uri, first ?: songs.firstOrNull()?.uri)) Player.playUri(l.uri) }
-        } else {
-            Smart.start(context, l, songs, first ?: songs.firstOrNull()?.uri, false)
-        }
-        if (first == null) tab = Tab.PLAYER
+        // the shuffle button decides: SpoX shuffle, shuffle, or in the order you see
+        val mode = Smart.mode(context)
+        if (Web.signedIn && Player.fromEngine || Web.signedIn && io.github.oatomh.spox.engine.Engine.get(context).isLive) {
+            if (mode == "off") Smart.start(context, l, songs, first ?: songs.firstOrNull()?.uri, false)
+            else Smart.start(context, l, p.items.filter { it.kind == "track" }, first, true)
+        } else kotlin.concurrent.thread { if (!Web.playIn(l.uri.takeIf { l.kind != "liked" }, first ?: songs.firstOrNull()?.uri, songs.map { it.uri })) Player.playUri(l.uri) }
+        tab = Tab.PLAYER
     }
+
 
     // ---- like + share (player header) -----------------------------------------------------
 
@@ -1668,7 +1657,7 @@ class PlayerView(ctx: Context) : View(ctx) {
                 }
                 pressed = if (dragging == null || dragging == "list" || dragging == "art") hitAt(x, y) else null
                 // hold a song in Up next to pick it; hold shuffle for the new-songs mix
-                pressed?.takeIf { it.startsWith("qrow:") || it == "btn_shuffle" || it == "libspox" }?.let { postDelayed(longPress, 420) }
+                pressed?.takeIf { it.startsWith("qrow:") || it == "btn_shuffle" }?.let { postDelayed(longPress, 420) }
                 drag(x)
                 invalidate()
             }
@@ -1754,7 +1743,6 @@ class PlayerView(ctx: Context) : View(ctx) {
         longFired = true
         when {
             p.startsWith("qrow:") -> queueLong(p)
-            p == "libspox" -> { performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); mixSheet() }
             p == "btn_shuffle" -> { performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); if (Web.signedIn) mixSheet() }
         }
         pressed = null

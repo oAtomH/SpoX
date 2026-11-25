@@ -88,10 +88,22 @@ object Smart {
 
     fun ratio(ctx: Context) = ctx.getSharedPreferences("spox", 0).getInt("smart_ratio", 50).let { if (it in listOf(0, 25, 50, 75, 100)) it else 50 }
 
+    /**
+     * The shuffle button: "off" (in order), "shuffle" (fair shuffle, only your list) or "spox"
+     * (fair shuffle + new songs). A setting that sticks: it doesn't reset when you play something
+     * else, it's simply how the next list plays.
+     */
+    fun mode(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("shuffle_mode", "off").let { if (it == "shuffle" || it == "spox") it else "off" }
+    fun setMode(ctx: Context, m: String) { ctx.getSharedPreferences("spox", 0).edit().putString("shuffle_mode", m).apply(); changed() }
+    fun nextMode(m: String) = when (m) { "off" -> "shuffle"; "shuffle" -> "spox"; else -> "off" }
+
+    /** The new-songs share in use: only in SpoX mode. */
+    private fun share() = if (shuffled && mode(app) == "spox") ratio(app) else 0
+
     fun setRatio(ctx: Context, r: Int) {
         val old = ratio(ctx)
         ctx.getSharedPreferences("spox", 0).edit().putInt("smart_ratio", r).apply()
-        if (on && shuffled && r != old) thread {
+        if (on && shuffled && mode(ctx) == "spox" && r != old) thread {
             // re-plan what's ahead: Up next changes once, to the new mix
             synchronized(lock) {
                 val ahead = deck.subList(index + 1, deck.size).toList()
@@ -100,7 +112,6 @@ object Smart {
                 ahead.filter { it.kind == "list" }.reversed().forEach { e -> seeds.firstOrNull { it.uri == e.uri }?.let { bag.addFirst(it) } }
                 needNew = 0; acc = 0.0; dirty = true
             }
-            if (r > 0) repeat(3) { if (pool.size < 10) discoverNow(null) }
             work()
         }
         changed()
@@ -130,7 +141,7 @@ object Smart {
     /** Plan ahead, look for more new songs if they're short, save, tell the screen. */
     private fun work() {
         val hungry = plan()
-        if (shuffled && ratio(app) > 0 && (hungry || pool.size < 12)) discover(if (hungry) 3 else 1)
+        if (share() > 0 && (hungry || pool.size < 20)) discover()
         save()
         changed()
     }
@@ -185,7 +196,7 @@ object Smart {
             seeds = clean
             used.clear()
             clean.forEach { used += Web.key(it.title, it.sub) }
-            val r = ratio(ctx)
+            val r = if (shuffle && mode(ctx) == "spox") ratio(ctx) else 0
             var order: List<Web.Item> = if (shuffle) spread(clean) else clean
             var firstItem: Web.Item? = null
             first?.let { f ->
@@ -196,17 +207,12 @@ object Smart {
                 }
             }
             synchronized(lock) { bag.addAll(order) }
-            if (shuffle && r > 0) {
-                // a few new songs ready before it starts, so Up next is full straight away
-                busy = "Finding new songs..."
-                changed()
-                val want = if (r == 100) 10 else 4
-                val until = System.currentTimeMillis() + 6000
-                while (pool.size < want && System.currentTimeMillis() < until) discoverNow(clean.random().sub)
-            }
+            // new songs found for this list before: ready at once (more are found in the background)
+            loadFound(list.uri)
+            warmUntil = if (r > 0 && pool.size < 10) System.currentTimeMillis() + 10_000 else 0L
             val begin = synchronized(lock) {
-                // the start: the song you tapped, else the first of the plan
-                val t = firstItem ?: if (shuffle && r == 100) pick("") else bag.removeFirstOrNull()
+                // the start: the song you tapped, else the first of the plan (plays at once)
+                val t = firstItem ?: (if (r == 100) pick("") else null) ?: bag.removeFirstOrNull()
                 if (t != null) {
                     deck.add(Entry(t.uri, t.title, t.sub, if (t.uri in newUris) "new" else "list"))
                     index = deck.size - 1
@@ -219,7 +225,7 @@ object Smart {
             val at = if (first != null && deck.getOrNull(index)?.uri == first) positionMs else 0L
             sendWindow(at)
             work()
-            if (shuffle) toast(if (r == 0) "SpoX shuffle on" else "SpoX shuffle on · $r% new songs")
+            if (shuffle) toast(if (r == 0) "Shuffle on" else "SpoX shuffle on · $r% new songs")
         }
         return true
     }
@@ -372,7 +378,7 @@ object Smart {
      * songs are owed but none are found yet (planning waits for them, unless it runs low).
      */
     private fun plan(): Boolean = synchronized(lock) {
-        val r = if (shuffled) ratio(app) else 0
+        val r = share()
         var hungry = false
         while (deck.size - index - 1 < AHEAD) {
             if (r >= 100 || needNew > 0) {
@@ -383,9 +389,12 @@ object Smart {
                     continue
                 }
                 hungry = true
-                // only wait for new songs while there's plenty planned; else carry on without
-                if (deck.size - index - 1 >= 15) break
+                // the very first seconds of a list SpoX has no new songs for yet: plan a few
+                // songs, wait for the first new ones, then fill Up next in one go
+                if (System.currentTimeMillis() < warmUntil && deck.size - index - 1 >= 5) break
+                // no new song ready: carry on with the list, never wait (that was the slowness)
                 needNew = 0
+                if (r >= 100) { if (bag.isEmpty() && seeds.isEmpty()) break }
             }
             if (bag.isEmpty()) {
                 // played the whole list: a new round, shuffled, without the songs you just heard
@@ -401,6 +410,8 @@ object Smart {
                 while (acc >= 1.0) { needNew++; acc -= 1.0 }
             }
         }
+        // Spotify has a much shorter list than what's planned now: hand it over at the next song change
+        if (sent.isNotEmpty() && deck.size - index - 1 > sent.size - 1 - sent.indexOf(deck.getOrNull(index)?.uri) + 10 && sent.size < WIN_BACK + WIN_AHEAD) dirty = true
         hungry
     }
 
@@ -410,7 +421,7 @@ object Smart {
 
     /** Spotify's own autoplay picks in the queue: also used as new songs. */
     private fun harvest() {
-        if (!shuffled || ratio(app) == 0) return
+        if (share() == 0) return
         for (t in engine.now.queue) {
             if (!(t.provider.contains("autoplay") || t.provider.contains("recommend"))) continue
             if (!known(t.title, t.artist) && pool.none { it.uri == t.uri }) pool.addFirst(Web.Item(t.uri, t.title, t.artist, "track"))
@@ -442,19 +453,11 @@ object Smart {
 
     private fun enc(s: String) = java.net.URLEncoder.encode(s, "UTF-8")
 
-    /** Popular songs by artists SIMILAR to [artist] (Deezer's free "related artists"), shuffled. */
-    private fun similarSongs(artist: String): List<Pair<String, String>> {
+    /** Artists similar to [artist] (Deezer's free "related artists", no Spotify requests). */
+    private fun similarArtists(artist: String): List<String> {
         val id = json("https://api.deezer.com/search/artist?limit=1&q=${enc(artist)}")?.optJSONArray("data")?.optJSONObject(0)?.optLong("id") ?: return emptyList()
         val rel = json("https://api.deezer.com/artist/$id/related?limit=25")?.optJSONArray("data") ?: return emptyList()
-        val ids = (0 until rel.length()).mapNotNull { rel.optJSONObject(it)?.optLong("id") }.shuffled().take(5)
-        val out = mutableListOf<Pair<String, String>>()
-        for (r in ids) {
-            val top = json("https://api.deezer.com/artist/$r/top?limit=10")?.optJSONArray("data") ?: continue
-            // not always the biggest hit: any of an artist's top ten, two at most
-            val songs = (0 until top.length()).mapNotNull { top.optJSONObject(it) }.shuffled().take(2)
-            for (t in songs) out += t.optString("title") to t.optJSONObject("artist")?.optString("name").orEmpty()
-        }
-        return out.shuffled()
+        return (0 until rel.length()).mapNotNull { rel.optJSONObject(it)?.optString("name") }.filter { it.isNotEmpty() }.shuffled()
     }
 
     /** Like a radio: mostly the last list song of the plan (where new songs go next), sometimes what's playing or any list song. */
@@ -468,38 +471,63 @@ object Smart {
         a.split(", ").firstOrNull().orEmpty()
     }
 
-    /** Look for new songs on up to [jobs] threads at once (more while the plan is waiting for them). */
-    private fun discover(jobs: Int) {
-        while (finding.get() < jobs && pool.size < 30) {
-            finding.incrementAndGet()
-            thread(name = "spox-discover") {
-                try { discoverNow(null) } finally { finding.decrementAndGet() }
-                if (on && pool.isNotEmpty()) runCatching { plan(); save(); changed() }
+    @Volatile private var warmUntil = 0L
+
+    /** One worker looks for new songs (Spotify requests go through its slow background lane). */
+    private fun discover() {
+        if (!finding.compareAndSet(0, 1)) return
+        thread(name = "spox-discover") {
+            try { discoverNow(null) } finally { finding.set(0) }
+            if (on && pool.isNotEmpty()) runCatching {
+                val wasWarm = warmUntil > 0
+                if (pool.size >= 6) warmUntil = 0
+                plan()
+                // the first new songs arrived: hand Spotify the full plan at the next song change
+                if (wasWarm && warmUntil == 0L) synchronized(lock) { dirty = true }
+                save(); changed()
             }
         }
     }
 
+    /**
+     * Finds new songs: three artists similar to the seed (Deezer), then ONE Spotify search per
+     * artist that brings ten of their songs; up to three you don't know are kept per artist.
+     * (Before, every single song cost its own Spotify search: that ran into Spotify's limit.)
+     */
     private fun discoverNow(seed: String?) {
         val artist = seed?.split(", ")?.firstOrNull() ?: seedArtist()
         if (artist.isEmpty()) return
-        var added = 0
-        for ((title, a) in similarSongs(artist)) {
-            if (added >= 6) break
-            if (title.isEmpty() || known(title, a)) continue
-            val t = Web.get("/search?type=track&limit=3&q=" + enc("track:$title artist:$a"))?.optJSONObject("tracks")?.optJSONArray("items")?.let { Web.track(it.optJSONObject(0)) } ?: continue
-            if (known(t.title, t.sub) || pool.any { it.uri == t.uri } || t.uri in newUris) continue
-            pool.addLast(t)
-            added++
+        val found = ArrayList<Web.Item>()
+        for (a in similarArtists(artist).take(3).ifEmpty { listOf(artist) }) {
+            val r = Web.getBg("/search?type=track&limit=10&q=" + enc("artist:\"$a\""))?.optJSONObject("tracks")?.optJSONArray("items") ?: continue
+            val songs = (0 until r.length()).mapNotNull { Web.track(r.optJSONObject(it)) }
+                .filter { it.sub.split(", ").first().equals(a, true) && !known(it.title, it.sub) && pool.none { p -> p.uri == it.uri } && it.uri !in newUris }
+                .shuffled().take(3)
+            pool.addAll(songs)
+            found += songs
         }
-        if (added > 0) return
-        // nothing similar found: other songs by that artist
-        val off = (System.currentTimeMillis() / 1000 % 3) * 10
-        val r = Web.get("/search?type=track&limit=10&offset=$off&q=" + enc("artist:\"$artist\""))?.optJSONObject("tracks")?.optJSONArray("items") ?: return
-        for (i in 0 until r.length()) {
-            val t = Web.track(r.optJSONObject(i)) ?: continue
-            if (known(t.title, t.sub) || pool.any { it.uri == t.uri } || t.uri in newUris) continue
-            pool.addLast(t)
-            if (++added >= 3) break
+        if (found.isNotEmpty()) saveFound(found)
+    }
+
+    // new songs found for each list, kept on the phone: starting that list again is instant
+    private fun foundFile(list: String) = File(app.filesDir, "found/" + list.replace(Regex("[^A-Za-z0-9]"), "_") + ".json")
+
+    private fun loadFound(list: String) {
+        val a = runCatching { JSONArray(foundFile(list).readText()) }.getOrNull() ?: return
+        val items = (0 until a.length()).mapNotNull { a.optJSONArray(it) }.map { item(it) }.shuffled()
+        for (t in items) if (!known(t.title, t.sub) && pool.none { it.uri == t.uri }) pool.addLast(t)
+    }
+
+    private fun saveFound(add: List<Web.Item>) {
+        val list = listUri.ifEmpty { return }
+        val f = foundFile(list)
+        saver.execute {
+            runCatching {
+                val old = runCatching { JSONArray(f.readText()) }.getOrNull()?.let { a -> (0 until a.length()).mapNotNull { a.optJSONArray(it) }.map { item(it) } }.orEmpty()
+                val all = (old + add).distinctBy { it.uri }.takeLast(400)
+                f.parentFile?.mkdirs()
+                f.writeText(JSONArray().apply { all.forEach { put(JSONArray().put(it.uri).put(it.title).put(it.sub)) } }.toString())
+            }
         }
     }
 

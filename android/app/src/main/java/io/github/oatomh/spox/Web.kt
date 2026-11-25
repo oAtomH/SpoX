@@ -125,26 +125,76 @@ object Web {
 
     // ---- requests (call these off the main thread) ------------------------------------------
 
-    fun get(path: String): JSONObject? = runCatching {
-        val t = token() ?: return null
-        val c = URL(if (path.startsWith("http")) path else API + path).openConnection() as HttpURLConnection
-        c.setRequestProperty("Authorization", "Bearer $t")
-        c.connectTimeout = 10000; c.readTimeout = 15000
-        if (c.responseCode !in 200..299) null else c.inputStream.bufferedReader().readText().let { if (it.isBlank()) JSONObject() else if (it.trim().startsWith("[")) JSONObject().put("list", JSONArray(it)) else JSONObject(it) }
-    }.getOrNull()
+    // ---- Spotify's request limit ---------------------------------------------------------------
+    // Spotify answers "429: too many requests, wait N s" when an app asks too much (SpoX on the PC
+    // and on the phone share one limit). Then EVERY request fails for a while, also "play". So:
+    // after a 429 nothing is sent until the wait is over; background work (finding new songs)
+    // goes one request at a time, spaced out, and gives way to everything you press.
 
-    fun send(method: String, path: String, body: JSONObject? = null): Boolean = runCatching {
-        val t = token() ?: return false
-        val c = URL(API + path).openConnection() as HttpURLConnection
+    @Volatile private var coolUntil = 0L
+    private val bgLock = Any()
+    @Volatile private var lastBg = 0L
+    /** For the engine report / Settings: when Spotify last asked SpoX to slow down. */
+    @Volatile var lastLimit = ""
+
+    private fun cooling() = System.currentTimeMillis() < coolUntil
+
+    private fun limited(c: HttpURLConnection) {
+        val wait = c.getHeaderField("Retry-After")?.toLongOrNull()?.coerceIn(2, 600) ?: 5
+        coolUntil = maxOf(coolUntil, System.currentTimeMillis() + wait * 1000)
+        lastLimit = "Spotify asked to wait ${wait}s at " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())
+    }
+
+    /** Waits out a cool-down (up to [maxMs]) before something you pressed. */
+    private fun waitCool(maxMs: Long = 30_000) {
+        val until = minOf(coolUntil, System.currentTimeMillis() + maxMs)
+        while (System.currentTimeMillis() < until) Thread.sleep(250)
+    }
+
+    private fun raw(method: String, path: String, body: JSONObject?): Pair<Int, String> {
+        val t = token() ?: return -1 to ""
+        val c = URL(if (path.startsWith("http")) path else API + path).openConnection() as HttpURLConnection
         c.requestMethod = method
         c.setRequestProperty("Authorization", "Bearer $t")
+        c.connectTimeout = 10000; c.readTimeout = 15000
         if (body != null) {
             c.doOutput = true
             c.setRequestProperty("Content-Type", "application/json")
             c.outputStream.write(body.toString().toByteArray())
         } else if (method == "PUT" || method == "POST") { c.doOutput = true; c.setFixedLengthStreamingMode(0) }
-        c.responseCode in 200..299
+        val code = c.responseCode
+        if (code == 429) limited(c)
+        val text = if (code in 200..299) c.inputStream.bufferedReader().readText() else ""
+        return code to text
+    }
+
+    private fun parse(text: String): JSONObject =
+        if (text.isBlank()) JSONObject() else if (text.trim().startsWith("[")) JSONObject().put("list", JSONArray(text)) else JSONObject(text)
+
+    /** Something you asked for: waits out a cool-down, and tries once more after a 429. */
+    fun get(path: String): JSONObject? = runCatching {
+        waitCool()
+        var r = raw("GET", path, null)
+        if (r.first == 429) { waitCool(); r = raw("GET", path, null) }
+        if (r.first in 200..299) parse(r.second) else null
+    }.getOrNull()
+
+    fun send(method: String, path: String, body: JSONObject? = null): Boolean = runCatching {
+        waitCool()
+        var r = raw(method, path, body)
+        if (r.first == 429) { waitCool(); r = raw(method, path, body) }
+        r.first in 200..299
     }.getOrDefault(false)
+
+    /** Background work (finding new songs): one at a time, at least 1.5 s apart, and nothing at
+     *  all while Spotify asks to slow down (it just tries later). */
+    fun getBg(path: String): JSONObject? = synchronized(bgLock) {
+        if (cooling()) return null
+        val gap = 1500 - (System.currentTimeMillis() - lastBg)
+        if (gap > 0) Thread.sleep(gap)
+        lastBg = System.currentTimeMillis()
+        runCatching { val r = raw("GET", path, null); if (r.first in 200..299) parse(r.second) else null }.getOrNull()
+    }
 
     private fun artists(t: JSONObject) = t.optJSONArray("artists")?.let { a -> (0 until a.length()).joinToString(", ") { a.optJSONObject(it)?.optString("name").orEmpty() } }.orEmpty()
 
