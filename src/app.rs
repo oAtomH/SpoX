@@ -866,6 +866,23 @@ impl App {
     }
 
     fn play_playlist(&mut self, p: &Playlist) {
+        // lists always play through SpoX's own queue (shuffle, SpoX shuffle or in order)
+        if self.signed_in && !p.uri.is_empty() {
+            if let Some(sm) = &self.smart {
+                let same = self.sel.as_ref().map(|s| s.uri == p.uri).unwrap_or(false) && self.tracks_listable;
+                let (tracks, order) = if same { (self.tracks_all.clone(), self.tracks.clone()) } else { (Vec::new(), Vec::new()) };
+                let _ = sm.send(crate::smart::Cmd::Start {
+                    playlist: p.clone(),
+                    tracks,
+                    order,
+                    first: None,
+                    shuffle: self.shuffle_mode() != "off",
+                    position: 0,
+                });
+                self.osd(format!("PLAYING {}", p.name.to_uppercase()));
+                return;
+            }
+        }
         if self.smart_on {
             self.stop_smart();
         }

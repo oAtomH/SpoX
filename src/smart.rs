@@ -211,6 +211,18 @@ struct Entry {
     kind: String,
 }
 
+/// SpoX shuffle's own log (what it played and why), next to web.log.
+fn slog(line: &str) {
+    use std::io::Write as _;
+    let p = config::cache_dir().join("shuffle.log");
+    if std::fs::metadata(&p).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(&p, p.with_extension("old.log"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "{} {}", now_ms(), line);
+    }
+}
+
 /// Songs planned ahead (Up next shows this many); planning tops it up as it gets lower.
 const AHEAD: usize = 100;
 /// Songs kept behind the one playing (for going back).
@@ -531,6 +543,19 @@ impl Engine {
     }
 
     fn begin(&mut self, playlist: Playlist, tracks: Vec<Track>, order: Vec<Track>, first: Option<String>, shuffle: bool, position: u64) {
+        slog(&format!("start {} ({} songs given, first {:?}, shuffle {}, ratio {})", playlist.name, tracks.len(), first, shuffle, self.ratio()));
+        // a list played from the library without its songs loaded: load them here
+        let (tracks, order) = if tracks.is_empty() {
+            self.busy = format!("Loading {}...", playlist.name);
+            self.report();
+            let (t, _) = self.api.fetch_all(&playlist);
+            self.busy.clear();
+            let mut o = t.clone();
+            o.sort_by_key(|x| x.order);
+            (t, o)
+        } else {
+            (tracks, order)
+        };
         let mut seen = HashSet::new();
         let clean: Vec<Track> = tracks.into_iter().filter(|t| t.uri.starts_with("spotify:track:") && seen.insert(key(&t.name, &t.artists))).collect();
         if clean.is_empty() {
@@ -638,6 +663,7 @@ impl Engine {
     }
 
     fn stop(&mut self) {
+        slog("stopped");
         self.on = false;
         ON.store(false, std::sync::atomic::Ordering::SeqCst);
         self.deck.clear();
@@ -686,6 +712,7 @@ impl Engine {
         if !self.play.is_active {
             self.send(command("activate"));
         }
+        slog(&format!("go {} -> {} ({})", t, u, if skip { "skip to the queued one" } else { "play" }));
         if skip {
             self.send(command("skip_next"));
         } else {
@@ -700,6 +727,7 @@ impl Engine {
         }
         if self.target.is_some() && self.target_at.elapsed() > Duration::from_secs(5) {
             self.fell_back = true;
+            slog(&format!("Soloist didn't start {} in 5 s: asking Spotify", self.target_uri));
             if let Err(e) = self.api.play_uris(&self.device(), &[self.target_uri.clone()], self.target_pos, 0) {
                 crate::web::web_log(&format!("SpoX: play failed: {}", e));
             }
@@ -807,7 +835,8 @@ impl Engine {
             return;
         }
         let Some(t) = self.play.track.as_ref() else { return };
-        if self.deck.get(self.index).map(|e| e.t.uri != t.uri).unwrap_or(true) {
+        let (tu, ck) = (t.uri.clone(), key(&t.name, &t.artists));
+        if !self.is_at(self.index, &tu, &ck) {
             return;
         }
         let Some(want) = self.deck.get(self.index + 1).map(|e| e.t.uri.clone()) else { return };
@@ -816,6 +845,7 @@ impl Engine {
             return;
         }
         self.drop_armed();
+        slog(&format!("queued the next song: {}", want));
         self.armed = Some(want.clone());
         self.send(command_with("add_to_queue", "uri", json!(want)));
     }
@@ -830,7 +860,7 @@ impl Engine {
             return;
         }
         let at_end = t.duration_ms > 0 && self.play.position(now_ms()) >= t.duration_ms as f64 - 1200.0;
-        if !at_end || self.deck.get(self.index).map(|e| e.t.uri != t.uri).unwrap_or(true) {
+        if !at_end || !self.is_at(self.index, &t.uri, &key(&t.name, &t.artists)) {
             return;
         }
         self.ended_for = t.uri;
@@ -839,9 +869,20 @@ impl Engine {
 
     // ---- following what plays ----
 
+    /// Is deck[k] the song playing? By its link, or by title + artist: Spotify sometimes plays a
+    /// song under another link than the one asked for (the same song on another release).
+    fn is_at(&self, k: usize, uri: &str, ck: &str) -> bool {
+        self.deck.get(k).map(|e| e.t.uri == uri || key(&e.t.name, &e.t.artists) == ck).unwrap_or(false)
+    }
+
+    fn cur_key(&self) -> String {
+        self.play.track.as_ref().map(|t| key(&t.name, &t.artists)).unwrap_or_default()
+    }
+
     fn nearest(&self, uri: &str) -> Option<usize> {
+        let ck = self.cur_key();
         let lo = self.index.saturating_sub(BEHIND);
-        (lo..self.deck.len()).filter(|&k| self.deck[k].t.uri == uri).min_by_key(|&k| (k as i64 - self.index as i64 - 1).abs())
+        (lo..self.deck.len()).filter(|&k| self.is_at(k, uri, &ck)).min_by_key(|&k| (k as i64 - self.index as i64 - 1).abs())
     }
 
     fn fallthrough(&self) -> bool {
@@ -869,9 +910,11 @@ impl Engine {
         }
         self.last_track = cur.clone();
         self.ended_for.clear();
+        let ck = self.cur_key();
+        slog(&format!("now: {} (target {:?}, index {}, context {})", cur, self.target, self.index, self.play.context_uri));
         let mut fix = false;
         if let Some(t) = self.target {
-            if cur == self.target_uri {
+            if cur == self.target_uri || self.is_at(t, &cur, &ck) {
                 self.index = t;
                 self.target = None;
                 if self.target_pos > 0 {
@@ -885,10 +928,10 @@ impl Engine {
                 self.target = None;
             }
         }
-        if self.target.is_none() && self.index < self.deck.len() && self.deck[self.index].t.uri != cur {
+        if self.target.is_none() && self.index < self.deck.len() && !self.is_at(self.index, &cur, &ck) {
             if let Some(i) = self.queued.iter().position(|t| t.uri == cur) {
                 self.queued.remove(i);
-            } else if self.armed.as_deref() == Some(cur.as_str()) {
+            } else if self.armed.is_some() && (self.armed.as_deref() == Some(cur.as_str()) || self.is_at(self.index + 1, &cur, &ck)) {
                 self.armed = None;
                 if let Some(i) = self.nearest(&cur) {
                     self.index = i;
@@ -909,6 +952,7 @@ impl Engine {
                 // Spotify's own pick after a song, or next pressed on another device
                 fix = true;
             } else if self.other_list() && now_ms() >= HOLD_UNTIL.load(std::sync::atomic::Ordering::SeqCst) {
+                slog(&format!("another list started ({}): SpoX hands over", self.play.context_uri));
                 // you played something else: SpoX hands back to Spotify
                 self.stop();
                 return;
@@ -970,9 +1014,6 @@ impl Engine {
                     continue;
                 }
                 hungry = true;
-                if self.warm_until.map(|t| Instant::now() < t).unwrap_or(false) && self.deck.len() - self.index - 1 >= 5 {
-                    break;
-                }
                 // none found yet: the list carries on (never waits), and the new songs owed here
                 // are slotted in at this spot once found (the share stays even)
                 if let Some(e) = self.deck.last() {
@@ -1262,6 +1303,7 @@ impl Discover {
         let seed_artist = first_artist_raw(&self.seed.artists);
         let mut artists = similar_artists(&seed_artist);
         artists.truncate(5);
+        slog(&format!("looking for new songs like {}: {:?}", seed_artist, artists));
         if artists.is_empty() {
             artists.push(seed_artist);
         }
@@ -1316,6 +1358,7 @@ impl Discover {
                 }
             }
         }
+        slog(&format!("found {} new songs{}", found.len(), if crate::web::cooling_now() { " (Spotify asked SpoX to wait)" } else { "" }));
         // keep what was found for this list (up to 400), so the next start is instant
         if let (Some(path), false) = (&self.found, found.is_empty()) {
             let mut all: Vec<Value> = std::fs::read(path)

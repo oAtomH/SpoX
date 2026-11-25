@@ -405,7 +405,7 @@ object Smart {
         val n = engine.now
         val t = n.track ?: return
         val want = synchronized(lock) {
-            if (target >= 0 || deck.getOrNull(index)?.uri != t.uri) return
+            if (target >= 0 || !isAt(index, t.uri)) return
             deck.getOrNull(index + 1)?.uri ?: return
         }
         if (n.repeat == "track") return
@@ -422,7 +422,7 @@ object Smart {
         if (target >= 0 || t.uri == endedFor) return
         val atEnd = t.durationMs > 0 && n.position() >= t.durationMs - 1200
         if (!atEnd || n.playing) return
-        if (synchronized(lock) { deck.getOrNull(index)?.uri != t.uri }) return
+        if (synchronized(lock) { !isAt(index, t.uri) }) return
         endedFor = t.uri
         next()
     }
@@ -441,7 +441,7 @@ object Smart {
         var leave = false
         synchronized(lock) {
             when {
-                target >= 0 && cur == targetUri -> {
+                target >= 0 && (cur == targetUri || isAt(target, cur)) -> {
                     index = target; target = -1
                     if (targetPos > 0) { engine.command("seek", mapOf("position_ms" to targetPos)); targetPos = 0 }
                 }
@@ -451,7 +451,8 @@ object Smart {
                     target = -1
                     when {
                         queued.remove(cur) -> {}
-                        armed == cur -> { armed = null; index = nearest(cur).takeIf { it >= 0 } ?: index }
+                        isAt(index, cur) -> {}
+                        armed != null && (armed == cur || isAt(index + 1, cur)) -> { armed = null; index = nearest(cur).takeIf { it >= 0 } ?: index }
                         stale[cur] != null -> {
                             stale.computeIfPresent(cur) { _, c -> if (c <= 1) null else c - 1 }
                             fix = true
@@ -481,9 +482,18 @@ object Smart {
     }
 
     /** Nearest place of [uri] in the deck around the song playing (a song can be in it twice). */
+    /** Is deck[k] the song playing? By its link, or by title + artist: Spotify sometimes plays a
+     *  song under another link than the one asked for (the same song on another release). */
+    private fun isAt(k: Int, uri: String): Boolean {
+        val e = deck.getOrNull(k) ?: return false
+        if (e.uri == uri) return true
+        val t = engine.now.track ?: return false
+        return t.uri == uri && Web.key(e.title, e.artist) == Web.key(t.title, t.artist)
+    }
+
     private fun nearest(uri: String): Int {
         val lo = maxOf(0, index - BEHIND)
-        return (lo until deck.size).filter { deck[it].uri == uri }.minByOrNull { kotlin.math.abs(it - index - 1) } ?: -1
+        return (lo until deck.size).filter { isAt(it, uri) }.minByOrNull { kotlin.math.abs(it - index - 1) } ?: -1
     }
 
     private fun otherList(n: Engine.Now): Boolean {
@@ -517,7 +527,6 @@ object Smart {
                     continue
                 }
                 hungry = true
-                if (System.currentTimeMillis() < warmUntil && deck.size - index - 1 >= 5) break
                 // none found yet: the list carries on (never waits), and the new songs owed here
                 // are slotted in at this spot as soon as they're found (the share stays even)
                 deck.lastOrNull()?.let { e -> repeat(maxOf(needNew, 1)) { owed += e } }

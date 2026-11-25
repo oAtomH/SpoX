@@ -732,6 +732,11 @@ fn now_ms() -> i64 {
     crate::config::now_ms()
 }
 
+/// Spotify asked SpoX to slow down and the wait isn't over (for the logs).
+pub fn cooling_now() -> bool {
+    cooling()
+}
+
 fn cooling() -> bool {
     now_ms() < COOL_UNTIL.load(Ordering::SeqCst)
 }
