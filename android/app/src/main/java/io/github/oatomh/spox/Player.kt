@@ -83,6 +83,7 @@ object Player {
         }
         engine = io.github.oatomh.spox.engine.Engine.get(app).also { it.now.listeners += engineChanged }
         Web.init(app)
+        Stats.init(app)
         Smart.init(app)
         Smart.listeners += { main.post { refresh() } }
         // notification + widget follow every change, whether or not Notification access is on
@@ -100,6 +101,7 @@ object Player {
         if (n.playing && heard > 10_000) Web.noteKnown(t.title, t.artist)
         Web.loadKnown(n.contextUri.ifEmpty { null })
         remember(t, n.contextUri, heard, n.playing)
+        Stats.tick(t.uri, t.title, t.artist, t.album, t.durationMs, n.playing)
         return State(
             title = t.title, artist = t.artist, album = t.album, art = n.art,
             durationMs = t.durationMs, positionMs = heard, positionAt = nowT,

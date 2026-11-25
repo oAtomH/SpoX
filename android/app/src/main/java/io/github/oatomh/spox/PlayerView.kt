@@ -1067,8 +1067,17 @@ class PlayerView(ctx: Context) : View(ctx) {
         if (pages.size > 1) hit(0f, contentTop, width.toFloat(), top, "libback")
         // tools: one search for everything (this list, your library, Spotify), and sorting
         val th = 22 * u
-        val searching = p.list == null && pages.size > 1
-        if (!searching) {
+        val isStats = p.title == STATS
+        val searching = p.list == null && pages.size > 1 && !isStats
+        if (isStats) {
+            // which time span (tap to change)
+            val lbl = when (p.sort) { "7" -> "Last 7 days"; "30" -> "Last 30 days"; "365" -> "This year"; else -> "All time" } + "  v"
+            val sw = tw(lbl, u) + 12 * u
+            nine(cv, "list_bg", pad, top, sw, th, u, 4)
+            txt(cv, lbl, pad + 6 * u, top + 6 * u, u, cList)
+            hit(pad, top, pad + sw, top + th, "libsort")
+            top += th + 4 * u
+        } else if (!searching) {
             val sortLabel = sortLabel(p)
             val sw = tw(sortLabel, u) + 12 * u
             val sx = width - pad - sw
@@ -1086,6 +1095,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             top += th + 4 * u
         }
         val rows = mutableListOf<Triple<String, String, String>>()
+        if (pages.size == 1) rows += Triple("Your listening stats", "top artists, songs, time listened" + if (Stats.lastfmOn()) " · Last.fm on" else "", "libstats")
         if (p.list != null && v.isNotEmpty()) {
             val how = if (Smart.on && Smart.shuffled || Player.state.shuffle) "SpoX shuffle" else "in this order"
             rows += Triple("Play all", "${v.size} songs · $how", "libplayall")
@@ -1112,6 +1122,22 @@ class PlayerView(ctx: Context) : View(ctx) {
         return if (p.sort.endsWith("!")) when (k) { "added" -> "Oldest"; "title" -> "Z-A"; "length" -> "Longest"; else -> (short[k] ?: k) + " ^" } else short[k] ?: "List order"
     }
 
+    private fun openStats(days: String) {
+        pages.lastOrNull()?.scroll = scroll
+        val p = Page(STATS, null, sort = days)
+        p.items = Stats.rows(days.toInt()).map { (a, b, uri) ->
+            when {
+                a.startsWith("#") -> Web.Item("", a.drop(1), "", "header")
+                uri.isNotEmpty() -> Web.Item(uri, a, b, "track")
+                else -> Web.Item("", a, b, "stat")
+            }
+        }
+        p.loading = false
+        pages += p
+        scroll = 0f
+        tab = Tab.LIBRARY
+    }
+
     private fun ago(t: Long): String {
         val d = (System.currentTimeMillis() - t) / 86_400_000L
         return when { d < 1 -> "today"; d < 2 -> "yesterday"; d < 31 -> "${d}d ago"; d < 365 -> "${d / 30}mo ago"; else -> "${d / 365}y ago" }
@@ -1123,6 +1149,10 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "libsignin" -> onSignIn?.invoke()
             id == "libsearch" -> onSearch?.invoke()
             id == "libback" -> back()
+            id == "libstats" -> openStats("7")
+            id == "libsort" && p.title == STATS -> show(Sheet("Stats for", emptyList(), listOf("7" to "Last 7 days", "30" to "Last 30 days", "365" to "This year", "0" to "All time").map { (k, l) ->
+                SheetItem(l, "", k == p.sort) { pages.removeAt(pages.size - 1); openStats(k) }
+            }))
             id == "libsort" -> {
                 val opts = if (p.list == null) linkedMapOf("custom" to "Recent (like Spotify)", "title" to "Name") else sortNames
                 val base = p.sort.removeSuffix("!")
@@ -1141,6 +1171,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             id.startsWith("qlib:") -> libItem(id.drop(1))?.let { Player.addToQueue(it.uri, it.title, it.sub); say("Added to queue: ${it.title}") }
             id.startsWith("lib:") -> libItem(id)?.let { item ->
                 when (item.kind) {
+                    "stat", "header" -> {}
                     "playlist", "liked", "album" -> openPage(item.title, item) { Web.tracks(item) }
                     "artist" -> Player.playUri(item.uri)
                     else -> {
@@ -1544,6 +1575,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         private val ICON_SEARCH = arrayOf(".XXX..", "X...X.", "X...X.", "X...X.", ".XXX..", ".....X")
         private val ICON_MUTED = arrayOf("...X....", "..XX....", "XXXX.X.X", "XXXX..X.", "XXXX.X.X", "..XX....", "...X....")
         private val ICON_SPEAKER = arrayOf("...X....", "..XX..X.", "XXXX...X", "XXXX.X.X", "XXXX...X", "..XX..X.", "...X....")
+        private const val STATS = "Your stats"
         val ICON_CHECK = arrayOf("......X", ".....X.", "X...X..", ".X.X...", "..X....")
 
         /** The SpoX window on screen (for messages from the player and SpoX shuffle). */

@@ -51,6 +51,7 @@ class MainActivity : Activity() {
                 "#Spotify account (library, search, likes)" to "",
                 "Account" to if (Web.signedIn) Web.userName().ifEmpty { "signed in" } else Web.status.ifEmpty { "sign in..." },
                 "Client ID" to if (Web.clientId().isEmpty()) "add..." else "set (change...)",
+                "Last.fm scrobbling" to if (Stats.lastfmOn()) Stats.lastfmUser() else "connect...",
                 "#Look" to "",
                 "Colour pack" to Skin.packName(this),
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's player"; else -> "off" },
@@ -88,6 +89,7 @@ class MainActivity : Activity() {
                     view.postDelayed({ view.invalidate() }, 600)
                 }
                 "Soloist key" -> askKey()
+                "Last.fm scrobbling" -> lastfm()
                 "Song cache" -> {
                     val sizes = listOf(500, 1024, 2048, 4096, 8192)
                     val cur = prefs.getInt("cache_mb", 1024)
@@ -149,6 +151,22 @@ class MainActivity : Activity() {
     @Deprecated("still the simplest way for a plain Activity")
     override fun onBackPressed() {
         if (!view.back()) moveTaskToBack(true)
+    }
+
+    /** Last.fm: your own API key + secret (last.fm/api/account/create), then approve SpoX once. */
+    private fun lastfm() {
+        if (Stats.lastfmOn()) {
+            view.confirm("Last.fm", "Scrobbling as ${Stats.lastfmUser()}.", "Disconnect", "Keep") { Stats.disconnect() }
+            return
+        }
+        view.ask("Last.fm API key", "API key", Stats.lastfmKey(),
+            message = "Make a free API account at last.fm/api/account/create (any name, no callback needed), then paste its API key here.", ok = "Next") { key ->
+            view.ask("Last.fm shared secret", "Shared secret", password = true, message = "The \"Shared secret\" from the same page.", ok = "Connect") { secret ->
+                Stats.setKeys(key, secret)
+                view.say("Approve SpoX on Last.fm, then come back")
+                Stats.connect(this) { msg -> runOnUiThread { view.say(msg); view.invalidate() } }
+            }
+        }
     }
 
     private var cacheTxt = ""
