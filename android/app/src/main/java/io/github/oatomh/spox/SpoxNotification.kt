@@ -20,7 +20,7 @@ import android.media.session.PlaybackState
  * app and sends the buttons back to it. (Spotify's own player stays next to it for now.)
  */
 object SpoxNotification {
-    const val CHANNEL = "playback"
+    const val CHANNEL = "playback2"
     const val ID = 77
     private var session: MediaSession? = null
     private var lastKey = ""
@@ -106,7 +106,7 @@ object SpoxNotification {
         val list = runCatching { msm.getActiveSessions(android.content.ComponentName(ctx, MediaListener::class.java)) }.getOrNull()
         sb.append("Android's active players: ").append(list?.joinToString { "${it.packageName}(${it.playbackState?.state})" } ?: "needs Notification access to see").append('\n')
         val cr = ctx.contentResolver
-        for (k in listOf("lock_screen_show_notifications", "lock_screen_allow_private_notifications", "media_controls_lock_screen", "lockscreen_show_media", "now_bar_enabled"))
+        for (k in listOf("lock_screen_show_notifications", "lock_screen_show_silent_notifications", "lock_screen_allow_private_notifications", "media_controls_lock_screen", "lockscreen_show_media", "now_bar_enabled"))
             sb.append(k).append('=').append(runCatching { android.provider.Settings.Secure.getString(cr, k) }.getOrNull()).append(' ')
         return sb.toString()
     }
@@ -201,13 +201,15 @@ object SpoxNotification {
         if (nm.getNotificationChannel(CHANNEL) == null) {
             // a fresh channel (0.10.1): the old "player" one may carry lock screen settings from
             // before; this one is made public on the lock screen from the start
-            nm.createNotificationChannel(NotificationChannel(CHANNEL, "SpoX player", NotificationManager.IMPORTANCE_LOW).apply {
+            // normal importance (not "silent"): One UI keeps silent notifications off the lock screen,
+            // and with them the media player. No sound or buzz: the player never alerts.
+            nm.createNotificationChannel(NotificationChannel(CHANNEL, "SpoX player", NotificationManager.IMPORTANCE_DEFAULT).apply {
                 setShowBadge(false)
                 setSound(null, null)
                 enableVibration(false)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             })
-            runCatching { nm.deleteNotificationChannel("player") }
+            runCatching { nm.deleteNotificationChannel("player"); nm.deleteNotificationChannel("playback") }
         }
     }
 
