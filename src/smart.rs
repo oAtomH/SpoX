@@ -463,7 +463,8 @@ impl Engine {
             shuffled: self.shuffled,
             list: self.playlist.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
             list_uri: self.playlist.as_ref().map(|p| p.uri.clone()).unwrap_or_default(),
-            new_uris: self.new_uris.clone(),
+            // what's marked new: the new songs still in the plan (none after switching shuffle off)
+            new_uris: self.deck.iter().skip(self.index).filter(|e| e.kind == "new").map(|e| e.t.uri.clone()).collect(),
             upcoming,
             busy: self.busy.clone(),
         });

@@ -2587,7 +2587,8 @@ impl App {
                     }
                     // highlighted: songs you've never listened to, and songs that aren't from your
                     // playlist (smart shuffle / Spotify's autoplay picks)
-                    let never = crate::smart::knows(&t.name, &t.artists) == Some(false);
+                    // while SpoX plays a list: NEW = a new song SpoX mixed in (only in SpoX shuffle)
+                    let never = !self.smart_on && crate::smart::knows(&t.name, &t.artists) == Some(false);
                     let outside = self.smart_new.contains(&t.uri) || p.contains("autoplay") || p.contains("recommend");
                     let is_new = never || outside;
                     if self.q_picked.contains(&t.uri) {

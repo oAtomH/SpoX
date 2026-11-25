@@ -509,7 +509,8 @@ object Player {
             val listName = Smart.listName.ifEmpty { "your list" }
             val group = when { !Smart.shuffled -> "Next from $listName"; Smart.mode(app) == "spox" -> "SpoX shuffle · $listName"; else -> "Shuffle · $listName" }
             return Smart.upcoming().take(100).mapIndexed { i, t ->
-                QRow(i.toLong(), t.uri, t.title, t.artist, if (t.isMine) "Next in queue" else group, Web.knows(t.title, t.artist) == false, t.isNew)
+                // NEW = a new song SpoX mixed in (only in SpoX shuffle), not "a list song you haven't played"
+                QRow(i.toLong(), t.uri, t.title, t.artist, if (t.isMine) "Next in queue" else group, t.isNew, t.isNew)
             }
         }
         val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, "", t, a, "", false, false) }
