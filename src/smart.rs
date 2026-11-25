@@ -5,8 +5,10 @@
 //!    autoplay picks, artists similar to what's playing (Deezer) and, with a key, Last.fm;
 //!  - the order is saved, so closing SpoX (or the PC restarting) carries on where you were.
 //! The same "deck" also plays a list in your own sort order with shuffle off (no new songs).
-//! Spotify gets the next part of the deck as a list of up to 100 songs; SpoX hands it the next
-//! part when you get there. Runs on its own thread, so it works while SpoX is hidden.
+//! Like Spotify's own app, the order lives in SpoX: Soloist is told which song to play with local
+//! commands (no Web API, so no request limits), next / previous move in SpoX's order, and about
+//! 20 s before a song ends the next one goes into Spotify's queue so it follows gaplessly.
+//! Runs on its own thread, so it works while SpoX is hidden.
 
 use crate::config::{self, now_ms, Shared};
 use crate::net::{self, enc};
@@ -21,7 +23,13 @@ use std::time::{Duration, Instant};
 
 pub enum Cmd {
     /// Start on a list. `first`: the song to begin with; `shuffle` false: in the given order.
-    Start { playlist: Playlist, tracks: Vec<Track>, first: Option<String>, shuffle: bool, position: u64 },
+    /// `order`: the same songs in the order you see them (sort / search), for "in order".
+    Start { playlist: Playlist, tracks: Vec<Track>, order: Vec<Track>, first: Option<String>, shuffle: bool, position: u64 },
+    /// next / previous in SpoX's order
+    Next,
+    Prev,
+    /// the shuffle button while SpoX plays: shuffled or in order (the share decides new songs)
+    Mode(bool),
     Stop,
     Ev(Value),
     /// take songs out of what's coming
@@ -207,11 +215,30 @@ struct Entry {
 const AHEAD: usize = 100;
 /// Songs kept behind the one playing (for going back).
 const BEHIND: usize = 100;
-/// The window Spotify gets as its playing list: songs before / after the one playing.
-const WIN_BACK: usize = 20;
-const WIN_AHEAD: usize = 80;
-/// Hand over the next window when fewer songs than this are left in it.
-const WIN_LOW: usize = 25;
+/// The next song goes into Spotify's queue this long before the end (gapless, also while hidden).
+const ARM_MS: f64 = 20_000.0;
+
+static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TX: std::sync::OnceLock<Mutex<Sender<Cmd>>> = std::sync::OnceLock::new();
+
+/// Next / previous from anywhere (buttons, taskbar, media keys, hotkeys) while SpoX plays a list:
+/// SpoX moves in its own order instead of Spotify's. True if it took the command.
+pub fn divert(cmd: &str) -> bool {
+    if !ON.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    let c = if cmd == command("skip_next") {
+        Cmd::Next
+    } else if cmd == command("skip_prev") {
+        Cmd::Prev
+    } else {
+        return false;
+    };
+    TX.get().map(|t| t.lock().unwrap().send(c).is_ok()).unwrap_or(false)
+}
+
+/// SpoX's own commands to Soloist carry this mark, so they're never diverted back.
+pub const OWN: char = '\u{1}';
 
 struct Engine {
     cfg: Shared,
@@ -223,24 +250,35 @@ struct Engine {
     shuffled: bool,
     playlist: Option<Playlist>,
     seeds: Vec<Track>,
+    /// the list in your order (sort / search), for "in order"
+    ordered: Vec<Track>,
     /// the order: played songs (for going back) and ~100 planned ahead
     deck: Vec<Entry>,
     index: usize,
-    /// the list's songs still to come in this round (a new shuffled round when it's empty)
+    /// the list's songs still to come in this round
     bag: VecDeque<Track>,
     need_new: usize,
     acc: f64,
-    /// exactly what Spotify was given as its playing list
-    sent: Vec<String>,
-    /// the window must be handed over again at the next song change
-    dirty: bool,
-    started: Option<Instant>,
-    last_track: String,
-    last_tick: Instant,
-    /// songs you queued: Spotify plays them in between, the order waits
+    /// where SpoX told Soloist to go (deck index), when, and the spot to seek to
+    target: Option<usize>,
+    target_uri: String,
+    target_at: Instant,
+    target_pos: u64,
+    /// the move is sent this long after the last press (quick presses become one move)
+    go_at: Option<Instant>,
+    fell_back: bool,
+    /// the next song, already put in Spotify's queue
+    armed: Option<String>,
+    /// songs SpoX put in Spotify's queue but no longer wants: skipped if they start
+    stale: std::collections::HashMap<String, usize>,
+    /// songs queued from somewhere else (another device): Spotify plays them in between
     queued: Vec<Track>,
-    /// taken out of Up next but maybe still in Spotify's old window: skipped if they come
+    /// with SpoX off: songs taken out of Spotify's own queue, skipped when they start
     removed: HashSet<String>,
+    last_track: String,
+    ended_for: String,
+    last_tick: Instant,
+    last_sec: Instant,
     pool: Arc<Mutex<VecDeque<Track>>>,
     library: Arc<Mutex<HashSet<String>>>,
     used: Arc<Mutex<HashSet<String>>>,
@@ -256,6 +294,7 @@ struct Engine {
 pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<String>) -> (Sender<Cmd>, Sender<Value>) {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     let (vtx, vrx) = std::sync::mpsc::channel::<Value>();
+    let _ = TX.set(Mutex::new(tx.clone()));
     let fwd = tx.clone();
     std::thread::spawn(move || {
         while let Ok(v) = vrx.recv() {
@@ -278,18 +317,26 @@ pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<Strin
                 shuffled: true,
                 playlist: None,
                 seeds: Vec::new(),
+                ordered: Vec::new(),
                 deck: Vec::new(),
                 index: 0,
                 bag: VecDeque::new(),
                 need_new: 0,
                 acc: 0.0,
-                sent: Vec::new(),
-                dirty: false,
-                started: None,
-                last_track: String::new(),
-                last_tick: Instant::now(),
+                target: None,
+                target_uri: String::new(),
+                target_at: Instant::now(),
+                target_pos: 0,
+                go_at: None,
+                fell_back: false,
+                armed: None,
+                stale: Default::default(),
                 queued: Vec::new(),
                 removed: HashSet::new(),
+                last_track: String::new(),
+                ended_for: String::new(),
+                last_tick: Instant::now(),
+                last_sec: Instant::now(),
                 pool: Default::default(),
                 library: Default::default(),
                 used: Default::default(),
@@ -315,8 +362,8 @@ fn state_path() -> std::path::PathBuf {
 impl Engine {
     fn run(&mut self, rx: Receiver<Cmd>) {
         loop {
-            match rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(Cmd::Start { playlist, tracks, first, shuffle, position }) => self.begin(playlist, tracks, first, shuffle, position),
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Cmd::Start { playlist, tracks, order, first, shuffle, position }) => self.begin(playlist, tracks, order, first, shuffle, position),
                 Ok(Cmd::Stop) => self.stop(),
                 Ok(Cmd::Ev(v)) => {
                     let changed = self.play.apply(&v);
@@ -326,7 +373,7 @@ impl Engine {
                             self.on_track();
                         }
                     } else if changed {
-                        // SpoX shuffle off: songs taken out of Spotify's own queue are skipped
+                        // SpoX off: songs taken out of Spotify's own queue are skipped
                         let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
                         if self.removed.remove(&cur) {
                             self.send(command("skip_next"));
@@ -335,35 +382,35 @@ impl Engine {
                 }
                 Ok(Cmd::Remove(uris)) => self.remove(&uris),
                 Ok(Cmd::PlayNext(ts)) => self.play_next(ts),
-                Ok(Cmd::Queued(t)) => {
-                    if self.on {
-                        self.queued.push(t);
-                        self.report();
-                    }
-                }
+                Ok(Cmd::Queued(t)) => self.play_next(vec![t]),
                 Ok(Cmd::JumpTo(uri)) => self.jump_to(&uri),
                 Ok(Cmd::Resume) => {
                     if self.on && !self.deck.is_empty() {
-                        self.last_track.clear();
-                        self.send_window(0);
+                        self.go(self.index, 0, true);
                     }
                 }
+                Ok(Cmd::Next) => self.next(),
+                Ok(Cmd::Prev) => self.prev(),
+                Ok(Cmd::Mode(shuffle)) => self.apply_mode(shuffle),
                 Ok(Cmd::Ratio) => {
                     if self.on && self.shuffled {
-                        // re-plan what's ahead: Up next changes once, to the new mix
-                        let ahead: Vec<Entry> = self.deck.drain(self.index + 1..).collect();
-                        for e in ahead.into_iter().rev().filter(|e| e.kind == "list") {
-                            self.bag.push_front(e.t);
-                        }
-                        self.need_new = 0;
-                        self.acc = 0.0;
-                        self.dirty = true;
-                        self.work();
+                        self.replan(true);
                     }
                     self.report();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
+            }
+            ON.store(self.on, std::sync::atomic::Ordering::SeqCst);
+            if self.go_at.map(|t| Instant::now() >= t).unwrap_or(false) {
+                self.go_at = None;
+                self.send_go();
+            }
+            if self.on && self.last_sec.elapsed() >= Duration::from_secs(1) {
+                self.last_sec = Instant::now();
+                self.arm();
+                self.ended();
+                self.fall_back();
             }
             if self.on && self.last_tick.elapsed() > Duration::from_secs(3) {
                 self.last_tick = Instant::now();
@@ -384,8 +431,9 @@ impl Engine {
         c.smart_ratio.min(100)
     }
 
+    /// To Soloist, marked as SpoX's own (never diverted back here).
     fn send(&self, c: String) {
-        let _ = self.solo.send(c);
+        let _ = self.solo.send(format!("{}{}", OWN, c));
     }
 
     fn osd(&self, s: impl Into<String>) {
@@ -393,12 +441,16 @@ impl Engine {
         self.ctx.request_repaint();
     }
 
+    fn base(&self) -> usize {
+        self.target.unwrap_or(self.index)
+    }
+
     fn report(&self) {
         let upcoming: Vec<(Track, String)> = if self.on {
             self.queued
                 .iter()
                 .map(|t| (t.clone(), "user".to_string()))
-                .chain(self.deck.iter().skip(self.index + 1).take(AHEAD).map(|e| (e.t.clone(), e.kind.clone())))
+                .chain(self.deck.iter().skip(self.base() + 1).take(AHEAD).map(|e| (e.t.clone(), e.kind.clone())))
                 .collect()
         } else {
             Vec::new()
@@ -424,13 +476,13 @@ impl Engine {
     }
 
     fn work(&mut self) {
-        // the first new songs for this list arrived: plan with them and hand the full plan over
         if self.warm_until.is_some()
             && (self.pool.lock().unwrap().len() >= 6
                 || self.warm_until.map(|t| Instant::now() >= t).unwrap_or(true))
         {
             self.warm_until = None;
-            self.dirty = true;
+            self.plan();
+            self.rearm();
         }
         let hungry = self.plan();
         if self.ratio() > 0 && (hungry || self.pool.lock().unwrap().len() < 20) {
@@ -440,123 +492,242 @@ impl Engine {
         self.report();
     }
 
-    fn begin(&mut self, playlist: Playlist, tracks: Vec<Track>, first: Option<String>, shuffle: bool, position: u64) {
-        // merge duplicates (same song on different albums), only playable songs
+    /// Fills the round: shuffled (spread, recent songs last), or your order after `from`.
+    fn fill_bag(&mut self, from: Option<&str>) {
+        self.bag.clear();
+        if self.shuffled {
+            let n = (self.seeds.len() / 2).min(self.deck.len());
+            let mut recent: HashSet<String> = self.deck[self.deck.len() - n..].iter().map(|e| e.t.uri.clone()).collect();
+            if let Some(f) = from {
+                recent.insert(f.to_string());
+            }
+            let fresh = spread(&self.seeds, &mut self.rng);
+            let (later, now): (Vec<Track>, Vec<Track>) = fresh.into_iter().partition(|t| recent.contains(&t.uri));
+            self.bag.extend(now);
+            self.bag.extend(later.into_iter().filter(|t| Some(t.uri.as_str()) != from));
+        } else {
+            let at = from.and_then(|f| self.ordered.iter().position(|t| t.uri == f));
+            match at {
+                Some(i) => self.bag.extend(self.ordered[i + 1..].iter().cloned()),
+                None => self.bag.extend(self.ordered.iter().cloned()),
+            }
+        }
+    }
+
+    fn begin(&mut self, playlist: Playlist, tracks: Vec<Track>, order: Vec<Track>, first: Option<String>, shuffle: bool, position: u64) {
         let mut seen = HashSet::new();
         let clean: Vec<Track> = tracks.into_iter().filter(|t| t.uri.starts_with("spotify:track:") && seen.insert(key(&t.name, &t.artists))).collect();
         if clean.is_empty() {
-            self.osd("SPOX SHUFFLE NEEDS A LIST WITH SONGS");
+            self.osd("NO SONGS TO PLAY IN THIS LIST");
             return;
         }
-        // keep what's been played (going back still works after switching)
+        let uris: HashSet<String> = clean.iter().map(|t| t.uri.clone()).collect();
+        let mut oseen = HashSet::new();
+        let ordered: Vec<Track> = order.into_iter().filter(|t| uris.contains(&t.uri) && oseen.insert(t.uri.clone())).collect();
+        let playing_now = self.play.track.as_ref().map(|t| t.uri.clone());
+        let carry_on = first.is_some() && first == playing_now;
+        // keep what's been played (going back still works)
         self.deck.truncate((self.index + 1).min(self.deck.len()));
         self.on = true;
         self.shuffled = shuffle;
         self.playlist = Some(playlist);
-        self.bag.clear();
         self.queued.clear();
         self.removed.clear();
         self.new_uris.clear();
         self.pool.lock().unwrap().clear();
         self.acc = 0.0;
         self.need_new = 0;
-        self.last_track.clear();
+        self.drop_armed();
         {
             let mut used = self.used.lock().unwrap();
             used.clear();
             used.extend(clean.iter().map(|t| key(&t.name, &t.artists)));
+            used.extend(self.deck.iter().map(|e| key(&e.t.name, &e.t.artists)));
             self.library.lock().unwrap().extend(used.iter().cloned());
         }
         self.load_library();
-        self.seeds = clean.clone();
-        let mut order = if shuffle { spread(&clean, &mut self.rng) } else { clean };
-        let mut start_with: Option<Track> = None;
-        if let Some(f) = &first {
-            if let Some(i) = order.iter().position(|t| &t.uri == f) {
-                start_with = Some(order[i].clone());
-                if shuffle {
-                    order.remove(i);
-                } else {
-                    order.drain(..=i);
-                }
-            }
-        }
-        self.bag = order.into();
+        self.ordered = if ordered.is_empty() { clean.clone() } else { ordered };
+        self.seeds = clean;
+        let start_with = first.as_ref().and_then(|f| self.seeds.iter().find(|t| &t.uri == f).cloned());
+        self.fill_bag(start_with.as_ref().map(|t| t.uri.as_str()));
         let r = self.ratio();
-        // new songs found for this list before: ready at once (more are found in the background)
         self.load_found();
-        self.warm_until = if r > 0 && self.pool.lock().unwrap().len() < 10 {
-            Some(Instant::now() + Duration::from_secs(10))
-        } else {
-            None
-        };
-        let same = start_with.is_some();
-        let t = start_with.or_else(|| if r >= 100 { self.pick_new("") } else { self.bag.pop_front() });
+        self.warm_until = if r > 0 && self.pool.lock().unwrap().len() < 10 { Some(Instant::now() + Duration::from_secs(10)) } else { None };
+        let t = start_with.clone().or_else(|| if r >= 100 { self.pick_new("") } else { None }).or_else(|| self.bag.pop_front());
         let Some(t) = t else {
             self.stop();
             return;
         };
-        let kind = if self.new_uris.contains(&t.uri) { "new" } else { "list" };
-        self.deck.push(Entry { t, kind: kind.into() });
-        self.index = self.deck.len() - 1;
-        self.plan();
-        self.send(command_with("set_shuffle", "enabled", json!(false)));
-        self.send_window(if same { position } else { 0 });
-        if shuffle {
-            self.osd(if r == 0 { "SPOX SHUFFLE ON".to_string() } else { format!("SPOX SHUFFLE ON \u{b7} {}% NEW", r) });
+        if self.play.shuffle {
+            self.send(command_with("set_shuffle", "enabled", json!(false)));
         }
+        if self.play.repeat == "context" {
+            self.send(command_with("set_repeat_context", "enabled", json!(false)));
+        }
+        let same_spot = carry_on && self.deck.get(self.index).map(|e| e.t.uri == t.uri).unwrap_or(false);
+        if !same_spot {
+            let kind = if self.new_uris.contains(&t.uri) { "new" } else { "list" };
+            self.deck.push(Entry { t: t.clone(), kind: kind.into() });
+            self.index = self.deck.len() - 1;
+        }
+        self.plan();
+        if carry_on {
+            // the song playing is the start: it simply carries on, only what follows changes
+            self.target = None;
+            self.last_track = t.uri.clone();
+        } else {
+            self.go(self.index, if start_with.is_some() { position } else { 0 }, true);
+        }
+        self.osd(if !shuffle {
+            "IN ORDER".to_string()
+        } else if r == 0 {
+            "SHUFFLE ON".to_string()
+        } else {
+            format!("SPOX SHUFFLE \u{b7} {}% NEW", r)
+        });
         self.work();
+    }
+
+    /// The shuffle button while SpoX plays a list: what's ahead is planned again at once.
+    fn apply_mode(&mut self, shuffle: bool) {
+        if !self.on || self.seeds.is_empty() {
+            return;
+        }
+        self.shuffled = shuffle;
+        if self.ratio() > 0 {
+            self.load_found();
+            self.warm_until = if self.pool.lock().unwrap().len() < 10 { Some(Instant::now() + Duration::from_secs(10)) } else { None };
+        }
+        self.replan(false);
+    }
+
+    /// Throws away the plan after the song playing (your own picks stay first) and plans again.
+    fn replan(&mut self, keep_order: bool) {
+        let ahead: Vec<Entry> = self.deck.drain(self.index + 1..).collect();
+        self.deck.extend(ahead.iter().filter(|e| e.kind == "user").cloned());
+        self.need_new = 0;
+        self.acc = 0.0;
+        if keep_order {
+            self.bag = ahead.into_iter().filter(|e| e.kind == "list").map(|e| e.t).collect();
+        } else {
+            let cur = self.deck.get(self.index).map(|e| e.t.uri.clone());
+            self.fill_bag(cur.as_deref());
+        }
+        self.plan();
+        self.rearm();
+        self.save();
+        self.report();
     }
 
     fn stop(&mut self) {
         self.on = false;
+        ON.store(false, std::sync::atomic::Ordering::SeqCst);
         self.deck.clear();
         self.index = 0;
         self.bag.clear();
-        self.sent.clear();
         self.queued.clear();
+        self.target = None;
+        self.go_at = None;
+        self.drop_armed();
         self.busy.clear();
         self.save();
         self.report();
     }
 
-    /// Gives Spotify the window around deck[index] as its playing list (20 back, 80 ahead), and
-    /// starts that song at `position_ms`. Spotify's own next / previous then just work.
-    fn send_window(&mut self, position_ms: u64) {
+    // ---- moving ----
+
+    /// Go to deck[i]: sent 250 ms after the last press, so quick presses become one move.
+    fn go(&mut self, i: usize, position_ms: u64, now: bool) {
         if self.deck.is_empty() {
             return;
         }
-        self.index = self.index.min(self.deck.len() - 1);
-        let from = self.index.saturating_sub(WIN_BACK);
-        let to = (self.index + 1 + WIN_AHEAD).min(self.deck.len());
-        self.sent = self.deck[from..to].iter().map(|e| e.t.uri.clone()).collect();
-        self.dirty = false;
-        self.started = Some(Instant::now());
+        let j = i.min(self.deck.len() - 1);
+        self.target = Some(j);
+        self.target_uri = self.deck[j].t.uri.clone();
+        self.target_at = Instant::now();
+        self.target_pos = position_ms;
+        self.fell_back = false;
+        hold_for(Duration::from_secs(8));
+        self.go_at = Some(Instant::now() + if now { Duration::ZERO } else { Duration::from_millis(250) });
+        self.report();
+    }
+
+    fn send_go(&mut self) {
+        let Some(t) = self.target else { return };
+        let u = self.target_uri.clone();
+        // the next song is already first in Spotify's queue: just skip to it (gapless, instant)
+        let head = self.play.upcoming.iter().find(|x| x.provider.contains("queue")).map(|x| x.uri.clone());
+        let skip = self.armed.as_deref() == Some(u.as_str()) && t == self.index + 1 && head.as_deref() == Some(u.as_str()) && self.queued.is_empty();
+        if skip {
+            self.armed = None;
+        } else {
+            self.drop_armed();
+        }
+        self.target_at = Instant::now();
         if !self.play.is_active {
             self.send(command("activate"));
         }
-        if let Err(e) = self.api.play_uris(&self.device(), &self.sent, position_ms, self.index - from) {
-            crate::web::web_log(&format!("SpoX shuffle: play failed: {}", e));
-            self.send(command_with("play", "uri", json!(self.deck[self.index].t.uri)));
+        if skip {
+            self.send(command("skip_next"));
+        } else {
+            self.send(command_with("play", "uri", json!(u)));
         }
-        self.send(command_with("get_queue", "limit", json!(0)));
-        self.save();
     }
 
-    /// Jump to a song in Up next: one jump, nothing skipped through.
+    /// Soloist didn't take the move within 5 s (not the active device yet...): once through Spotify.
+    fn fall_back(&mut self) {
+        if self.fell_back || self.go_at.is_some() {
+            return;
+        }
+        if self.target.is_some() && self.target_at.elapsed() > Duration::from_secs(5) {
+            self.fell_back = true;
+            if let Err(e) = self.api.play_uris(&self.device(), &[self.target_uri.clone()], self.target_pos, 0) {
+                crate::web::web_log(&format!("SpoX: play failed: {}", e));
+            }
+        }
+    }
+
+    fn next(&mut self) {
+        // songs queued from another device play first, like Spotify
+        if !self.queued.is_empty() && self.play.upcoming.first().map(|t| self.queued.iter().any(|q| q.uri == t.uri)).unwrap_or(false) {
+            self.send(command("skip_next"));
+            return;
+        }
+        let b = self.base();
+        if b + 1 >= self.deck.len() {
+            self.plan();
+        }
+        if b + 1 < self.deck.len() {
+            self.go(b + 1, 0, false);
+        }
+    }
+
+    /// Back: to the start of the song, or (in its first 3 s) the song before.
+    fn prev(&mut self) {
+        let pos = self.play.position(now_ms());
+        let b = self.base();
+        if (self.target.is_none() && pos > 3000.0) || b == 0 {
+            self.send(command_with("seek", "position_ms", json!(0)));
+            return;
+        }
+        self.go(b - 1, 0, false);
+    }
+
+    /// Jump to a song in Up next: the songs before it are passed over (like Spotify).
     fn jump_to(&mut self, uri: &str) {
+        if let Some(i) = self.queued.iter().position(|t| t.uri == uri) {
+            let t = self.queued.remove(i);
+            self.deck.insert(self.index + 1, Entry { t, kind: "user".into() });
+        }
         let Some(i) = (self.index + 1..self.deck.len()).find(|&k| self.deck[k].t.uri == uri) else { return };
-        self.index = i;
-        self.last_track = uri.to_string();
-        hold_for(Duration::from_secs(4));
-        self.send_window(0);
+        self.deck.drain(self.index + 1..i);
+        self.go(self.index + 1, 0, true);
         self.work();
     }
 
     fn remove(&mut self, uris: &[String]) {
         let set: HashSet<&String> = uris.iter().collect();
         if !self.on {
-            // Spotify can't take songs out of its queue: skip them the moment they start
             self.removed.extend(uris.iter().cloned());
             return;
         }
@@ -567,17 +738,12 @@ impl Engine {
                 self.deck.remove(j);
             }
         }
-        for u in uris {
-            if self.sent.contains(u) {
-                self.removed.insert(u.clone());
-                self.dirty = true;
-            }
-        }
         self.queued.retain(|t| !set.contains(&t.uri));
+        self.rearm();
         self.work();
     }
 
-    /// Play songs next: Spotify's queue plays them right after this song, then the order carries on.
+    /// Play next: right after this song (after songs you picked before), in SpoX's own order.
     fn play_next(&mut self, ts: Vec<Track>) {
         if !self.on || self.deck.is_empty() {
             return;
@@ -588,17 +754,193 @@ impl Engine {
             j -= 1;
             if set.contains(&self.deck[j].t.uri) {
                 self.deck.remove(j);
-                self.dirty = true;
             }
         }
-        for t in &ts {
-            if self.sent.contains(&t.uri) {
-                self.removed.insert(t.uri.clone());
-            }
-            self.send(command_with("add_to_queue", "uri", json!(t.uri)));
+        let mut at = self.index + 1;
+        while at < self.deck.len() && self.deck[at].kind == "user" {
+            at += 1;
         }
-        self.queued.extend(ts);
+        for (k, t) in ts.into_iter().enumerate() {
+            self.deck.insert(at + k, Entry { t, kind: "user".into() });
+        }
+        self.rearm();
         self.work();
+    }
+
+    // ---- Spotify's queue: only the very next song, only near the end ----
+
+    fn drop_armed(&mut self) {
+        if let Some(a) = self.armed.take() {
+            *self.stale.entry(a).or_insert(0) += 1;
+        }
+    }
+
+    fn rearm(&mut self) {
+        let want = self.deck.get(self.index + 1).map(|e| e.t.uri.clone());
+        if self.armed.is_some() && self.armed != want {
+            self.drop_armed();
+        }
+        self.arm();
+    }
+
+    fn arm(&mut self) {
+        if self.target.is_some() || self.play.repeat == "track" {
+            return;
+        }
+        let Some(t) = self.play.track.as_ref() else { return };
+        if self.deck.get(self.index).map(|e| e.t.uri != t.uri).unwrap_or(true) {
+            return;
+        }
+        let Some(want) = self.deck.get(self.index + 1).map(|e| e.t.uri.clone()) else { return };
+        let left = t.duration_ms as f64 - self.play.position(now_ms());
+        if t.duration_ms == 0 || left > ARM_MS || self.armed.as_deref() == Some(want.as_str()) {
+            return;
+        }
+        self.drop_armed();
+        self.armed = Some(want.clone());
+        self.send(command_with("add_to_queue", "uri", json!(want)));
+    }
+
+    /// The song ended with nothing after it (or Spotify stopped): play the next one.
+    fn ended(&mut self) {
+        if self.target.is_some() {
+            return;
+        }
+        let Some(t) = self.play.track.clone() else { return };
+        if t.uri == self.ended_for || self.play.status == "playing" || self.play.status == "buffering" {
+            return;
+        }
+        let at_end = t.duration_ms > 0 && self.play.position(now_ms()) >= t.duration_ms as f64 - 1200.0;
+        if !at_end || self.deck.get(self.index).map(|e| e.t.uri != t.uri).unwrap_or(true) {
+            return;
+        }
+        self.ended_for = t.uri;
+        self.next();
+    }
+
+    // ---- following what plays ----
+
+    fn nearest(&self, uri: &str) -> Option<usize> {
+        let lo = self.index.saturating_sub(BEHIND);
+        (lo..self.deck.len()).filter(|&k| self.deck[k].t.uri == uri).min_by_key(|&k| (k as i64 - self.index as i64 - 1).abs())
+    }
+
+    fn fallthrough(&self) -> bool {
+        let c = &self.play.context_uri;
+        c.is_empty()
+            || c.contains("station")
+            || c.contains("autoplay")
+            || c.contains("radio")
+            || (c.starts_with("spotify:track:") && self.deck.iter().any(|e| &e.t.uri == c))
+            || self.playlist.as_ref().map(|p| &p.uri == c).unwrap_or(false)
+    }
+
+    fn on_track(&mut self) {
+        let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
+        if cur.is_empty() || cur == self.last_track {
+            return;
+        }
+        self.last_track = cur.clone();
+        self.ended_for.clear();
+        let mut fix = false;
+        if let Some(t) = self.target {
+            if cur == self.target_uri {
+                self.index = t;
+                self.target = None;
+                if self.target_pos > 0 {
+                    self.send(command_with("seek", "position_ms", json!(self.target_pos)));
+                    self.target_pos = 0;
+                }
+            } else if self.target_at.elapsed() < Duration::from_secs(8) {
+                // a move is on its way: Spotify may still report the old song for a moment
+                return;
+            } else {
+                self.target = None;
+            }
+        }
+        if self.target.is_none() && self.index < self.deck.len() && self.deck[self.index].t.uri != cur {
+            if let Some(i) = self.queued.iter().position(|t| t.uri == cur) {
+                self.queued.remove(i);
+            } else if self.armed.as_deref() == Some(cur.as_str()) {
+                self.armed = None;
+                if let Some(i) = self.nearest(&cur) {
+                    self.index = i;
+                }
+            } else if let Some(n) = self.stale.get_mut(&cur) {
+                *n -= 1;
+                if *n == 0 {
+                    self.stale.remove(&cur);
+                }
+                fix = true;
+            } else if let Some(i) = self.nearest(&cur) {
+                self.index = i;
+                let want = self.deck.get(i + 1).map(|e| e.t.uri.clone());
+                if self.armed.is_some() && self.armed != want {
+                    self.drop_armed();
+                }
+            } else if self.fallthrough() {
+                // Spotify's own pick after a song, or next pressed on another device
+                fix = true;
+            } else if now_ms() >= HOLD_UNTIL.load(std::sync::atomic::Ordering::SeqCst) {
+                // you played something else: SpoX hands back to Spotify
+                self.stop();
+                return;
+            }
+        }
+        if self.index > BEHIND + 50 {
+            let cut = self.index - BEHIND;
+            self.deck.drain(..cut);
+            self.index -= cut;
+        }
+        if fix {
+            self.go(self.index + 1, 0, true);
+        }
+        self.work();
+    }
+
+    /// Fills the order up to AHEAD songs ahead. True while new songs are owed but not found yet.
+    fn plan(&mut self) -> bool {
+        let r = self.ratio();
+        let mut hungry = false;
+        while self.deck.len() - self.index - 1 < AHEAD {
+            if r >= 100 || self.need_new > 0 {
+                let last = self.deck.last().map(|e| e.t.artists.clone()).unwrap_or_default();
+                if let Some(t) = self.pick_new(&last) {
+                    self.deck.push(Entry { t, kind: "new".into() });
+                    self.need_new = self.need_new.saturating_sub(1);
+                    continue;
+                }
+                hungry = true;
+                if self.warm_until.map(|t| Instant::now() < t).unwrap_or(false) && self.deck.len() - self.index - 1 >= 5 {
+                    break;
+                }
+                self.need_new = 0;
+                if r >= 100 && self.bag.is_empty() && self.seeds.is_empty() {
+                    break;
+                }
+            }
+            if self.bag.is_empty() {
+                if self.seeds.is_empty() {
+                    break;
+                }
+                // the whole round played: another one (shuffled again, or your order from the top)
+                if self.shuffled {
+                    self.fill_bag(None);
+                } else {
+                    self.bag.extend(self.ordered.iter().cloned());
+                }
+            }
+            let Some(t) = self.bag.pop_front() else { break };
+            self.deck.push(Entry { t, kind: "list".into() });
+            if r > 0 && r < 100 {
+                self.acc += r as f64 / (100 - r) as f64;
+                while self.acc >= 1.0 {
+                    self.need_new += 1;
+                    self.acc -= 1.0;
+                }
+            }
+        }
+        hungry
     }
 
     /// Library = Liked Songs + every playlist SpoX has cached. Loaded in the background.
@@ -653,69 +995,6 @@ impl Engine {
         None
     }
 
-    /// Fills the order up to AHEAD songs ahead: the next list songs of this round (a new shuffled
-    /// round when it's done), new songs between them by the share. True while new songs are owed
-    /// but not found yet (planning waits for them, unless it runs low).
-    fn plan(&mut self) -> bool {
-        let r = self.ratio();
-        let mut hungry = false;
-        while self.deck.len() - self.index - 1 < AHEAD {
-            if r >= 100 || self.need_new > 0 {
-                let last = self.deck.last().map(|e| e.t.artists.clone()).unwrap_or_default();
-                if let Some(t) = self.pick_new(&last) {
-                    self.deck.push(Entry { t, kind: "new".into() });
-                    self.need_new = self.need_new.saturating_sub(1);
-                    continue;
-                }
-                hungry = true;
-                // the first seconds of a list with no new songs yet: plan a few, wait for the
-                // first new ones, then fill Up next in one go
-                if self.warm_until.map(|t| Instant::now() < t).unwrap_or(false)
-                    && self.deck.len() - self.index - 1 >= 5
-                {
-                    break;
-                }
-                // no new song ready: carry on with the list, never wait
-                self.need_new = 0;
-                if r >= 100 && self.bag.is_empty() && self.seeds.is_empty() {
-                    break;
-                }
-            }
-            if self.bag.is_empty() {
-                // the whole list played: a fresh shuffled round, the songs just heard last
-                if !self.shuffled || self.seeds.is_empty() {
-                    break;
-                }
-                let n = (self.seeds.len() / 3).min(self.deck.len());
-                let recent: HashSet<String> = self.deck[self.deck.len() - n..].iter().map(|e| e.t.uri.clone()).collect();
-                let fresh = spread(&self.seeds, &mut self.rng);
-                let (later, now): (Vec<Track>, Vec<Track>) = fresh.into_iter().partition(|t| recent.contains(&t.uri));
-                self.bag.extend(now);
-                self.bag.extend(later);
-            }
-            let Some(t) = self.bag.pop_front() else { break };
-            self.deck.push(Entry { t, kind: "list".into() });
-            if r > 0 && r < 100 {
-                self.acc += r as f64 / (100 - r) as f64;
-                while self.acc >= 1.0 {
-                    self.need_new += 1;
-                    self.acc -= 1.0;
-                }
-            }
-        }
-        // Spotify has a much shorter list than what's planned now: hand it over at the next song change
-        if let Some(cur) = self.deck.get(self.index) {
-            if let Some(i) = self.sent.iter().position(|u| *u == cur.t.uri) {
-                if self.sent.len() < WIN_BACK + WIN_AHEAD
-                    && self.deck.len() - self.index - 1 > self.sent.len() - 1 - i + 10
-                {
-                    self.dirty = true;
-                }
-            }
-        }
-        hungry
-    }
-
     fn found_path(&self) -> Option<std::path::PathBuf> {
         let p = self.playlist.as_ref()?;
         let name: String = p
@@ -761,52 +1040,6 @@ impl Engine {
                 pool.push_back(t);
             }
         }
-    }
-
-    fn on_track(&mut self) {
-        let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
-        if cur.is_empty() || cur == self.last_track {
-            return;
-        }
-        self.last_track = cur.clone();
-        // a song you queued: Spotify plays it in between, the order waits
-        if let Some(i) = self.queued.iter().position(|t| t.uri == cur) {
-            self.queued.remove(i);
-            self.report();
-            return;
-        }
-        // taken out of Up next but still in Spotify's old window
-        if self.removed.remove(&cur) {
-            self.send(command("skip_next"));
-            return;
-        }
-        let lo = self.index.saturating_sub(WIN_BACK + 5);
-        let hi = (self.index + WIN_AHEAD + 5).min(self.deck.len());
-        let pos = (lo..hi).filter(|&k| self.deck[k].t.uri == cur).min_by_key(|&k| (k as i64 - self.index as i64 - 1).abs());
-        let Some(pos) = pos else {
-            // just started / jumping: Spotify may still report the old song for a moment
-            let fresh = self.started.map(|t| t.elapsed() < Duration::from_secs(6)).unwrap_or(false);
-            if fresh || now_ms() < HOLD_UNTIL.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            // you played something else: SpoX shuffle hands back to Spotify
-            self.stop();
-            return;
-        };
-        self.index = pos;
-        // trim far history (going back keeps working, without growing forever)
-        if self.index > BEHIND + 50 {
-            let cut = self.index - BEHIND;
-            self.deck.drain(..cut);
-            self.index -= cut;
-        }
-        let left = self.sent.iter().position(|u| *u == cur).map(|i| self.sent.len() - 1 - i).unwrap_or(0);
-        if (self.dirty || left < WIN_LOW) && self.deck.len() > self.index + 1 + left {
-            // a new song just started: hand over the next window now, from this same spot
-            let at = self.play.position(now_ms()) as u64;
-            self.send_window(at);
-        }
-        self.work();
     }
 
     /// Spotify's autoplay suggestions show up in the queue: also used as new songs.
@@ -875,10 +1108,11 @@ impl Engine {
         let deck: Vec<Value> = self.deck.iter().map(|e| json!([e.t.uri, e.t.name, e.t.artists, e.t.album, e.t.duration_ms, e.kind])).collect();
         let bag: Vec<Value> = self.bag.iter().map(|t| json!([t.uri, t.name, t.artists, t.album, t.duration_ms])).collect();
         let seeds: Vec<Value> = self.seeds.iter().take(3000).map(|t| json!([t.uri, t.name, t.artists])).collect();
+        let ordered: Vec<&String> = self.ordered.iter().take(3000).map(|t| &t.uri).collect();
         let p = self.playlist.clone().unwrap_or_default();
         let v = json!({
-            "v": 3, "on": self.on, "shuffled": self.shuffled, "index": self.index, "need": self.need_new, "acc": self.acc,
-            "list": [p.uri, p.id, p.name, p.total, p.owned], "deck": deck, "bag": bag, "sent": self.sent, "seeds": seeds,
+            "v": 4, "on": self.on, "shuffled": self.shuffled, "index": self.index, "need": self.need_new, "acc": self.acc,
+            "list": [p.uri, p.id, p.name, p.total, p.owned], "deck": deck, "bag": bag, "seeds": seeds, "ordered": ordered,
         });
         let path = state_path();
         let tmp = path.with_extension("tmp");
@@ -902,12 +1136,18 @@ impl Engine {
         self.index = (v["index"].as_u64().unwrap_or(0) as usize).min(self.deck.len() - 1);
         self.need_new = v["need"].as_u64().unwrap_or(0) as usize;
         self.acc = v["acc"].as_f64().unwrap_or(0.0);
-        self.sent = v["sent"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default();
         self.on = true;
+        ON.store(true, std::sync::atomic::Ordering::SeqCst);
         self.shuffled = v["shuffled"].as_bool().unwrap_or(true);
         let l = &v["list"];
         self.playlist = Some(Playlist { uri: s(&l[0]), id: s(&l[1]), name: s(&l[2]), total: l[3].as_u64().unwrap_or(0) as u32, owned: l[4].as_bool().unwrap_or(false) });
         self.seeds = v["seeds"].as_array().map(|a| a.iter().map(|e| Track { uri: s(&e[0]), name: s(&e[1]), artists: s(&e[2]), ..Default::default() }).collect()).unwrap_or_default();
+        let by: std::collections::HashMap<String, Track> = self.seeds.iter().map(|t| (t.uri.clone(), t.clone())).collect();
+        self.ordered = v["ordered"].as_array().map(|a| a.iter().filter_map(|u| by.get(u.as_str().unwrap_or("")).cloned()).collect()).unwrap_or_default();
+        if self.ordered.is_empty() {
+            self.ordered = self.seeds.clone();
+        }
+        self.last_track = self.deck[self.index].t.uri.clone();
         self.new_uris = self.deck.iter().filter(|e| e.kind == "new").map(|e| e.t.uri.clone()).collect();
         let mut used = self.used.lock().unwrap();
         used.extend(self.deck.iter().map(|e| key(&e.t.name, &e.t.artists)));

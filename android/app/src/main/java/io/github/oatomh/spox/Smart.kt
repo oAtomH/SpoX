@@ -9,43 +9,38 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
- * SpoX shuffle (same as SpoX on Windows). SpoX decides the order itself instead of Spotify.
+ * SpoX's own queue, run like Spotify's app runs its queue: the order lives in SpoX, and SpoX
+ * Engine (Soloist, on the phone) is only told what to play, with local commands. No Spotify
+ * Web API for playing at all, so no waiting on Spotify's request limits.
  *
- * How it works:
- *  - The "deck" is the order: songs already played (kept, so going back works) and about 100
- *    songs ahead, fully planned: your list's songs shuffled properly (artists spread out, every
- *    song once per round) with new songs mixed in by the "new songs" share. Up next shows exactly
- *    this, and it only ever grows at the bottom: nothing already shown is swapped.
- *  - When the list has been played through, a fresh shuffled round follows (never-ending), avoiding
- *    the songs you just heard.
- *  - New songs are found like a radio: songs by artists similar to the song at the end of the
- *    plan, plus Spotify's own autoplay picks.
- *  - Spotify is handed a window of the deck (20 songs back, up to 80 ahead) as its playing list,
- *    so Spotify's own next / previous work normally (also from headphones, the lock screen, a
- *    car, another device). Before the window runs out SpoX hands over the next one, at a song change.
- *  - All of it is saved, so closing SpoX (or the phone restarting) carries on where you were.
- *
- * With shuffle off the same deck plays a list in your sort order (no new songs then).
+ *  - The "deck" is the order: songs already played (going back works) and ~100 planned ahead.
+ *    Shuffle: your list spread out fairly (artists apart, every song once per round), with new
+ *    songs mixed in by the share in SpoX shuffle. In order: your list from the song you're on.
+ *  - Moving (next, back, a song tapped in Up next, a new list): SpoX plays that song directly.
+ *    Several quick presses become one move, so nothing is skipped late.
+ *  - Gapless: about 20 s before a song ends, SpoX puts the next one in Spotify's queue, so it
+ *    follows by itself (also with the screen off). Until then nothing is handed to Spotify, so
+ *    changing shuffle, the share or Up next is instant and never touches the song playing.
+ *  - If a song ends anyway with nothing after it (or Spotify starts its own pick), SpoX plays
+ *    the next one itself. Everything is saved, so a restart carries on where you were.
  */
 object Smart {
     class Entry(val uri: String, val title: String, val artist: String, val kind: String) {
         val isNew get() = kind == "new"
+        val isMine get() = kind == "user"
     }
 
-    /** Songs planned ahead (Up next shows this many). Planning tops it up when it gets lower. */
+    /** Songs planned ahead (Up next shows this many). */
     private const val AHEAD = 100
     /** Songs kept behind the one playing (for going back). */
     private const val BEHIND = 100
-    /** How much of the window Spotify gets before / after the song playing. */
-    private const val WIN_BACK = 20
-    private const val WIN_AHEAD = 80
-    /** Hand over the next window when fewer songs than this are left in it. */
-    private const val WIN_LOW = 25
+    /** The next song goes into Spotify's queue this long before the end. */
+    private const val ARM_MS = 20_000L
 
     /** SpoX is in charge of what plays next. */
     @Volatile var on = false
         private set
-    /** true: SpoX shuffle; false: your list in your sort order. */
+    /** true: shuffled; false: your list in your order. */
     @Volatile var shuffled = true
         private set
     @Volatile var listUri = ""
@@ -55,7 +50,7 @@ object Smart {
     /** Songs SpoX brought in (Up next marks them). */
     val newUris: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
     @Volatile var holdUntil = 0L
-    /** Shown while the list loads / new songs are being found. */
+    /** Shown while the list loads. */
     @Volatile var busy = ""
         private set
 
@@ -64,56 +59,48 @@ object Smart {
     private val lock = Any()
     private val deck = ArrayList<Entry>()
     @Volatile private var index = 0
-    /** Your list's songs still to come in this round (the next round is shuffled when it's empty). */
+    /** Your list's songs still to come in this round. */
     private val bag = ArrayDeque<Web.Item>()
-    /** new songs still owed after the last list song planned (the share's running total) */
     private var needNew = 0
     private var acc = 0.0
-    /** exactly what Spotify was given as its playing list */
-    private var sent: List<String> = emptyList()
-    /** the window has to be handed over again (songs taken out, share changed...) */
-    private var dirty = false
-    private var startedAt = 0L
-    private var lastTrack = ""
-    /** songs you queued (Spotify plays them first, then carries on with the deck) */
+    /** the list's songs (merged, playable) and the same in your order (sort / search) */
+    private var seeds: List<Web.Item> = emptyList()
+    private var ordered: List<Web.Item> = emptyList()
+
+    // where SpoX told SpoX Engine to go, and what it put in Spotify's queue
+    @Volatile private var target = -1
+    @Volatile private var targetUri = ""
+    @Volatile private var targetAt = 0L
+    @Volatile private var targetPos = 0L
+    @Volatile private var fellBack = false
+    /** the next song, already in Spotify's queue */
+    @Volatile private var armed: String? = null
+    /** songs SpoX put in Spotify's queue that it no longer wants: skipped the moment they start */
+    private val stale = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    /** songs queued from somewhere else (another device): Spotify plays them in between */
     private val queued: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
-    /** songs taken out that Spotify may still play from the old window: skipped if they come */
-    private val removed: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+    private var lastTrack = ""
+    private var endedFor = ""
+
     private val pool = java.util.concurrent.ConcurrentLinkedDeque<Web.Item>()
     private val used: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
-    private var seeds: List<Web.Item> = emptyList()
     private val finding = AtomicInteger(0)
     private val saver = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val main by lazy { android.os.Handler(app.mainLooper) }
 
     fun ratio(ctx: Context) = ctx.getSharedPreferences("spox", 0).getInt("smart_ratio", 50).let { if (it in listOf(0, 25, 50, 75, 100)) it else 50 }
 
-    /**
-     * The shuffle button: "off" (in order), "shuffle" (fair shuffle, only your list) or "spox"
-     * (fair shuffle + new songs). A setting that sticks: it doesn't reset when you play something
-     * else, it's simply how the next list plays.
-     */
+    /** The shuffle button: "off" (in order), "shuffle" or "spox" (shuffle + new songs). A setting that sticks. */
     fun mode(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("shuffle_mode", "off").let { if (it == "shuffle" || it == "spox") it else "off" }
     fun setMode(ctx: Context, m: String) { ctx.getSharedPreferences("spox", 0).edit().putString("shuffle_mode", m).apply(); changed() }
     fun nextMode(m: String) = when (m) { "off" -> "shuffle"; "shuffle" -> "spox"; else -> "off" }
 
-    /** The new-songs share in use: only in SpoX mode. */
     private fun share() = if (shuffled && mode(app) == "spox") ratio(app) else 0
 
     fun setRatio(ctx: Context, r: Int) {
         val old = ratio(ctx)
         ctx.getSharedPreferences("spox", 0).edit().putInt("smart_ratio", r).apply()
-        if (on && shuffled && mode(ctx) == "spox" && r != old) thread {
-            // re-plan what's ahead: Up next changes once, to the new mix
-            synchronized(lock) {
-                val ahead = deck.subList(index + 1, deck.size).toList()
-                while (deck.size > index + 1) deck.removeAt(deck.size - 1)
-                // the list songs go back into the round, in the same order
-                ahead.filter { it.kind == "list" }.reversed().forEach { e -> seeds.firstOrNull { it.uri == e.uri }?.let { bag.addFirst(it) } }
-                needNew = 0; acc = 0.0; dirty = true
-            }
-            work()
-        }
+        if (on && shuffled && mode(ctx) == "spox" && r != old) replanAhead(keepOrder = true)
         changed()
     }
 
@@ -125,20 +112,24 @@ object Smart {
         app = c.applicationContext
         restore()
         engine.now.listeners += { if (on) runCatching { onChange() } }
-        main.postDelayed(ticker, 3000)
+        main.postDelayed(ticker, 1000)
     }
 
     private fun toast(t: String) = PlayerView.say(app, t)
 
-    // every few seconds: keep planning ahead and finding new songs
+    // every second: arm the next song near the end, catch a song that ended with nothing after it;
+    // every few seconds: keep planning and finding new songs
+    private var tick = 0
     private val ticker = object : Runnable {
         override fun run() {
-            if (on) thread(name = "spox-shuffle-tick") { runCatching { work() } }
-            main.postDelayed(this, 3000)
+            if (on) {
+                runCatching { arm(); ended() }
+                if (++tick % 4 == 0) thread(name = "spox-shuffle-tick") { runCatching { work() } }
+            }
+            main.postDelayed(this, 1000)
         }
     }
 
-    /** Plan ahead, look for more new songs if they're short, save, tell the screen. */
     private fun work() {
         val hungry = plan()
         if (share() > 0 && (hungry || pool.size < 20)) discover()
@@ -167,166 +158,276 @@ object Smart {
     }
 
     /**
-     * Start SpoX shuffle (or, with [shuffle] false, your sort order) on a list.
-     * [songs]: the list's songs if already loaded (in the order to play when not shuffling).
-     * [first]: the song to start with (a song you tapped). [positionMs]: carry on mid-song.
+     * Plays a list through SpoX. [songs]: its songs if loaded; [order]: the same in the order you
+     * see them (for "in order"); [first]: the song to start with. If [first] is the song playing
+     * right now, it simply carries on (nothing restarts): only what comes after changes.
      */
-    fun start(ctx: Context, list: Web.Item, songs: List<Web.Item>? = null, first: String? = null, shuffle: Boolean = true, positionMs: Long = 0): Boolean {
+    fun start(ctx: Context, list: Web.Item, songs: List<Web.Item>? = null, first: String? = null, shuffle: Boolean = true,
+              positionMs: Long = 0, order: List<Web.Item>? = null): Boolean {
         init(ctx)
-        if (!Web.signedIn) { toast("SpoX shuffle needs the Spotify sign-in (Settings)"); return false }
+        if (!Web.signedIn) { toast("Sign in to Spotify first (Settings)"); return false }
         if (!engine.isLive) { toast("Turn on SpoX Engine first (Settings)"); return false }
-        // keep what's already been played (going back still works after switching)
-        synchronized(lock) {
-            on = true; shuffled = shuffle
-            listUri = list.uri; listName = list.title
-            while (deck.size > index + 1) deck.removeAt(deck.size - 1)
-            bag.clear(); queued.clear(); removed.clear()
-            newUris.clear(); pool.clear(); acc = 0.0; needNew = 0
-            lastTrack = ""
-        }
         busy = "Loading ${list.title.ifEmpty { "the list" }}..."
         changed()
         if (list.uri.startsWith("spotify:")) Web.loadKnown(list.uri)
         thread(name = "spox-shuffle") {
             val all = songs ?: Web.tracks(list)
-            // merge duplicates (same song on another album) and drop things Spotify can't play
             val seen = HashSet<String>()
             val clean = all.filter { it.kind == "track" && it.uri.startsWith("spotify:track:") && seen.add(Web.key(it.title, it.sub)) }
-            if (clean.isEmpty()) { busy = ""; stop(); toast("Nothing to play in ${list.title}"); return@thread }
-            seeds = clean
-            used.clear()
-            clean.forEach { used += Web.key(it.title, it.sub) }
-            val r = if (shuffle && mode(ctx) == "spox") ratio(ctx) else 0
-            var order: List<Web.Item> = if (shuffle) spread(clean) else clean
-            var firstItem: Web.Item? = null
-            first?.let { f ->
-                order.firstOrNull { it.uri == f }?.let { t ->
-                    firstItem = t
-                    // shuffled: that song first, then the mix; in order: from that song on
-                    order = if (shuffle) order.filter { it !== t } else order.dropWhile { it !== t }.drop(1)
-                }
+            if (clean.isEmpty()) { busy = ""; changed(); toast("Nothing to play in ${list.title}"); return@thread }
+            val keys = clean.map { it.uri }.toSet()
+            val ord = order?.filter { it.uri in keys }?.distinctBy { it.uri }?.takeIf { it.isNotEmpty() } ?: clean
+            val playingNow = engine.now.track?.uri
+            val carryOn = first != null && first == playingNow && engine.now.track != null
+            synchronized(lock) {
+                // what's been played stays (going back still works)
+                while (deck.size > index + 1) deck.removeAt(deck.size - 1)
+                on = true; shuffled = shuffle
+                listUri = list.uri; listName = list.title
+                seeds = clean; ordered = ord
+                used.clear(); clean.forEach { used += Web.key(it.title, it.sub) }
+                deck.forEach { used += Web.key(it.title, it.artist) }
+                newUris.clear(); pool.clear(); queued.clear(); acc = 0.0; needNew = 0
+                dropArmed()
             }
-            synchronized(lock) { bag.addAll(order) }
-            // new songs found for this list before: ready at once (more are found in the background)
             loadFound(list.uri)
+            val r = share()
             warmUntil = if (r > 0 && pool.size < 10) System.currentTimeMillis() + 10_000 else 0L
-            val begin = synchronized(lock) {
-                // the start: the song you tapped, else the first of the plan (plays at once)
+            val firstItem = first?.let { f -> clean.firstOrNull { it.uri == f } }
+            val startIndex = synchronized(lock) {
+                fillBag(firstItem?.uri)
                 val t = firstItem ?: (if (r == 100) pick("") else null) ?: bag.removeFirstOrNull()
-                if (t != null) {
-                    deck.add(Entry(t.uri, t.title, t.sub, if (t.uri in newUris) "new" else "list"))
-                    index = deck.size - 1
+                if (t == null) -1 else {
+                    if (carryOn && deck.isNotEmpty() && deck[index].uri == t.uri) index
+                    else { deck.add(Entry(t.uri, t.title, t.sub, if (t.uri in newUris) "new" else "list")); deck.size - 1 }
                 }
-                t != null
             }
             busy = ""
-            if (!begin) { stop(); toast("No songs to play"); return@thread }
-            plan()
-            val at = if (first != null && deck.getOrNull(index)?.uri == first) positionMs else 0L
-            sendWindow(at)
+            if (startIndex < 0) { stop(); toast("No songs to play"); return@thread }
+            // Spotify's own shuffle / repeat would fight SpoX's order
+            if (engine.now.shuffle) engine.command("set_shuffle", mapOf("enabled" to false))
+            if (engine.now.repeat == "context") engine.command("set_repeat_context", mapOf("enabled" to false))
+            if (carryOn) {
+                synchronized(lock) { index = startIndex; lastTrack = playingNow.orEmpty(); target = -1 }
+                plan()
+            } else {
+                synchronized(lock) { index = startIndex }
+                plan()
+                go(startIndex, if (first != null) positionMs else 0, now = true)
+            }
             work()
-            if (shuffle) toast(if (r == 0) "Shuffle on" else "SpoX shuffle on · $r% new songs")
+            toast(when { !shuffle -> "In order"; r == 0 -> "Shuffle on"; else -> "SpoX shuffle · $r% new songs" })
         }
         return true
     }
 
+    /** Fills the round: shuffled (spread), or your order from the song after [from]. */
+    private fun fillBag(from: String?) {
+        bag.clear()
+        if (shuffled) {
+            val recent = deck.takeLast(minOf(deck.size, seeds.size / 2)).map { it.uri }.toSet() + setOfNotNull(from)
+            val fresh = spread(seeds)
+            bag.addAll(fresh.filter { it.uri !in recent } + fresh.filter { it.uri in recent && it.uri != from })
+        } else {
+            val at = from?.let { f -> ordered.indexOfFirst { it.uri == f } } ?: -1
+            bag.addAll(if (at >= 0) ordered.drop(at + 1) else ordered)
+        }
+    }
+
+    /** The shuffle button pressed while SpoX plays a list: what's ahead is planned again at once,
+     *  the song playing carries on. */
+    fun applyMode(ctx: Context, mode: String): Boolean {
+        if (!on || seeds.isEmpty()) return false
+        synchronized(lock) { shuffled = mode != "off" }
+        if (mode == "spox") { loadFound(listUri); warmUntil = if (pool.size < 10) System.currentTimeMillis() + 10_000 else 0L }
+        replanAhead(keepOrder = false)
+        toast(when (mode) { "spox" -> "SpoX shuffle · ${ratio(ctx)}% new songs"; "shuffle" -> "Shuffle on"; else -> "Shuffle off · in order" })
+        return true
+    }
+
+    /** Throws away the plan after the song playing (your own picks stay first) and plans again. */
+    private fun replanAhead(keepOrder: Boolean) {
+        synchronized(lock) {
+            val ahead = deck.subList(index + 1, deck.size).toList()
+            while (deck.size > index + 1) deck.removeAt(deck.size - 1)
+            ahead.filter { it.isMine }.forEach { deck += it }
+            needNew = 0; acc = 0.0
+            if (keepOrder) {
+                // same list songs in the same order, only the new songs are mixed again
+                bag.clear()
+                ahead.filter { it.kind == "list" }.forEach { e -> seeds.firstOrNull { it.uri == e.uri }?.let { bag.addLast(it) } }
+            } else fillBag(deck.getOrNull(index)?.uri)
+        }
+        plan()
+        rearm()
+        save(); changed()
+    }
+
     fun stop() {
-        synchronized(lock) { on = false; deck.clear(); index = 0; bag.clear(); sent = emptyList(); queued.clear() }
+        synchronized(lock) { on = false; deck.clear(); index = 0; bag.clear(); target = -1; queued.clear(); dropArmed() }
         pool.clear()
         busy = ""
         save()
         changed()
     }
 
-    /** Nothing is playing (e.g. SpoX Engine just started): carry on with the saved order. */
+    /** Nothing loaded (SpoX Engine just started): carry on with the saved order at [positionMs]. */
     fun resume(positionMs: Long = 0): Boolean {
         if (!on || !Web.signedIn || synchronized(lock) { deck.isEmpty() }) return false
-        lastTrack = ""
-        thread { sendWindow(positionMs) }
+        go(index, positionMs, now = true)
         return true
     }
 
-    /**
-     * Gives Spotify the window around the song at [index] as its playing list (20 back, 80 ahead)
-     * and starts that song at [positionMs].
-     */
-    private fun sendWindow(positionMs: Long) {
-        val win = synchronized(lock) {
-            if (deck.isEmpty()) return
-            index = index.coerceIn(0, deck.size - 1)
-            val from = maxOf(0, index - WIN_BACK)
-            val to = minOf(deck.size, index + 1 + WIN_AHEAD)
-            val list = deck.subList(from, to).map { it.uri }
-            sent = list
-            dirty = false
-            startedAt = System.currentTimeMillis()
-            list to (index - from)
-        }
-        if (!Web.playUris(win.first, positionMs, win.second)) toast("SpoX Phone isn't ready yet: press play again in a moment")
-        engine.command("get_queue", mapOf("limit" to 0))
-        save()
-    }
+    // ---- moving ------------------------------------------------------------------------------
 
-    /** Jump to a song in Up next: one jump, no skipping through the ones in between. */
-    fun jumpTo(uri: String): Boolean {
+    private val send = Runnable { thread(name = "spox-go") { runCatching { sendGo() } } }
+
+    /** Go to deck[i]. Quick presses in a row are gathered into one move (sent 250 ms after the last). */
+    private fun go(i: Int, positionMs: Long = 0, now: Boolean = false) {
         synchronized(lock) {
-            val i = (index + 1 until deck.size).firstOrNull { deck[it].uri == uri } ?: return false
-            index = i
+            if (deck.isEmpty()) return
+            val j = i.coerceIn(0, deck.size - 1)
+            target = j; targetUri = deck[j].uri; targetAt = System.currentTimeMillis(); targetPos = positionMs
+            fellBack = false
+            holdUntil = targetAt + 8000
         }
-        holdUntil = System.currentTimeMillis() + 4000
-        lastTrack = uri
-        thread { sendWindow(0); work() }
+        changed()
+        main.removeCallbacks(send)
+        main.postDelayed(send, if (now) 0 else 250)
+    }
+
+    private fun sendGo() {
+        val (uri, useSkip) = synchronized(lock) {
+            if (target < 0) return
+            val u = targetUri
+            // the next song is already first in Spotify's queue: just skip to it (gapless, instant)
+            val head = engine.now.queue.firstOrNull { it.provider.contains("queue") }?.uri
+            val skip = armed == u && target == index + 1 && head == u && queued.isEmpty()
+            if (skip) armed = null else dropArmed()
+            u to skip
+        }
+        targetAt = System.currentTimeMillis()
+        if (!engine.now.active) engine.command("activate")
+        if (useSkip) engine.command("skip_next") else engine.command("play", mapOf("uri" to uri))
+        // SpoX Engine didn't take it (not the active device yet...): ask through Spotify once
+        main.postDelayed({
+            if (target >= 0 && targetUri == uri && engine.now.track?.uri != uri && !fellBack) {
+                fellBack = true
+                thread { Web.playUris(listOf(uri), targetPos, 0) }
+            }
+        }, 5000)
+    }
+
+    /** Next (button, lock screen, headphones). */
+    fun next() {
+        // songs queued from another device play first, like Spotify
+        if (queued.isNotEmpty() && engine.now.queue.firstOrNull()?.uri in queued) { engine.command("skip_next"); return }
+        val base = synchronized(lock) { if (target >= 0) target else index }
+        synchronized(lock) { if (base + 1 >= deck.size) plan() }
+        if (base + 1 < synchronized(lock) { deck.size }) go(base + 1)
+    }
+
+    /** Back: to the start of the song, or (in its first 3 s) the song before. */
+    fun prev() {
+        val pos = engine.now.position()
+        val base = synchronized(lock) { if (target >= 0) target else index }
+        if (target < 0 && pos > 3000 || base == 0) { engine.command("seek", mapOf("position_ms" to 0)); return }
+        go(base - 1)
+    }
+
+    /** Jump to a song in Up next: the songs before it are passed over (like Spotify). */
+    fun jumpTo(uri: String): Boolean {
+        val i = synchronized(lock) {
+            val i = (index + 1 until deck.size).firstOrNull { deck[it].uri == uri } ?: return false
+            repeat(i - index - 1) { deck.removeAt(index + 1) }
+            index + 1
+        }
+        go(i, now = true)
+        thread { runCatching { work() } }
         return true
     }
 
-    // ---- Up next ------------------------------------------------------------------------------
+    // ---- Up next -----------------------------------------------------------------------------
 
-    /** What's coming, in SpoX's order (songs you queued are shown first by the player). */
-    fun upcoming(): List<Entry> = synchronized(lock) { if (index + 1 < deck.size) deck.subList(index + 1, deck.size).toList() else emptyList() }
+    fun upcoming(): List<Entry> = synchronized(lock) {
+        val from = (if (target >= 0) target else index) + 1
+        if (from < deck.size) deck.subList(from, deck.size).toList() else emptyList()
+    }
 
-    /** The song SpoX shuffle is at (shown, paused, before SpoX Engine has anything loaded). */
-    fun current(): Entry? = synchronized(lock) { if (on) deck.getOrNull(index) else null }
+    fun current(): Entry? = synchronized(lock) { if (on) deck.getOrNull(if (target >= 0) target else index) else null }
 
-    /** Songs you queued, still to play (Up next shows them first). */
-    fun queuedUris(): Set<String> = queued.toSet()
+    fun queuedUris(): Set<String> = synchronized(lock) { deck.drop(index + 1).filter { it.isMine }.map { it.uri }.toSet() } + queued
 
-    /** Take songs out of what's coming. */
     fun remove(uris: Set<String>) {
         synchronized(lock) {
-            for (j in deck.indices.reversed()) {
-                if (j <= index || deck[j].uri !in uris) continue
-                if (deck[j].uri in sent) dirty = true
-                deck.removeAt(j)
-            }
-            // Spotify may still have them in its window: skipped if they come before the next hand-over
-            removed += uris.filter { it in sent }
+            for (j in deck.indices.reversed()) if (j > index && deck[j].uri in uris) deck.removeAt(j)
             queued.removeAll(uris)
         }
+        rearm()
         thread { runCatching { work() } }
     }
 
-    /** Play songs next: Spotify's queue plays them right after this song, then the order carries on. */
+    /** Play next: right after this song (after songs you picked before), in SpoX's own order. */
     fun playNext(items: List<Entry>) {
         if (items.isEmpty()) return
         val uris = items.map { it.uri }.toSet()
         synchronized(lock) {
-            // they leave their old spot in the order (no playing twice)
-            for (j in deck.indices.reversed()) if (j > index && deck[j].uri in uris) { deck.removeAt(j); dirty = true }
-            removed += uris.filter { it in sent }
-            queued += uris
+            for (j in deck.indices.reversed()) if (j > index && deck[j].uri in uris) deck.removeAt(j)
+            var at = index + 1
+            while (at < deck.size && deck[at].isMine) at++
+            items.forEachIndexed { k, e -> deck.add(at + k, Entry(e.uri, e.title, e.artist, "user")) }
         }
-        items.forEach { engine.command("add_to_queue", mapOf("uri" to it.uri)) }
+        rearm()
         thread { runCatching { work() } }
     }
 
-    /** A song you added to the queue (library, a link): it plays next, then the order carries on. */
-    fun noteQueued(uri: String, title: String, artist: String) {
-        if (!on) return
-        queued += uri
-        changed()
+    /** Added to the queue from the library / a link while SpoX plays: it goes into SpoX's order. */
+    fun noteQueued(uri: String, title: String, artist: String): Boolean {
+        if (!on) return false
+        playNext(listOf(Entry(uri, title, artist, "user")))
+        return true
     }
 
-    // ---- following what plays --------------------------------------------------------------
+    // ---- Spotify's queue: only the very next song, only near the end -----------------------
+
+    /** The armed song is no longer wanted: if it starts, it's skipped. */
+    private fun dropArmed() {
+        armed?.let { stale.merge(it, 1, Int::plus) }
+        armed = null
+    }
+
+    private fun rearm() {
+        synchronized(lock) { if (armed != null && armed != deck.getOrNull(index + 1)?.uri) dropArmed() }
+        arm()
+    }
+
+    private fun arm() {
+        val n = engine.now
+        val t = n.track ?: return
+        val want = synchronized(lock) {
+            if (target >= 0 || deck.getOrNull(index)?.uri != t.uri) return
+            deck.getOrNull(index + 1)?.uri ?: return
+        }
+        if (n.repeat == "track") return
+        if (t.durationMs <= 0 || t.durationMs - n.position() > ARM_MS) return
+        if (armed == want) return
+        synchronized(lock) { if (armed != null) dropArmed(); armed = want }
+        engine.command("add_to_queue", mapOf("uri" to want))
+    }
+
+    /** The song ended and nothing came after it (or Spotify stopped): play the next one. */
+    private fun ended() {
+        val n = engine.now
+        val t = n.track ?: return
+        if (target >= 0 || t.uri == endedFor) return
+        val atEnd = t.durationMs > 0 && n.position() >= t.durationMs - 1200
+        if (!atEnd || n.playing) return
+        if (synchronized(lock) { deck.getOrNull(index)?.uri != t.uri }) return
+        endedFor = t.uri
+        next()
+    }
+
+    // ---- following what plays ----------------------------------------------------------------
 
     private fun onChange() {
         harvest()
@@ -335,47 +436,65 @@ object Smart {
         if (cur == lastTrack) return
         val now = System.currentTimeMillis()
         lastTrack = cur
-        if (Player.isSkipped(cur)) return
-        // a song you queued: Spotify plays it in between, the order waits
-        if (queued.remove(cur)) { changed(); return }
-        // taken out of Up next but still in Spotify's old window
-        if (removed.remove(cur)) { engine.command("skip_next"); return }
-        val pos = synchronized(lock) {
-            // nearest match around where we are (the same song can be in the deck twice)
-            val lo = maxOf(0, index - WIN_BACK - 5)
-            val hi = minOf(deck.size, index + WIN_AHEAD + 5)
-            (lo until hi).filter { deck[it].uri == cur }.minByOrNull { kotlin.math.abs(it - index - 1) } ?: -1
-        }
-        if (pos < 0) {
-            // just started / jumping: Spotify may still report the old song for a moment
-            if (now - startedAt < 6000 || now < holdUntil) return
-            // you played something else: SpoX shuffle hands back to Spotify
-            stop()
-            return
-        }
-        val handOver = synchronized(lock) {
-            index = pos
-            // trim far history (keeps going back possible, without growing forever)
+        endedFor = ""
+        var fix = false
+        var leave = false
+        synchronized(lock) {
+            when {
+                target >= 0 && cur == targetUri -> {
+                    index = target; target = -1
+                    if (targetPos > 0) { engine.command("seek", mapOf("position_ms" to targetPos)); targetPos = 0 }
+                }
+                // a move is on its way: Spotify may still report the old song for a moment
+                target >= 0 && now - targetAt < 8000 -> return
+                else -> {
+                    target = -1
+                    when {
+                        queued.remove(cur) -> {}
+                        armed == cur -> { armed = null; index = nearest(cur).takeIf { it >= 0 } ?: index }
+                        stale[cur] != null -> {
+                            stale.computeIfPresent(cur) { _, c -> if (c <= 1) null else c - 1 }
+                            fix = true
+                        }
+                        nearest(cur) >= 0 -> { index = nearest(cur); if (armed != null && armed != deck.getOrNull(index + 1)?.uri) dropArmed() }
+                        Player.isSkipped(cur) -> {}
+                        // Spotify's own pick after a song (autoplay), or next pressed on another device
+                        isFallthrough(n) -> fix = true
+                        else -> leave = true
+                    }
+                }
+            }
             if (index > BEHIND + 50) {
                 val cut = index - BEHIND
                 repeat(cut) { deck.removeAt(0) }
                 index -= cut
             }
-            val at = sent.indexOf(cur)
-            val left = if (at < 0) 0 else sent.size - 1 - at
-            (dirty || left < WIN_LOW) && deck.size > index + 1 + left
         }
-        if (handOver) {
-            // a new song just started: hand over the next window now (from this same spot)
-            val at = n.position()
-            thread { sendWindow(at); work() }
-        } else thread { runCatching { work() } }
+        when {
+            fix -> go(synchronized(lock) { index } + 1, now = true)
+            // you played something else (another list, a song from search): SpoX hands over
+            leave -> stop()
+            else -> thread { runCatching { work() } }
+        }
+    }
+
+    /** Nearest place of [uri] in the deck around the song playing (a song can be in it twice). */
+    private fun nearest(uri: String): Int {
+        val lo = maxOf(0, index - BEHIND)
+        return (lo until deck.size).filter { deck[it].uri == uri }.minByOrNull { kotlin.math.abs(it - index - 1) } ?: -1
+    }
+
+    private fun isFallthrough(n: Engine.Now): Boolean {
+        val c = n.contextUri
+        // SpoX plays single songs, so its context is a song of the deck; after it Spotify may go on
+        // with its own picks (autoplay / a station)
+        return c.isEmpty() || c.contains("station") || c.contains("autoplay") || c.contains("radio") ||
+            (c.startsWith("spotify:track:") && deck.any { it.uri == c }) || (c == listUri && listUri.isNotEmpty())
     }
 
     /**
-     * Fills the order up to [AHEAD] songs ahead: the next list songs of this round (a new shuffled
-     * round when it's done), with new songs between them by the share. Returns true while new
-     * songs are owed but none are found yet (planning waits for them, unless it runs low).
+     * Fills the order up to [AHEAD] songs ahead. Returns true while new songs are owed but none
+     * are found yet.
      */
     private fun plan(): Boolean = synchronized(lock) {
         val r = share()
@@ -389,19 +508,14 @@ object Smart {
                     continue
                 }
                 hungry = true
-                // the very first seconds of a list SpoX has no new songs for yet: plan a few
-                // songs, wait for the first new ones, then fill Up next in one go
                 if (System.currentTimeMillis() < warmUntil && deck.size - index - 1 >= 5) break
-                // no new song ready: carry on with the list, never wait (that was the slowness)
                 needNew = 0
-                if (r >= 100) { if (bag.isEmpty() && seeds.isEmpty()) break }
+                if (r >= 100 && bag.isEmpty() && seeds.isEmpty()) break
             }
             if (bag.isEmpty()) {
-                // played the whole list: a new round, shuffled, without the songs you just heard
-                if (!shuffled || seeds.isEmpty()) break
-                val recent = deck.takeLast(minOf(deck.size, seeds.size / 3)).map { it.uri }.toSet()
-                val fresh = spread(seeds)
-                bag.addAll(fresh.filter { it.uri !in recent } + fresh.filter { it.uri in recent })
+                if (seeds.isEmpty()) break
+                // played the whole round: another one (shuffled again, or your order from the top)
+                if (shuffled) fillBag(null) else bag.addAll(ordered)
             }
             val t = bag.removeFirstOrNull() ?: break
             deck += Entry(t.uri, t.title, t.sub, "list")
@@ -410,8 +524,6 @@ object Smart {
                 while (acc >= 1.0) { needNew++; acc -= 1.0 }
             }
         }
-        // Spotify has a much shorter list than what's planned now: hand it over at the next song change
-        if (sent.isNotEmpty() && deck.size - index - 1 > sent.size - 1 - sent.indexOf(deck.getOrNull(index)?.uri) + 10 && sent.size < WIN_BACK + WIN_AHEAD) dirty = true
         hungry
     }
 
@@ -482,8 +594,7 @@ object Smart {
                 val wasWarm = warmUntil > 0
                 if (pool.size >= 6) warmUntil = 0
                 plan()
-                // the first new songs arrived: hand Spotify the full plan at the next song change
-                if (wasWarm && warmUntil == 0L) synchronized(lock) { dirty = true }
+                if (wasWarm && warmUntil == 0L) rearm()
                 save(); changed()
             }
         }
@@ -558,16 +669,18 @@ object Smart {
     private val file get() = File(app.filesDir, "spox_shuffle.json")
 
     private fun item(e: JSONArray) = Web.Item(e.optString(0), e.optString(1), e.optString(2), "track")
+    private fun items(a: JSONArray?) = a?.let { (0 until it.length()).mapNotNull { i -> it.optJSONArray(i) }.map { e -> item(e) } }.orEmpty()
+    private fun arr(l: List<Web.Item>) = JSONArray().apply { l.forEach { put(JSONArray().put(it.uri).put(it.title).put(it.sub)) } }
 
     private fun save() {
         if (!::app.isInitialized) return
         val snap = synchronized(lock) {
-            JSONObject().put("v", 3).put("on", on).put("shuffled", shuffled).put("list", listUri).put("name", listName).put("index", index)
+            JSONObject().put("v", 4).put("on", on).put("shuffled", shuffled).put("list", listUri).put("name", listName).put("index", index)
                 .put("need", needNew).put("acc", acc)
                 .put("deck", JSONArray().apply { deck.forEach { put(JSONArray().put(it.uri).put(it.title).put(it.artist).put(it.kind)) } })
-                .put("bag", JSONArray().apply { bag.forEach { put(JSONArray().put(it.uri).put(it.title).put(it.sub)) } })
-                .put("sent", JSONArray(sent))
-                .put("seeds", JSONArray().apply { seeds.take(2000).forEach { put(JSONArray().put(it.uri).put(it.title).put(it.sub)) } })
+                .put("bag", arr(bag.toList()))
+                .put("seeds", arr(seeds.take(3000)))
+                .put("ordered", JSONArray().apply { ordered.take(3000).forEach { put(it.uri) } })
                 .toString()
         }
         saver.execute { runCatching { val tmp = File(file.path + ".tmp"); tmp.writeText(snap); tmp.renameTo(file) } }
@@ -581,17 +694,19 @@ object Smart {
             o.optJSONArray("deck")?.let { a ->
                 for (i in 0 until a.length()) a.optJSONArray(i)?.let { e -> deck += Entry(e.optString(0), e.optString(1), e.optString(2), e.optString(3, "list")) }
             }
-            o.optJSONArray("bag")?.let { a -> for (i in 0 until a.length()) a.optJSONArray(i)?.let { bag += item(it) } }
+            bag.addAll(items(o.optJSONArray("bag")))
             index = o.optInt("index").coerceIn(0, (deck.size - 1).coerceAtLeast(0))
             needNew = o.optInt("need"); acc = o.optDouble("acc", 0.0)
-            sent = o.optJSONArray("sent")?.let { a -> (0 until a.length()).map { a.optString(it) } }.orEmpty()
             on = deck.isNotEmpty()
             shuffled = o.optBoolean("shuffled", true)
             listUri = o.optString("list"); listName = o.optString("name")
             deck.filter { it.isNew }.forEach { newUris += it.uri }
             deck.forEach { used += Web.key(it.title, it.artist) }
+            seeds = items(o.optJSONArray("seeds"))
+            val byUri = seeds.associateBy { it.uri }
+            ordered = o.optJSONArray("ordered")?.let { a -> (0 until a.length()).mapNotNull { byUri[a.optString(it)] } }?.takeIf { it.isNotEmpty() } ?: seeds
+            lastTrack = deck.getOrNull(index)?.uri.orEmpty()
         }
-        seeds = o.optJSONArray("seeds")?.let { a -> (0 until a.length()).mapNotNull { a.optJSONArray(it) }.map { item(it) } }.orEmpty()
         seeds.forEach { used += Web.key(it.title, it.sub) }
     }
 }

@@ -303,6 +303,12 @@ fn run(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, rx: Receiver<String>, ta
                     break 'conn;
                 }
                 let cmd = if cmd == "__toggle__" { command(if playing { "pause" } else { "play" }) } else { cmd };
+                // SpoX's own queue: next / previous from anywhere move in SpoX's order
+                let cmd = match cmd.strip_prefix(crate::smart::OWN) {
+                    Some(own) => own.to_string(),
+                    None if crate::smart::divert(&cmd) => continue,
+                    None => cmd,
+                };
                 if ws.send(Message::text(cmd)).is_err() {
                     break 'conn;
                 }

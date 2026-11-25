@@ -56,6 +56,7 @@ class MainActivity : Activity() {
                 "Colour pack" to Skin.packName(this),
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's player"; else -> "off" },
                 "Lock screen player" to SpoxNotification.lockStatus(this),
+                "Lock screen check" to "copy report",
                 "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "card" -> "SpoX card"; else -> "pixel cover" },
                 "Mini player: heart and + / -" to if (prefs.getBoolean("mini_extras", true)) "on" else "off",
                 "App icon follows colour pack" to if (AppIcon.follows(this)) "on (when you leave SpoX)" else "off",
@@ -112,6 +113,12 @@ class MainActivity : Activity() {
                     val cur = prefs.getInt("cache_mb", 1024)
                     view.show(PlayerView.Sheet("Song cache", listOf("Songs you play are kept on the phone, so", "playing them again uses less mobile data.", "Changes apply when SpoX Engine restarts."),
                         sizes.map { mb -> PlayerView.SheetItem(if (mb >= 1024) "${mb / 1024} GB" else "$mb MB", "", mb == cur) { prefs.edit().putInt("cache_mb", mb).apply(); cacheAt = 0 } }))
+                }
+                "Lock screen check" -> {
+                    SpoxNotification.refresh(this)
+                    getSystemService(android.content.ClipboardManager::class.java)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("SpoX lock screen", SpoxNotification.lockReport(this)))
+                    view.say("Lock screen report copied: paste it to Claude")
                 }
                 "Engine report" -> {
                     val eng = io.github.oatomh.spox.engine.Engine.get(this)
