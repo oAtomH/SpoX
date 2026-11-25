@@ -36,6 +36,8 @@ pub struct Shared_ {
     pub app_actions: Mutex<Vec<String>>,
     /// SpoX smart shuffle on (set by the main window), for the shuffle button.
     pub smart_on: AtomicBool,
+    /// Playing song vs. the playing playlist (set by the main window): 0 = not one of yours, 1 = not in it, 2 = in it.
+    pub in_list: std::sync::atomic::AtomicU8,
     /// Number of taskbars (= monitors with a taskbar), counted by the watcher.
     pub monitors: std::sync::atomic::AtomicUsize,
     paused_since: Mutex<Option<Instant>>,
@@ -75,6 +77,7 @@ pub fn new_shared(skin: Arc<Skin>, live: Arc<Mutex<Play>>, solo: Sender<String>,
         fs_info: AtomicBool::new(false),
         app_actions: Mutex::new(Vec::new()),
         smart_on: AtomicBool::new(false),
+        in_list: std::sync::atomic::AtomicU8::new(0),
         monitors: std::sync::atomic::AtomicUsize::new(1),
         paused_since: Mutex::new(None),
         moved_at: Mutex::new(None),
@@ -89,7 +92,7 @@ pub fn base_size(cfg: &Shared, idle_icon: bool, info_only: bool) -> (f32, f32) {
     }
     let c = cfg.lock().unwrap();
     let tw = c.tb_text_w.clamp(32, 256) as f32;
-    let buttons = if info_only { 0.0 } else if c.tb_shuffle_btn { 64.0 } else { 48.0 };
+    let buttons = if info_only { 0.0 } else { 16.0 * (3 + c.tb_shuffle_btn as u32 + c.tb_like_btn as u32 + c.tb_add_btn as u32) as f32 };
     (16.0 + 2.0 + tw + 2.0 + buttons, 16.0)
 }
 
@@ -143,7 +146,7 @@ fn act(sh: &TbShared, ctx: &egui::Context, action: &str, p: &Play) {
             drop(solo);
             osd(sh, if d > 0.0 { "+10 s" } else { "-10 s" });
         }
-        "mute" | "shuffle" => {
+        "mute" | "shuffle" | "addremove" => {
             drop(solo);
             sh.app_actions.lock().unwrap().push(action.to_string());
             crate::desktop::wake(ctx);
@@ -388,9 +391,16 @@ pub fn ui(sh: &TbShared, ctx: &egui::Context) {
         let mut ui_st = sh.ui.lock().unwrap();
         let mut hover_now: Option<&'static str> = None;
         if !info_only {
-            let smart = sh.smart_on.load(Ordering::SeqCst);
-            let shuf_name = if smart { "tb_shuffle_smart" } else if play.shuffle { "tb_shuffle_on" } else { "tb_shuffle" };
-            let mut btns = vec![("prev", "tb_prev"), ("pp", if playing { "tb_pause" } else { "tb_play" }), ("next", "tb_next")];
+            let shuf_name = match cfg.shuffle_mode.as_str() { "spox" => "tb_shuffle_smart", "shuffle" => "tb_shuffle_on", _ => "tb_shuffle" };
+            let liked = { let l = sh.liked.lock().unwrap(); play.track.as_ref().map(|t| l.0 == t.uri && l.1).unwrap_or(false) };
+            let mut btns = Vec::new();
+            if cfg.tb_like_btn {
+                btns.push(("like", if liked { "tb_like_on" } else { "tb_like" }));
+            }
+            if cfg.tb_add_btn {
+                btns.push(("addremove", if sh.in_list.load(Ordering::SeqCst) == 2 { "tb_remove" } else { "tb_add" }));
+            }
+            btns.extend([("prev", "tb_prev"), ("pp", if playing { "tb_pause" } else { "tb_play" }), ("next", "tb_next")]);
             if cfg.tb_shuffle_btn {
                 btns.push(("shuffle", shuf_name));
             }
@@ -409,7 +419,7 @@ pub fn ui(sh: &TbShared, ctx: &egui::Context) {
                 spr(&n, x, 0.0, 16.0, 16.0);
                 if inp.2 && ov && ui_st.pressed == Some(idn) {
                     drop(ui_st);
-                    act(sh, ctx, match idn { "prev" => "prev", "pp" => "play_pause", "shuffle" => "shuffle", _ => "next" }, &play);
+                    act(sh, ctx, match idn { "prev" => "prev", "pp" => "play_pause", "shuffle" => "shuffle", "like" => "like", "addremove" => "addremove", _ => "next" }, &play);
                     ui_st = sh.ui.lock().unwrap();
                 }
             }

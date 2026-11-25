@@ -57,10 +57,18 @@ class MainActivity : Activity() {
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's player"; else -> "off" },
                 "Lock screen player" to SpoxNotification.lockStatus(this),
                 "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "card" -> "SpoX card"; else -> "pixel cover" },
+                "Mini player: heart and + / -" to if (prefs.getBoolean("mini_extras", true)) "on" else "off",
+                "App icon follows colour pack" to if (AppIcon.follows(this)) "on (when you leave SpoX)" else "off",
+                "Keep screen on" to when (prefs.getString("keep_on", "off")) { "player" -> "while playing"; "always" -> "while SpoX is open"; else -> "off" },
                 "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
                 "#Listening" to "",
                 "Sleep timer" to Player.sleepLabel(),
+                "Shuffle" to when (Smart.mode(this)) { "spox" -> "SpoX shuffle"; "shuffle" -> "shuffle"; else -> "in order" },
                 "SpoX shuffle: new songs" to "${Smart.ratio(this)}%",
+                "NEW tags in Up next" to if (prefs.getBoolean("show_new", true)) "on" else "off",
+                "Forget found new songs" to "reset",
+                "Pause when headphones disconnect" to if (prefs.getBoolean("pause_noisy", true)) "on" else "off",
+                "Carry on after calls" to if (prefs.getBoolean("resume_after_call", true)) "on" else "off",
                 "Volume buttons" to if (prefs.getBoolean("own_volume", true)) "SpoX volume" else "phone's slider",
                 "When you close SpoX" to when (io.github.oatomh.spox.engine.EngineService.onClose(this)) { "now" -> "quit at once"; "keep" -> "keep running"; else -> "quit when paused" },
                 "#Spotify app" to "",
@@ -125,6 +133,24 @@ class MainActivity : Activity() {
                 "Client ID" -> askClientId { }
                 "Sleep timer" -> Player.cycleSleep()
                 "SpoX shuffle: new songs" -> view.mixSheet()
+                "Shuffle" -> Player.toggleShuffle()
+                "NEW tags in Up next" -> prefs.edit().putBoolean("show_new", !prefs.getBoolean("show_new", true)).apply()
+                "Forget found new songs" -> view.confirm("Forget found new songs", "SpoX shuffle finds new songs again for every list (the first play of each list warms up for a few seconds).", "Forget", "Keep") {
+                    java.io.File(filesDir, "found").deleteRecursively()
+                    view.say("Found songs forgotten")
+                }
+                "Pause when headphones disconnect" -> prefs.edit().putBoolean("pause_noisy", !prefs.getBoolean("pause_noisy", true)).apply()
+                "Carry on after calls" -> prefs.edit().putBoolean("resume_after_call", !prefs.getBoolean("resume_after_call", true)).apply()
+                "Mini player: heart and + / -" -> prefs.edit().putBoolean("mini_extras", !prefs.getBoolean("mini_extras", true)).apply()
+                "App icon follows colour pack" -> {
+                    val on = !AppIcon.follows(this)
+                    AppIcon.setFollows(this, on)
+                    view.say(if (on) "The icon changes when you leave SpoX (the home screen may redraw)" else "Back to the normal icon when you leave SpoX")
+                }
+                "Keep screen on" -> {
+                    prefs.edit().putString("keep_on", when (prefs.getString("keep_on", "off")) { "off" -> "player"; "player" -> "always"; else -> "off" }).apply()
+                    keepScreen()
+                }
                 "When you close SpoX" -> io.github.oatomh.spox.engine.EngineService.cycleOnClose(this)
                 "Volume buttons" -> prefs.edit().putBoolean("own_volume", !prefs.getBoolean("own_volume", true)).apply()
                 "Updates" -> Updater.check(this, true) { runOnUiThread { view.invalidate() } }
@@ -315,8 +341,27 @@ class MainActivity : Activity() {
         return super.dispatchKeyEvent(e)
     }
 
+    override fun onStop() {
+        super.onStop()
+        AppIcon.apply(this)
+    }
+
+    /** Keep screen on: off / while music plays / while SpoX is open. Checked every few seconds. */
+    private fun keepScreen() {
+        val mode = getSharedPreferences("spox", 0).getString("keep_on", "off")
+        val on = mode == "always" || (mode == "player" && Player.state.playing)
+        if (on) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private val keepTick = object : Runnable {
+        override fun run() { keepScreen(); view.postDelayed(this, 5000) }
+    }
+
     override fun onResume() {
         super.onResume()
+        view.removeCallbacks(keepTick)
+        view.post(keepTick)
         // opened again after being swiped away: don't quit when the music pauses
         io.github.oatomh.spox.engine.EngineService.closed = false
         // coming back from the "Notification access" screen: start following the music app

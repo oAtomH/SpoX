@@ -102,6 +102,54 @@ pub fn note_known(name: &str, artists: &str) {
 
 /// Popular songs by artists similar to `artist` (Deezer's public API: related artists + their
 /// top songs), shuffled. (title, artist) pairs.
+/// Artists similar to `artist` (Deezer's free "related artists": no Spotify requests), shuffled.
+fn similar_artists(artist: &str) -> Vec<String> {
+    let get = |url: String| -> Option<Value> {
+        net::agent()
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .call()
+            .ok()?
+            .into_json()
+            .ok()
+    };
+    let Some(v) = get(format!(
+        "https://api.deezer.com/search/artist?limit=1&q={}",
+        enc(artist)
+    )) else {
+        return Vec::new();
+    };
+    let Some(id) = v.pointer("/data/0/id").and_then(|x| x.as_u64()) else {
+        return Vec::new();
+    };
+    let Some(rel) = get(format!(
+        "https://api.deezer.com/artist/{}/related?limit=25",
+        id
+    )) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = rel
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut rng = Rng::new();
+    for i in (1..out.len()).rev() {
+        let j = rng.below(i + 1);
+        out.swap(i, j);
+    }
+    out
+}
+
+#[allow(dead_code)]
 fn similar_songs(artist: &str) -> Vec<(String, String)> {
     let get = |url: String| -> Option<Value> { net::agent().get(&url).timeout(Duration::from_secs(10)).call().ok()?.into_json().ok() };
     let Some(v) = get(format!("https://api.deezer.com/search/artist?limit=1&q={}", enc(artist))) else { return Vec::new() };
@@ -201,6 +249,8 @@ struct Engine {
     rng: Rng,
     finding: Arc<std::sync::atomic::AtomicUsize>,
     busy: String,
+    /// the first seconds of a list with no new songs yet
+    warm_until: Option<Instant>,
 }
 
 pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<String>) -> (Sender<Cmd>, Sender<Value>) {
@@ -248,6 +298,7 @@ pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<Strin
                 rng: Rng::new(),
                 finding: Default::default(),
                 busy: String::new(),
+                warm_until: None,
             };
             e.restore();
             e.report();
@@ -321,11 +372,16 @@ impl Engine {
         }
     }
 
+    /// The new-songs share in use: only with the shuffle button on "SpoX shuffle".
     fn ratio(&self) -> u32 {
         if !self.shuffled {
             return 0;
         }
-        self.cfg.lock().unwrap().smart_ratio.min(100)
+        let c = self.cfg.lock().unwrap();
+        if c.shuffle_mode != "spox" {
+            return 0;
+        }
+        c.smart_ratio.min(100)
     }
 
     fn send(&self, c: String) {
@@ -351,6 +407,7 @@ impl Engine {
             on: self.on,
             shuffled: self.shuffled,
             list: self.playlist.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
+            list_uri: self.playlist.as_ref().map(|p| p.uri.clone()).unwrap_or_default(),
             new_uris: self.new_uris.clone(),
             upcoming,
             busy: self.busy.clone(),
@@ -367,9 +424,17 @@ impl Engine {
     }
 
     fn work(&mut self) {
+        // the first new songs for this list arrived: plan with them and hand the full plan over
+        if self.warm_until.is_some()
+            && (self.pool.lock().unwrap().len() >= 6
+                || self.warm_until.map(|t| Instant::now() >= t).unwrap_or(true))
+        {
+            self.warm_until = None;
+            self.dirty = true;
+        }
         let hungry = self.plan();
-        if self.ratio() > 0 && (hungry || self.pool.lock().unwrap().len() < 12) {
-            self.discover(if hungry { 3 } else { 1 });
+        if self.ratio() > 0 && (hungry || self.pool.lock().unwrap().len() < 20) {
+            self.discover();
         }
         self.save();
         self.report();
@@ -418,17 +483,13 @@ impl Engine {
         }
         self.bag = order.into();
         let r = self.ratio();
-        if r > 0 {
-            // a few new songs ready first, so Up next is full straight away
-            self.busy = "Finding new songs...".into();
-            self.report();
-            let want = if r >= 100 { 10 } else { 4 };
-            let until = Instant::now() + Duration::from_secs(6);
-            while self.pool.lock().unwrap().len() < want && Instant::now() < until {
-                self.discover_now();
-            }
-            self.busy.clear();
-        }
+        // new songs found for this list before: ready at once (more are found in the background)
+        self.load_found();
+        self.warm_until = if r > 0 && self.pool.lock().unwrap().len() < 10 {
+            Some(Instant::now() + Duration::from_secs(10))
+        } else {
+            None
+        };
         let same = start_with.is_some();
         let t = start_with.or_else(|| if r >= 100 { self.pick_new("") } else { self.bag.pop_front() });
         let Some(t) = t else {
@@ -607,11 +668,18 @@ impl Engine {
                     continue;
                 }
                 hungry = true;
-                if self.deck.len() - self.index - 1 >= 15 {
+                // the first seconds of a list with no new songs yet: plan a few, wait for the
+                // first new ones, then fill Up next in one go
+                if self.warm_until.map(|t| Instant::now() < t).unwrap_or(false)
+                    && self.deck.len() - self.index - 1 >= 5
+                {
                     break;
                 }
-                // running low: carry on without the new song
+                // no new song ready: carry on with the list, never wait
                 self.need_new = 0;
+                if r >= 100 && self.bag.is_empty() && self.seeds.is_empty() {
+                    break;
+                }
             }
             if self.bag.is_empty() {
                 // the whole list played: a fresh shuffled round, the songs just heard last
@@ -635,7 +703,64 @@ impl Engine {
                 }
             }
         }
+        // Spotify has a much shorter list than what's planned now: hand it over at the next song change
+        if let Some(cur) = self.deck.get(self.index) {
+            if let Some(i) = self.sent.iter().position(|u| *u == cur.t.uri) {
+                if self.sent.len() < WIN_BACK + WIN_AHEAD
+                    && self.deck.len() - self.index - 1 > self.sent.len() - 1 - i + 10
+                {
+                    self.dirty = true;
+                }
+            }
+        }
         hungry
+    }
+
+    fn found_path(&self) -> Option<std::path::PathBuf> {
+        let p = self.playlist.as_ref()?;
+        let name: String = p
+            .uri
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        Some(
+            config::config_dir()
+                .join("found")
+                .join(format!("{}.json", name)),
+        )
+    }
+
+    /// New songs found for this list before (kept so starting it again is instant).
+    fn load_found(&mut self) {
+        let Some(path) = self.found_path() else {
+            return;
+        };
+        let Some(Value::Array(a)) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        else {
+            return;
+        };
+        let mut ts: Vec<Track> = a
+            .iter()
+            .map(|e| Track {
+                uri: e[0].as_str().unwrap_or("").into(),
+                name: e[1].as_str().unwrap_or("").into(),
+                artists: e[2].as_str().unwrap_or("").into(),
+                ..Default::default()
+            })
+            .collect();
+        for i in (1..ts.len()).rev() {
+            let j = self.rng.below(i + 1);
+            ts.swap(i, j);
+        }
+        let fresh: Vec<Track> = ts.into_iter().filter(|t| !self.is_known(t)).collect();
+        let mut pool = self.pool.lock().unwrap();
+        for t in fresh {
+            if !pool.iter().any(|p| p.uri == t.uri) {
+                pool.push_back(t);
+            }
+        }
     }
 
     fn on_track(&mut self) {
@@ -719,22 +844,16 @@ impl Engine {
         Some(self.seeds[self.rng.below(self.seeds.len())].clone())
     }
 
-    /// Look for new songs on up to `jobs` threads at once.
-    fn discover(&mut self, jobs: usize) {
+    /// One worker looks for new songs (its Spotify requests use the slow background lane).
+    fn discover(&mut self) {
         use std::sync::atomic::Ordering;
-        while self.finding.load(Ordering::SeqCst) < jobs && self.pool.lock().unwrap().len() < 30 {
-            let Some(seed) = self.seed() else { return };
-            self.finding.fetch_add(1, Ordering::SeqCst);
-            let job = self.job(seed);
-            std::thread::spawn(move || job.run());
+        if self.finding.load(Ordering::SeqCst) > 0 || self.pool.lock().unwrap().len() >= 30 {
+            return;
         }
-    }
-
-    fn discover_now(&mut self) {
-        if let Some(seed) = self.seed() {
-            self.finding.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.job(seed).run();
-        }
+        let Some(seed) = self.seed() else { return };
+        self.finding.fetch_add(1, Ordering::SeqCst);
+        let job = self.job(seed);
+        std::thread::spawn(move || job.run());
     }
 
     fn job(&self, seed: Track) -> Discover {
@@ -746,6 +865,7 @@ impl Engine {
             used: self.used.clone(),
             api: self.api.clone(),
             finding: self.finding.clone(),
+            found: self.found_path(),
         }
     }
 
@@ -807,6 +927,8 @@ struct Discover {
     api: crate::web::Api,
     /// how many look-ups run (the caller counted this one in already)
     finding: Arc<std::sync::atomic::AtomicUsize>,
+    /// where the songs found for this list are kept
+    found: Option<std::path::PathBuf>,
 }
 
 impl Discover {
@@ -827,11 +949,43 @@ impl Discover {
     }
 
     fn run(self) {
-        let mut added = 0;
-        if !self.lastfm.is_empty() {
-            // Last.fm "similar tracks" for the seed song
+        let mut found: Vec<Track> = Vec::new();
+        // three artists similar to the seed (Deezer), then ONE Spotify search per artist that
+        // brings ten of their songs; up to three you don't know are kept per artist. (Before,
+        // every song cost its own search, which ran into Spotify's request limit.)
+        let seed_artist = first_artist_raw(&self.seed.artists);
+        let mut artists = similar_artists(&seed_artist);
+        artists.truncate(3);
+        if artists.is_empty() {
+            artists.push(seed_artist);
+        }
+        for a in artists {
+            let mut ts: Vec<Track> = self
+                .api
+                .search_artist(&a)
+                .into_iter()
+                .filter(|t| first_artist(&t.artists) == a.to_lowercase())
+                .collect();
+            let mut rng = Rng::new();
+            for i in (1..ts.len()).rev() {
+                let j = rng.below(i + 1);
+                ts.swap(i, j);
+            }
+            let mut n = 0;
+            for t in ts {
+                if n >= 3 {
+                    break;
+                }
+                if self.add(t.clone()) {
+                    found.push(t);
+                    n += 1;
+                }
+            }
+        }
+        if !self.lastfm.is_empty() && found.len() < 3 {
+            // optional: Last.fm "similar tracks" for the seed song
             let url = format!(
-                "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar&autocorrect=1&limit=40&format=json&api_key={}&artist={}&track={}",
+                "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar&autocorrect=1&limit=20&format=json&api_key={}&artist={}&track={}",
                 enc(&self.lastfm), enc(&first_artist_raw(&self.seed.artists)), enc(&self.seed.name)
             );
             let list: Vec<(String, String)> = net::agent()
@@ -845,46 +999,34 @@ impl Discover {
                 .iter()
                 .filter_map(|t| Some((t.get("name")?.as_str()?.to_string(), t.pointer("/artist/name")?.as_str()?.to_string())))
                 .collect();
-            for (name, artist) in list {
-                if added >= 6 {
-                    break;
-                }
+            for (name, artist) in list.into_iter().take(4) {
                 if self.known(&key(&name, &artist)) {
                     continue;
                 }
                 if let Some(t) = self.api.search_track(&artist, &name) {
-                    if self.add(t) {
-                        added += 1;
+                    if self.add(t.clone()) {
+                        found.push(t);
                     }
                 }
             }
         }
-        if added < 3 {
-            // songs by artists SIMILAR to the seed's (Deezer's free "related artists")
-            for (title, artist) in similar_songs(&first_artist_raw(&self.seed.artists)) {
-                if added >= 4 {
-                    break;
-                }
-                if self.known(&key(&title, &artist)) {
-                    continue;
-                }
-                if let Some(t) = self.api.search_track(&artist, &title) {
-                    if self.add(t) {
-                        added += 1;
-                    }
+        // keep what was found for this list (up to 400), so the next start is instant
+        if let (Some(path), false) = (&self.found, found.is_empty()) {
+            let mut all: Vec<Value> = std::fs::read(path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+                .unwrap_or_default();
+            for t in &found {
+                if !all.iter().any(|e| e[0].as_str() == Some(t.uri.as_str())) {
+                    all.push(json!([t.uri, t.name, t.artists]));
                 }
             }
-        }
-        if added == 0 {
-            // nothing similar found: other songs by the seed's own artist
-            for t in self.api.search_artist(&first_artist_raw(&self.seed.artists)) {
-                if self.add(t) {
-                    added += 1;
-                }
-                if added >= 3 {
-                    break;
-                }
-            }
+            let skip = all.len().saturating_sub(400);
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            let _ = std::fs::write(
+                path,
+                Value::Array(all.into_iter().skip(skip).collect()).to_string(),
+            );
         }
         self.finding.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }

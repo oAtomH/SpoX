@@ -346,13 +346,33 @@ class PlayerView(ctx: Context) : View(ctx) {
         spr(cv, if (pressed == "mini_play") "${btn}_down" else btn, bx, by, u)
         spr(cv, if (pressed == "mini_next") "btn_next_down" else "btn_next", nx, by, u)
         miniRect = RectF(0f, top, width.toFloat(), top + h)
+        // heart and + / - in front of them (Settings → Mini player buttons)
+        var left = px
+        if (Player.fromEngine && Web.signedIn && miniExtras(context)) {
+            checkLiked()
+            val lw = sprW("btn_like", u)
+            val lby = top + (h - sprH("btn_like", u)) / 2
+            val uri = Player.engineTrackUri()
+            val inPl = if (uri != null) Web.inPlaylist(plusList(), uri) else null
+            if (inPl != null) {
+                val ax = left - lw - 2 * u
+                val b = if (inPl) "btn_remove" else "btn_add"
+                spr(cv, if (pressed == "plus") "${b}_down" else b, ax, lby, u)
+                hit(ax - u, top, left - u, top + h, "plus")
+                left = ax
+            }
+            val lx = left - lw - 2 * u
+            spr(cv, if (liked == true || pressed == "like") "btn_like_down" else "btn_like", lx, lby, u)
+            hit(lx - u, top, left - u, top + h, "like")
+            left = lx
+        }
         val tx = pad + a + 6 * u
-        val textW = px - tx - 6 * u
+        val textW = left - tx - 6 * u
         marquee(cv, st.title, tx, top + 6 * u, textW, u, cTitle, now)
         txt(cv, fit(st.artist, textW, u), tx, top + 17 * u, u, cInfo)
         // progress line along the top edge
         if (st.durationMs > 0) box(cv, 0f, top, width * (st.position(now).toFloat() / st.durationMs).coerceIn(0f, 1f), max(1f, u / 2), cTitle)
-        hit(0f, top, px - 2 * u, top + h, "tab:PLAYER")
+        hit(0f, top, left - 2 * u, top + h, "tab:PLAYER")
         hit(px - 2 * u, top, bx - u, top + h, "mini_prev")
         hit(bx - u, top, nx - u, top + h, "mini_play")
         hit(nx - u, top, width.toFloat(), top + h, "mini_next")
@@ -830,7 +850,8 @@ class PlayerView(ctx: Context) : View(ctx) {
                 box(cv, 0f, ry + 4 * u, 2 * u, rh - 8 * u, accent)
             }
             // tag on the right: NEW = never heard; "pick" = SpoX/Spotify brought it in
-            val tag = when { q.neverHeard -> "NEW"; q.outside -> "pick"; else -> "" }
+            val tags = context.getSharedPreferences("spox", 0).getBoolean("show_new", true)
+            val tag = when { !tags -> ""; q.neverHeard -> "NEW"; q.outside -> "pick"; else -> "" }
             var tagW = 0f
             if (tag.isNotEmpty()) {
                 tagW = tw(tag, u) + 8 * u
@@ -1284,6 +1305,8 @@ class PlayerView(ctx: Context) : View(ctx) {
     }
 
     var onDevices: (() -> Unit)? = null
+
+    private fun miniExtras(ctx: Context) = ctx.getSharedPreferences("spox", Context.MODE_PRIVATE).getBoolean("mini_extras", true)
 
     /** The playlist + / - works on: SpoX shuffle's list, else the one playing. */
     private fun plusList(): String = Smart.listUri.takeIf { Smart.on && it.startsWith("spotify:playlist:") }
