@@ -885,8 +885,14 @@ impl App {
         let shuffle = self.shuffle_mode() != "off";
         if self.signed_in {
             if let Some(sm) = &self.smart {
-                let tracks = if shuffle { self.tracks_all.clone() } else { self.tracks.clone() };
-                let _ = sm.send(crate::smart::Cmd::Start { playlist: p, tracks, first: Some(t.uri.clone()), shuffle, position: 0 });
+                let _ = sm.send(crate::smart::Cmd::Start {
+                    playlist: p,
+                    tracks: self.tracks_all.clone(),
+                    order: self.tracks.clone(),
+                    first: Some(t.uri.clone()),
+                    shuffle,
+                    position: 0,
+                });
                 return;
             }
         }
@@ -948,6 +954,17 @@ impl App {
 
     /// Repeat is a simple on/off for the playlist.
     fn cycle_repeat(&mut self) {
+        // SpoX plays songs one by one (its list never runs out): repeat = this song again
+        if self.smart_on {
+            let on = self.play.repeat == "off";
+            self.send(command_with("set_repeat_context", "enabled", json!(false)));
+            self.send(command_with("set_repeat_track", "enabled", json!(on)));
+            let r = if on { "track" } else { "off" };
+            self.play.repeat = r.into();
+            self.hold_repeat = Some((r.into(), Instant::now()));
+            self.osd(if on { "REPEAT THIS SONG" } else { "REPEAT OFF" });
+            return;
+        }
         // order as documented by Soloist: turn track-repeat off first, then set context-repeat
         self.send(command_with("set_repeat_track", "enabled", json!(false)));
         if self.play.repeat == "off" {
@@ -1012,7 +1029,7 @@ impl App {
         if let Some(s) = &self.smart {
             let cur = self.play.track.as_ref().map(|t| t.uri.clone());
             let at = if cur.as_ref().map(|u| tracks.iter().any(|t| &t.uri == u)).unwrap_or(false) { self.play.position(now_ms()) as u64 } else { 0 };
-            let _ = s.send(crate::smart::Cmd::Start { playlist: pl, tracks, first: cur, shuffle: true, position: at });
+            let _ = s.send(crate::smart::Cmd::Start { playlist: pl, tracks, order: Vec::new(), first: cur, shuffle: true, position: at });
             self.smart_on = true;
             self.smart_shuffled = true;
             self.play.shuffle = true;
@@ -1066,17 +1083,25 @@ impl App {
             "shuffle" => "SHUFFLE",
             _ => "SHUFFLE OFF",
         };
+        if self.smart_on {
+            // SpoX plays the list already: only what's ahead changes, the song carries on
+            if let Some(sm) = &self.smart {
+                let _ = sm.send(crate::smart::Cmd::Mode(next != "off"));
+            }
+            self.osd(label);
+            self.refresh_at = Some(Instant::now() + Duration::from_millis(700));
+            return;
+        }
         match (self.signed_in, self.smart_source(), &self.smart) {
             (true, Some((pl, tracks)), Some(sm)) => {
-                let mut tracks = tracks;
-                if next == "off" {
-                    tracks.sort_by_key(|t| t.order);
-                }
+                let mut order = tracks.clone();
+                order.sort_by_key(|t| t.order);
                 let cur = self.play.track.as_ref().map(|t| t.uri.clone());
                 let at = self.play.position(now_ms()) as u64;
                 let _ = sm.send(crate::smart::Cmd::Start {
                     playlist: pl,
                     tracks,
+                    order,
                     first: cur,
                     shuffle: next != "off",
                     position: at,
@@ -2907,7 +2932,10 @@ impl App {
                 self.send(command_with("play", "uri", json!(u)));
             }
             CtxAct::QueueTrack(u) => {
-                self.send(command_with("add_to_queue", "uri", json!(u)));
+                // SpoX plays a list: the song goes into SpoX's own order (right after this one)
+                if !self.smart_on {
+                    self.send(command_with("add_to_queue", "uri", json!(u)));
+                }
                 if self.smart_on {
                     let t = self.tracks_all.iter().chain(self.history.iter().map(|h| &h.0)).find(|t| t.uri == u).cloned();
                     if let (Some(t), Some(sm)) = (t, &self.smart) {
