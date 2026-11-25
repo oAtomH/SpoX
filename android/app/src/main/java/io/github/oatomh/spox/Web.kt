@@ -25,7 +25,9 @@ object Web {
     private const val SCOPES = "playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public " +
         "user-library-read user-library-modify user-read-private user-read-playback-state user-modify-playback-state"
 
-    class Item(val uri: String, val title: String, val sub: String, val kind: String, val id: String = "")
+    /** A song, list or artist. For songs: sub = artists, plus album, length and when it was added. */
+    class Item(val uri: String, val title: String, val sub: String, val kind: String, val id: String = "",
+               val album: String = "", val durationMs: Long = 0, val added: Long = 0, val order: Int = 0)
 
     private lateinit var app: Context
     private val prefs get() = app.getSharedPreferences("web", 0)
@@ -146,10 +148,16 @@ object Web {
 
     private fun artists(t: JSONObject) = t.optJSONArray("artists")?.let { a -> (0 until a.length()).joinToString(", ") { a.optJSONObject(it)?.optString("name").orEmpty() } }.orEmpty()
 
-    fun track(t: JSONObject?): Item? {
+    fun track(t: JSONObject?, added: Long = 0, order: Int = 0): Item? {
         if (t == null || !t.has("uri")) return null
-        return Item(t.optString("uri"), t.optString("name"), artists(t), "track", t.optString("id"))
+        return Item(t.optString("uri"), t.optString("name"), artists(t), "track", t.optString("id"),
+            t.optJSONObject("album")?.optString("name").orEmpty(), t.optLong("duration_ms"), added, order)
     }
+
+    /** "2025-03-01T12:00:00Z" -> epoch ms (0 if missing). */
+    private fun time(s: String?): Long = runCatching {
+        if (s.isNullOrEmpty() || s == "null") 0L else java.time.Instant.parse(s).toEpochMilli()
+    }.getOrDefault(0L)
 
     fun playlists(): List<Item> {
         val out = mutableListOf(Item("liked", "Liked Songs", "your saved songs", "liked"))
@@ -179,7 +187,8 @@ object Web {
             val items = v.optJSONArray("items") ?: break
             for (i in 0 until items.length()) {
                 val e = items.optJSONObject(i) ?: continue
-                (track(e.optJSONObject("item") ?: e.optJSONObject("track")) ?: track(e))?.let { out += it }
+                val at = time(e.optString("added_at"))
+                (track(e.optJSONObject("item") ?: e.optJSONObject("track"), at, out.size) ?: track(e, at, out.size))?.let { out += it }
             }
             next = v.optString("next").takeIf { it.isNotEmpty() && it != "null" }
         }
@@ -202,8 +211,17 @@ object Web {
         return out
     }
 
-    fun isLiked(trackId: String): Boolean? = get("/me/tracks/contains?ids=$trackId")?.optJSONArray("list")?.optBoolean(0)
-    fun setLiked(trackId: String, on: Boolean) = send(if (on) "PUT" else "DELETE", "/me/tracks?ids=$trackId")
+    // Spotify's February 2026 API: one "library" endpoint for every kind of thing, by uri
+    // (the old /me/tracks/contains and PUT /me/tracks were removed, which broke liking)
+    fun isLiked(trackId: String): Boolean? {
+        val uri = enc("spotify:track:$trackId")
+        return get("/me/library/contains?uris=$uri")?.optJSONArray("list")?.let { if (it.length() > 0) it.optBoolean(0) else null }
+    }
+    fun setLiked(trackId: String, on: Boolean): Boolean {
+        val uri = "spotify:track:$trackId"
+        val ok = send(if (on) "PUT" else "DELETE", "/me/library?uris=${enc(uri)}")
+        return ok
+    }
 
     // ---- songs you know, according to Spotify (Liked Songs, the playing playlist, recent plays) ----
 
@@ -248,21 +266,32 @@ object Web {
 
     private val playlistCache = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
 
-    /** Is the song in this playlist? null while loading / unknown. */
+    private val playlistAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Is the song in this playlist? null while loading / unknown. Re-read every 2 minutes, so
+     *  songs added or removed on another device show the right button here too. */
     fun inPlaylist(context: String, uri: String): Boolean? {
         if (!context.startsWith("spotify:playlist:")) return null
+        val now = System.currentTimeMillis()
         val set = playlistCache[context]
-        if (set == null) {
-            playlistCache[context] = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+        if (set == null || now - (playlistAt[context] ?: 0) > 120_000) {
+            if (set == null) playlistCache[context] = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+            playlistAt[context] = now
             thread {
                 val uris = tracks(Item(context, "", "", "playlist", context.substringAfterLast(':'))).map { it.uri }
-                playlistCache[context]?.addAll(uris)
-                playlistLoaded += context
-                changed()
+                if (uris.isNotEmpty() || context !in playlistLoaded) {
+                    playlistCache[context]?.let { s -> s.retainAll(uris.toSet()); s.addAll(uris) }
+                    playlistLoaded += context
+                    changed()
+                }
             }
-            return null
         }
-        return if (context in playlistLoaded) uri in set else null
+        return if (context in playlistLoaded) uri in (playlistCache[context] ?: return null) else null
+    }
+    /** Optimistic change (the button flips at once; [addTo]/[removeFrom] confirm it). */
+    fun markInPlaylist(context: String, uri: String, inside: Boolean) {
+        playlistCache[context]?.let { if (inside) it.add(uri) else it.remove(uri) }
+        changed()
     }
     private val playlistLoaded = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
@@ -295,11 +324,31 @@ object Web {
     /** Moves what's playing to another device (any Spotify app, SpoX or speaker), keeps playing. */
     fun transfer(deviceId: String): Boolean = send("PUT", "/me/player", JSONObject().put("device_ids", JSONArray().put(deviceId)).put("play", true))
 
+    @Volatile private var phoneId = ""
+    private fun phoneDevice(): String? {
+        phoneId.takeIf { it.isNotEmpty() }?.let { return it }
+        return get("/me/player/devices")?.optJSONArray("devices")?.let { a ->
+            (0 until a.length()).mapNotNull { a.optJSONObject(it) }.firstOrNull { it.optString("name") == "SpoX Phone" }?.optString("id")
+        }?.also { phoneId = it }
+    }
+
+    /** Plays exactly these songs, in this order, on SpoX Phone (SpoX's own shuffle and sorting).
+     *  [positionMs] starts the first one part-way (to carry on without a jump). */
+    fun playUris(uris: List<String>, positionMs: Long = 0): Boolean {
+        if (uris.isEmpty()) return false
+        val body = JSONObject().put("uris", JSONArray(uris.take(100)))
+        if (positionMs > 0) body.put("position_ms", positionMs)
+        for (attempt in 0..1) {
+            val dev = phoneDevice() ?: return false
+            if (send("PUT", "/me/player/play?device_id=${enc(dev)}", body)) return true
+            phoneId = "" // the id changes when the engine restarts: look it up again
+        }
+        return false
+    }
+
     /** Play a song inside its playlist/album on SpoX Phone (so "next" continues in the list). */
     fun playIn(context: String?, track: String?, uris: List<String> = emptyList()): Boolean {
-        val dev = get("/me/player/devices")?.optJSONArray("devices")?.let { a ->
-            (0 until a.length()).mapNotNull { a.optJSONObject(it) }.firstOrNull { it.optString("name") == "SpoX Phone" }?.optString("id")
-        } ?: return false
+        val dev = phoneDevice() ?: return false
         val body = JSONObject()
         if (context != null && context != "liked") {
             body.put("context_uri", context)
@@ -309,6 +358,11 @@ object Web {
             val i = uris.indexOf(track).coerceAtLeast(0)
             body.put("uris", JSONArray(uris.drop(i).take(100)))
         }
-        return send("PUT", "/me/player/play?device_id=${enc(dev)}", body)
+        val ok = send("PUT", "/me/player/play?device_id=${enc(dev)}", body)
+        if (!ok) phoneId = ""
+        return ok
     }
+
+    /** Spotify Connect name of the device playing right now (for "Playing on ..."). */
+    fun activeDevice(): Device? = devices().firstOrNull { it.active }
 }

@@ -25,7 +25,21 @@ class EngineService : Service() {
         private const val STOP = "stop"
         fun start(c: Context) = c.startForegroundService(Intent(c, EngineService::class.java))
         fun stop(c: Context) = c.startService(Intent(c, EngineService::class.java).setAction(STOP))
+
+        /** What closing SpoX (swiping it away) does: "paused" = quit once the music is paused
+         *  (right away if it is), "now" = quit at once, "keep" = keep running like before. */
+        fun onClose(c: Context) = c.getSharedPreferences("spox", 0).getString("on_close", "paused") ?: "paused"
+        fun cycleOnClose(c: Context) {
+            val next = when (onClose(c)) { "paused" -> "now"; "now" -> "keep"; else -> "paused" }
+            c.getSharedPreferences("spox", 0).edit().putString("on_close", next).apply()
+        }
+
+        /** SpoX was swiped away: quit when the music stops (see [onClose]). Opening it again clears it. */
+        @Volatile var closed = false
     }
+
+    private var stopping = false
+    private var restarts = ArrayList<Long>()
 
     private lateinit var engine: Engine
     private var wake: PowerManager.WakeLock? = null
@@ -49,19 +63,55 @@ class EngineService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(SpoxNotification.ID, SpoxNotification.placeholder(this, "Engine starting... pick \"SpoX Phone\" in Spotify Connect once"))
         if (intent?.action == STOP) {
-            engine.stopLive()
-            finish()
+            quit()
             return START_NOT_STICKY
         }
+        closed = false
+        main.removeCallbacks(idleQuit)
+        stopping = false
         if (!engine.isLive) engine.startLive(engine.prefs.getString("key", "").orEmpty())
         SpoxNotification.update(this)
+        main.removeCallbacks(refresh)
+        main.postDelayed(refresh, 45_000)
         return START_STICKY
     }
 
     private fun finish() {
         release()
+        main.removeCallbacks(refresh)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    /** Stops Soloist and SpoX's player (nothing of SpoX keeps running). */
+    private fun quit() {
+        stopping = true
+        engine.stopLive()
+        finish()
+        runCatching { getSystemService(android.app.NotificationManager::class.java).cancel(SpoxNotification.ID) }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        when (onClose(this)) {
+            "keep" -> {}
+            "now" -> quit()
+            else -> {
+                closed = true
+                if (!engine.now.playing) quit()
+            }
+        }
+    }
+
+    // paused for a while after SpoX was closed: quit (a short pause, like a call, keeps it)
+    private val idleQuit = Runnable { if (closed && !engine.now.playing) quit() }
+
+    // the lock screen / Now Bar player is posted again now and then, so Android doesn't drop it
+    private val refresh = object : Runnable {
+        override fun run() {
+            SpoxNotification.refresh(this@EngineService)
+            main.postDelayed(this, 45_000)
+        }
     }
 
     override fun onDestroy() {
@@ -71,7 +121,19 @@ class EngineService : Service() {
         super.onDestroy()
     }
 
-    private val ended: (org.json.JSONObject?) -> Unit = { m -> if (m == null) main.post { finish() } }
+    // Soloist stopped. Meant to: done. By itself (it crashed): start it again, up to 3 times in 10 min.
+    private val ended: (org.json.JSONObject?) -> Unit = { m ->
+        if (m == null) main.post {
+            val now = System.currentTimeMillis()
+            restarts.removeAll { now - it > 10 * 60_000 }
+            val want = getSharedPreferences("spox", 0).getBoolean("engine_on", false) && !closed
+            if (!stopping && want && restarts.size < 3) {
+                restarts += now
+                engine.log("Soloist stopped by itself: starting it again")
+                main.postDelayed({ if (!stopping && !engine.isLive) engine.startLive(engine.prefs.getString("key", "").orEmpty()) }, 2500)
+            } else finish()
+        }
+    }
 
     private val changed: () -> Unit = { main.post { locks() } }
 
@@ -88,7 +150,10 @@ class EngineService : Service() {
                 getSystemService(AudioManager::class.java).requestAudioFocus(f)
                 focus = f
             }
-        } else release()
+        } else {
+            release()
+            if (closed) { main.removeCallbacks(idleQuit); main.postDelayed(idleQuit, 3 * 60_000) }
+        }
     }
 
     private fun release() {

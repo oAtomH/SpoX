@@ -32,7 +32,7 @@ class MainActivity : Activity() {
         setContentView(view)
         if (Build.VERSION.SDK_INT >= 33) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) {
-                if (!view.back()) finish()
+                if (!view.back()) moveTaskToBack(true)
             }
         }
         view.fps = getSharedPreferences("spox", 0).getInt("fps", 30)
@@ -57,7 +57,9 @@ class MainActivity : Activity() {
                 "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
                 "#Listening" to "",
                 "Sleep timer" to Player.sleepLabel(),
-                "Smart shuffle: new songs" to "${Smart.ratio(this)}%",
+                "SpoX shuffle: new songs" to "${Smart.ratio(this)}%",
+                "Volume buttons" to if (prefs.getBoolean("own_volume", true)) "SpoX volume" else "phone's slider",
+                "When you close SpoX" to when (io.github.oatomh.spox.engine.EngineService.onClose(this)) { "now" -> "quit at once"; "keep" -> "keep running"; else -> "quit when paused" },
                 "#Spotify app" to "",
                 "Notification access" to if (Player.hasAccess(this)) "allowed" else "allow...",
                 "Hide Spotify's own player" to "open...",
@@ -89,7 +91,7 @@ class MainActivity : Activity() {
                     val eng = io.github.oatomh.spox.engine.Engine.get(this)
                     getSystemService(android.content.ClipboardManager::class.java)
                         .setPrimaryClip(android.content.ClipData.newPlainText("SpoX Engine report", eng.reportText()))
-                    android.widget.Toast.makeText(this, "Engine report copied", android.widget.Toast.LENGTH_SHORT).show()
+                    view.say("Engine report copied")
                 }
                 "Colour pack" -> {
                     val names = Skin.PACKS.map { it.name }
@@ -100,13 +102,13 @@ class MainActivity : Activity() {
                 }
                 "Lock screen art" -> SpoxNotification.cycleLockArt(this)
                 "Account" -> if (Web.signedIn) {
-                    android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                        .setTitle("Spotify account").setMessage("Signed in as ${Web.userName()}.")
-                        .setPositiveButton("Sign out") { _, _ -> Web.signOut() }.setNegativeButton("Keep", null).show()
+                    view.confirm("Spotify account", "Signed in as ${Web.userName()}.", "Sign out", "Keep") { Web.signOut() }
                 } else signIn()
                 "Client ID" -> askClientId { }
                 "Sleep timer" -> Player.cycleSleep()
-                "Smart shuffle: new songs" -> Smart.cycleRatio(this)
+                "SpoX shuffle: new songs" -> view.mixSheet()
+                "When you close SpoX" -> io.github.oatomh.spox.engine.EngineService.cycleOnClose(this)
+                "Volume buttons" -> prefs.edit().putBoolean("own_volume", !prefs.getBoolean("own_volume", true)).apply()
                 "Updates" -> Updater.check(this, true) { runOnUiThread { view.invalidate() } }
                 "Smoothness" -> {
                     val next = when (prefs.getInt("fps", 30)) { 30 -> 60; 60 -> 15; else -> 30 }
@@ -139,7 +141,7 @@ class MainActivity : Activity() {
 
     @Deprecated("still the simplest way for a plain Activity")
     override fun onBackPressed() {
-        if (!view.back()) @Suppress("DEPRECATION") super.onBackPressed()
+        if (!view.back()) moveTaskToBack(true)
     }
 
     /** RAM: SpoX itself, and SpoX Engine (Soloist) running next to it. */
@@ -166,22 +168,25 @@ class MainActivity : Activity() {
 
     /** Move the music to another device: your PC (Spotify or SpoX), a speaker, this phone... */
     private fun pickDevice() {
+        view.say("Looking for devices...")
         kotlin.concurrent.thread {
             val list = Web.devices()
             runOnUiThread {
                 if (list.isEmpty()) {
-                    android.widget.Toast.makeText(this, "No devices: open Spotify (or SpoX) on the other device", android.widget.Toast.LENGTH_LONG).show()
+                    view.say("No devices: open Spotify (or SpoX) on the other device")
                     return@runOnUiThread
                 }
-                val names = list.map { (if (it.active) "▶ " else "") + it.name + "  (" + it.type.lowercase() + ")" }.toTypedArray()
-                android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                    .setTitle("Play on...")
-                    .setItems(names) { _, i ->
+                val out = Player.output(this)
+                val here = if (out.kind != "phone" && out.name.isNotEmpty()) "Sound: ${out.name}" else ""
+                view.show(PlayerView.Sheet("Play on", if (here.isEmpty()) emptyList() else listOf(here), list.map { d ->
+                    val kind = if (d.name == "SpoX Phone") "this phone" else when (d.type.lowercase()) { "computer" -> "PC"; "smartphone" -> "phone"; "speaker" -> "speaker"; "tv" -> "TV"; "automobile" -> "car"; else -> d.type.lowercase() }
+                    PlayerView.SheetItem(d.name, if (d.active) "playing" else kind, d.active) {
                         kotlin.concurrent.thread {
-                            val ok = Web.transfer(list[i].id)
-                            runOnUiThread { android.widget.Toast.makeText(this, if (ok) "Playing on ${list[i].name}" else "Couldn't move it to ${list[i].name}", android.widget.Toast.LENGTH_SHORT).show() }
+                            val ok = Web.transfer(d.id)
+                            runOnUiThread { view.say(if (ok) "Playing on ${d.name}" else "Couldn't move it to ${d.name}") }
                         }
-                    }.show()
+                    }
+                }))
             }
         }
     }
@@ -192,28 +197,13 @@ class MainActivity : Activity() {
 
     /** Your Spotify developer app's Client ID: the same one as SpoX on Windows. */
     private fun askClientId(then: () -> Unit) {
-        val box = android.widget.EditText(this).apply { hint = "Client ID"; setText(Web.clientId()) }
-        android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("Spotify Client ID")
-            .setMessage("The Client ID of your Spotify developer app (the same one SpoX on Windows uses). " +
-                "Its Redirect URIs must include ${Web.REDIRECT} (already there if Windows SpoX signs in).")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ -> Web.setClientId(box.text.toString()); view.invalidate(); if (Web.clientId().isNotEmpty()) then() }
-            .setNegativeButton("Cancel", null)
-            .show()
+        view.ask("Spotify Client ID", "Client ID", Web.clientId(),
+            message = "The Client ID of your Spotify developer app (the same one SpoX on Windows uses). Its Redirect URIs must include ${Web.REDIRECT}.",
+            ok = "Save") { v -> Web.setClientId(v); view.invalidate(); if (Web.clientId().isNotEmpty()) then() }
     }
 
     private fun askSearch() {
-        val box = android.widget.EditText(this).apply { hint = "Song, artist, album, playlist"; isSingleLine = true }
-        val d = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("Search")
-            .setView(box)
-            .setPositiveButton("Search") { _, _ -> box.text.toString().trim().takeIf { it.isNotEmpty() }?.let { view.search(it) } }
-            .setNegativeButton("Cancel", null)
-            .create()
-        box.setOnEditorActionListener { _, _, _ -> d.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick(); true }
-        d.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
-        d.show()
+        view.ask("Search Spotify", "Song, artist, album, playlist", ok = "Search") { q -> q.trim().takeIf { it.isNotEmpty() }?.let { view.search(it) } }
     }
 
     // ---- links from other apps: songs people send you, "Share > SpoX" -----------------------
@@ -233,20 +223,19 @@ class MainActivity : Activity() {
         } ?: return
         if (text.startsWith("spox://")) return  // back from signing in
         val m = Regex("(?:open\\.spotify\\.com/(?:intl-[a-z]+/)?|spotify:)(track|album|playlist|artist|episode|show)[/:]([A-Za-z0-9]+)").find(text)
-            ?: run { android.widget.Toast.makeText(this, "That isn't a Spotify link", android.widget.Toast.LENGTH_SHORT).show(); return }
+            ?: run { view.say("That isn't a Spotify link"); return }
         val uri = "spotify:${m.groupValues[1]}:${m.groupValues[2]}"
         intent.action = null
         val eng = io.github.oatomh.spox.engine.Engine.get(this)
         if (!eng.isLive) {
-            android.widget.Toast.makeText(this, "Turn on SpoX Engine (Settings) to play links", android.widget.Toast.LENGTH_LONG).show()
+            view.say("Turn on SpoX Engine (Settings) to play links")
             return
         }
         if (m.groupValues[1] == "track") {
-            android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("Song from a link")
-                .setItems(arrayOf("Play now", "Add to queue")) { _, which ->
-                    if (which == 0) { Player.playUri(uri); view.tab = PlayerView.Tab.PLAYER } else Player.addToQueue(uri)
-                }.show()
+            view.show(PlayerView.Sheet("Song from a link", emptyList(), listOf(
+                PlayerView.SheetItem("Play now") { if (Smart.on) Smart.stop(); Player.playUri(uri); view.tab = PlayerView.Tab.PLAYER },
+                PlayerView.SheetItem("Add to queue") { Player.addToQueue(uri); view.say("Added to queue") },
+            )))
         } else {
             Player.playUri(uri)
             view.tab = PlayerView.Tab.PLAYER
@@ -256,30 +245,33 @@ class MainActivity : Activity() {
     /** The Soloist key: same one as SpoX on Windows; it stays on this phone. */
     private fun askKey() {
         val eng = io.github.oatomh.spox.engine.Engine.get(this)
-        val box = android.widget.EditText(this).apply {
-            hint = "Soloist API key"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(eng.prefs.getString("key", ""))
-        }
-        android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("Your Soloist key")
-            .setMessage("The same key as SpoX on Windows (from Spotify's Soloist page). It stays on this phone.\n\nAfter starting, pick \"SpoX Phone\" once in Spotify Connect on another device to sign in.")
-            .setView(box)
-            .setPositiveButton("Save and start") { _, _ ->
-                val k = box.text.toString().trim()
-                if (k.length >= 6) {
-                    eng.prefs.edit().putString("key", k).apply()
-                    getSharedPreferences("spox", 0).edit().putBoolean("engine_on", true).apply()
-                    io.github.oatomh.spox.engine.EngineService.start(this)
-                }
-                view.postDelayed({ view.invalidate() }, 600)
+        view.ask("Your Soloist key", "Soloist API key", eng.prefs.getString("key", "").orEmpty(), password = true,
+            message = "The same key as SpoX on Windows (from Spotify's Soloist page). It stays on this phone. After starting, pick \"SpoX Phone\" once in Spotify Connect on another device to sign in.",
+            ok = "Save and start") { v ->
+            val k = v.trim()
+            if (k.length >= 6) {
+                eng.prefs.edit().putString("key", k).apply()
+                getSharedPreferences("spox", 0).edit().putBoolean("engine_on", true).apply()
+                io.github.oatomh.spox.engine.EngineService.start(this)
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+            view.postDelayed({ view.invalidate() }, 600)
+        }
+    }
+
+    /** Volume buttons while SpoX is open: SpoX's own pixel volume instead of Android's slider. */
+    override fun dispatchKeyEvent(e: android.view.KeyEvent): Boolean {
+        val up = e.keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP
+        if ((up || e.keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) && getSharedPreferences("spox", 0).getBoolean("own_volume", true)) {
+            if (e.action == android.view.KeyEvent.ACTION_DOWN) view.showVolume(Player.stepVolume(this, up))
+            return true
+        }
+        return super.dispatchKeyEvent(e)
     }
 
     override fun onResume() {
         super.onResume()
+        // opened again after being swiped away: don't quit when the music pauses
+        io.github.oatomh.spox.engine.EngineService.closed = false
         // coming back from the "Notification access" screen: start following the music app
         if (Player.hasAccess(this)) {
             runCatching { NotificationListenerService.requestRebind(ComponentName(this, MediaListener::class.java)) }

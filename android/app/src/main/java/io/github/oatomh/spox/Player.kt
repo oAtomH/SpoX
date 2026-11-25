@@ -56,7 +56,16 @@ object Player {
     /** True while the music comes from SpoX's own engine (not the Spotify app). */
     val fromEngine get() = engine?.let { it.isLive && it.now.track != null } == true
 
-    private val engineChanged: () -> Unit = { main.post { refresh() } }
+    private var lastEngineTrack = ""
+    private val engineChanged: () -> Unit = {
+        // a song you took out of Up next came up: straight on to the next one
+        val cur = engine?.now?.track?.uri.orEmpty()
+        if (cur != lastEngineTrack) {
+            lastEngineTrack = cur
+            if (cur.isNotEmpty() && skipped.remove(cur)) engine?.command("skip_next")
+        }
+        main.post { refresh() }
+    }
     private val outputs: () -> Unit = {
         SpoxNotification.update(app)
         PlayerWidget.updateAll(app)
@@ -65,9 +74,17 @@ object Player {
     fun init(ctx: Context) {
         if (::app.isInitialized) return
         app = ctx.applicationContext
+        // Bluetooth / car / headphones icon follows the speaker the music goes to
+        runCatching {
+            app.getSystemService(AudioManager::class.java).registerAudioDeviceCallback(object : android.media.AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(d: Array<out android.media.AudioDeviceInfo>?) { outputAt = 0; changed() }
+                override fun onAudioDevicesRemoved(d: Array<out android.media.AudioDeviceInfo>?) { outputAt = 0; changed() }
+            }, main)
+        }
         engine = io.github.oatomh.spox.engine.Engine.get(app).also { it.now.listeners += engineChanged }
         Web.init(app)
         Smart.init(app)
+        Smart.listeners += { main.post { refresh() } }
         // notification + widget follow every change, whether or not Notification access is on
         listen(outputs)
     }
@@ -85,7 +102,7 @@ object Player {
         return State(
             title = t.title, artist = t.artist, album = t.album, art = n.art,
             durationMs = t.durationMs, positionMs = heard, positionAt = nowT,
-            playing = n.playing, shuffle = n.shuffle, repeat = n.repeat != "off",
+            playing = n.playing, shuffle = n.shuffle || (Smart.on && Smart.shuffled), repeat = n.repeat != "off",
             app = "io.github.oatomh.spox.engine",
         )
     }
@@ -155,8 +172,9 @@ object Player {
         if (!::app.isInitialized) return
         val msm = app.getSystemService(MediaSessionManager::class.java) ?: return
         val list = runCatching { msm.getActiveSessions(ComponentName(app, MediaListener::class.java)) }.getOrNull() ?: return
-        val best = list.sortedBy { c -> preferred.indexOf(c.packageName).let { if (it < 0) 99 else it } }
-            .firstOrNull { it.packageName != app.packageName }
+        // only Spotify: other apps' players (YouTube, a PDF reader reading aloud...) are not SpoX's business
+        val best = list.filter { it.packageName in preferred }
+            .minByOrNull { preferred.indexOf(it.packageName) }
         if (best?.sessionToken != controller?.sessionToken) {
             controller?.unregisterCallback(callback)
             controller = best
@@ -176,7 +194,9 @@ object Player {
         }
         val c = controller
         if (c == null) {
-            state = State()
+            // SpoX Engine on, nothing loaded yet, SpoX shuffle saved: show where you were (play carries on)
+            val saved = Smart.current()?.takeIf { engine?.isLive == true }
+            state = if (saved != null) State(title = saved.title, artist = saved.artist, app = "io.github.oatomh.spox.engine") else State()
             changed()
             return
         }
@@ -233,13 +253,30 @@ object Player {
 
     private val eng get() = engine?.takeIf { fromEngine }
 
-    fun play() { eng?.let { expect(playing = true); it.command("play"); return }; if (controller != null) expect(playing = true); tc?.play() }
+    fun play() {
+        eng?.let { expect(playing = true); it.command("play"); return }
+        // SpoX Engine on but nothing loaded (e.g. it just started): carry on with SpoX shuffle
+        if (engine?.isLive == true && controller == null && Smart.resume()) return
+        if (controller != null) expect(playing = true); tc?.play()
+    }
     fun pause() { eng?.let { expect(playing = false); it.command("pause"); return }; if (controller != null) expect(playing = false); tc?.pause() }
 
     fun playPause() {
         if (state.playing) pause() else play()
     }
     fun next() { eng?.let { it.command("skip_next"); return }; tc?.skipToNext() }
+
+    // ---- songs taken out of Up next ------------------------------------------------------------
+
+    private val skipped: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+    fun isSkipped(uri: String) = uri in skipped
+
+    /** Spotify can't take songs out of its queue, so SpoX skips them the moment they start. */
+    fun removeFromQueue(uris: Set<String>) {
+        if (uris.isEmpty()) return
+        if (Smart.on) Smart.remove(uris) else skipped += uris
+        changed()
+    }
     fun prev() { eng?.let { it.command("skip_prev"); return }; tc?.skipToPrevious() }
     fun seek(ms: Long) {
         eng?.let { e ->
@@ -261,10 +298,22 @@ object Player {
 
     fun toggleShuffle() {
         eng?.let { e ->
-            // off -> shuffle -> smart shuffle (with the Spotify sign-in) -> off
+            // with the Spotify sign-in: off <-> SpoX shuffle (SpoX's own order, saved between runs).
+            // Without it: Spotify's shuffle.
+            val list = Smart.playingList()
             when {
-                Smart.on -> { Smart.stop(); expect(shuffle = false); e.command("set_shuffle", mapOf("enabled" to false)) }
-                state.shuffle && Web.signedIn -> { if (!Smart.start(app)) { expect(shuffle = false); e.command("set_shuffle", mapOf("enabled" to false)) } else changed() }
+                Smart.on && Smart.shuffled -> {
+                    // back to the list in its own order, carrying on with the song playing now
+                    expect(shuffle = false)
+                    val l = list
+                    if (l != null && Web.signedIn) Smart.start(app, l, null, e.now.track?.uri, false, state.position())
+                    else Smart.stop()
+                }
+                Web.signedIn && list != null -> {
+                    if (state.shuffle) e.command("set_shuffle", mapOf("enabled" to false))
+                    Smart.start(app, list, null, e.now.track?.uri, true)
+                    changed()
+                }
                 else -> { expect(shuffle = !state.shuffle); e.command("set_shuffle", mapOf("enabled" to state.shuffle)) }
             }
             return
@@ -304,6 +353,41 @@ object Player {
         am.setStreamVolume(AudioManager.STREAM_MUSIC, (f.coerceIn(0f, 1f) * max).toInt(), 0)
     }
 
+    /** Volume buttons: one step of the phone's media volume, without Android's own slider. */
+    fun stepVolume(ctx: Context, up: Boolean): Float {
+        val am = ctx.getSystemService(AudioManager::class.java)
+        am.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, 0)
+        return volume(ctx)
+    }
+
+    /** Where the sound goes: "bt" (Bluetooth), "car", "wired", "usb" or "phone", and its name. */
+    class Output(val kind: String, val name: String)
+    @Volatile private var output = Output("phone", "")
+    @Volatile private var outputAt = 0L
+    fun output(ctx: Context): Output {
+        val now = SystemClock.elapsedRealtime()
+        if (now - outputAt < 3000) return output
+        outputAt = now
+        val am = ctx.getSystemService(AudioManager::class.java)
+        val outs = runCatching { am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList() }.getOrDefault(emptyList())
+        val car = runCatching { ctx.getSystemService(android.app.UiModeManager::class.java).currentModeType == android.content.res.Configuration.UI_MODE_TYPE_CAR }.getOrDefault(false)
+        fun has(vararg t: Int) = outs.firstOrNull { it.type in t }
+        val bt = has(android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, 26 /* BLE headset */, 27 /* BLE speaker */)
+        output = when {
+            car -> Output("car", bt?.productName?.toString().orEmpty().ifEmpty { "Car" })
+            bt != null -> {
+                val n = bt.productName?.toString().orEmpty()
+                // car stereos usually say so in their name
+                if (Regex("(?i)car|auto|vw|bmw|audi|mercedes|toyota|ford|kia|hyundai|skoda|seat|opel|renault|peugeot|fiat|mazda|honda|nissan|volvo|tesla|sync|uconnect|mylink|carplay").containsMatchIn(n)) Output("car", n)
+                else Output("bt", n.ifEmpty { "Bluetooth" })
+            }
+            has(android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES, android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET) != null -> Output("wired", "Headphones")
+            has(android.media.AudioDeviceInfo.TYPE_USB_HEADSET, android.media.AudioDeviceInfo.TYPE_USB_DEVICE) != null -> Output("usb", "USB audio")
+            else -> Output("phone", "")
+        }
+        return output
+    }
+
     /** Up next, if the music app shares it ("Artist - Title"). */
     fun queue(): List<String> = controller?.queue?.mapNotNull { q ->
         val t = q.description.title?.toString() ?: return@mapNotNull null
@@ -317,7 +401,8 @@ object Player {
         Triple(q.queueId, t, q.description.subtitle?.toString().orEmpty())
     } ?: emptyList()
 
-    fun playQueueItem(id: Long) {
+    fun playQueueItem(id: Long, uri: String = "") {
+        if (Smart.on && uri.isNotEmpty() && Smart.jumpTo(uri)) return
         val e = eng ?: run { tc?.skipToQueueItem(id); return }
         val i = id.toInt()
         val t = e.now.queue.getOrNull(i) ?: return
@@ -335,13 +420,27 @@ object Player {
 
     // ---- "new" songs: never listened to before, or not from your playlist -------------------------
 
-    class QRow(val id: Long, val title: String, val artist: String, val group: String, val neverHeard: Boolean, val outside: Boolean)
+    /** One song in Up next. [new]: SpoX brought it in or it's Spotify's pick; [neverHeard]: not
+     *  in your Liked Songs, this list or recent plays. */
+    class QRow(val id: Long, val uri: String, val title: String, val artist: String, val group: String, val neverHeard: Boolean, val outside: Boolean)
 
     /** Up next for the list, grouped like Spotify's queue, with "new" marks. */
     fun queueRows(): List<QRow> {
-        val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, t, a, "", false, false) }
+        if (Smart.on) {
+            // SpoX's own order: the whole rest of the list, not just Spotify's next few
+            val listName = Smart.listName.ifEmpty { "your list" }
+            return Smart.upcoming().take(300).mapIndexed { i, t ->
+                val group = when {
+                    t.kind == "user" -> "Next in queue"
+                    !Smart.shuffled -> "Next from $listName"
+                    else -> "SpoX shuffle · $listName"
+                }
+                QRow(i.toLong(), t.uri, t.title, t.artist, group, Web.knows(t.title, t.artist) == false, t.isNew)
+            }
+        }
+        val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, "", t, a, "", false, false) }
         val name = e.now.contextName.ifEmpty { "this playlist" }
-        return e.now.queue.mapIndexed { i, t ->
+        return e.now.queue.filter { it.uri !in skipped }.mapIndexed { i, t ->
             val p = t.provider
             val group = when {
                 p.contains("queue") -> "Next in queue"
@@ -349,8 +448,7 @@ object Player {
                 p.contains("context") -> "Next from $name"
                 else -> ""
             }
-            // "new to you": not in your Liked Songs, this playlist or recent plays (Spotify's lists)
-            QRow(i.toLong(), t.title, t.artist, group, Web.knows(t.title, t.artist) == false,
+            QRow(e.now.queue.indexOf(t).toLong(), t.uri, t.title, t.artist, group, Web.knows(t.title, t.artist) == false,
                 p.contains("autoplay") || p.contains("recommend") || t.uri in Smart.newUris)
         }
     }
@@ -361,7 +459,10 @@ object Player {
 
     /** Plays a Spotify link/uri (song, album, playlist, artist) on SpoX Engine. */
     fun playUri(uri: String) { engine?.command("play", mapOf("uri" to uri)) }
-    fun addToQueue(uri: String) { engine?.command("add_to_queue", mapOf("uri" to uri)) }
+    fun addToQueue(uri: String, title: String = "", artist: String = "") {
+        engine?.command("add_to_queue", mapOf("uri" to uri))
+        Smart.noteQueued(uri, title, artist)
+    }
 
     // ---- sleep timer ---------------------------------------------------------------------
 
