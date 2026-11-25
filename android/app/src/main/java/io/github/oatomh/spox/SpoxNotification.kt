@@ -259,6 +259,9 @@ object SpoxNotification {
             .addAction(if (st.playing) action("toggle", R.drawable.ic_px_pause, "Pause") else action("toggle", R.drawable.ic_px_play, "Play"))
             .addAction(action("next", R.drawable.ic_px_next, "Next"))
             .setStyle(Notification.MediaStyle().setMediaSession(s.sessionToken).setShowActionsInCompactView(0, 1, 2))
+            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
             .build()
         runCatching { nm.notify(ID, n) }
     }
