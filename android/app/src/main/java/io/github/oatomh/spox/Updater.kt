@@ -26,12 +26,36 @@ object Updater {
         return false
     }
 
-    private fun open(url: String): HttpURLConnection = (URL(url).openConnection() as HttpURLConnection).apply {
-        setRequestProperty("Accept", "application/vnd.github+json")
+    private const val PAGE = "https://github.com/oAtomH/SpoX/releases/latest"
+    private const val APK = "https://github.com/oAtomH/SpoX/releases/latest/download/SpoX.apk"
+
+    /** [api]: GitHub's API wants its own "Accept"; file downloads must NOT get it (GitHub then says "not found"). */
+    private fun open(url: String, api: Boolean = false, follow: Boolean = true): HttpURLConnection = (URL(url).openConnection() as HttpURLConnection).apply {
+        setRequestProperty("Accept", if (api) "application/vnd.github+json" else "application/octet-stream")
         setRequestProperty("User-Agent", "SpoX-Android")
         connectTimeout = 10000
         readTimeout = 30000
-        instanceFollowRedirects = true
+        instanceFollowRedirects = follow
+    }
+
+    /** Newest version: from GitHub's API, or (if that's busy / rate-limited) from where the
+     *  "latest release" page redirects to (.../tag/v0.9.0). Returns (tag, apk url). */
+    private fun latest(): Pair<String, String?> {
+        runCatching {
+            val c = open(API, api = true)
+            if (c.responseCode == 200) {
+                val j = JSONObject(c.inputStream.bufferedReader().readText())
+                val assets = j.getJSONArray("assets")
+                val url = (0 until assets.length()).map { assets.getJSONObject(it) }
+                    .firstOrNull { it.getString("name") == "SpoX.apk" }?.getString("browser_download_url")
+                return j.getString("tag_name") to url
+            }
+        }
+        val c = open(PAGE, follow = false)
+        val loc = c.getHeaderField("Location").orEmpty()
+        val tag = loc.substringAfter("/tag/", "")
+        if (tag.isEmpty()) throw java.io.IOException("GitHub answered ${c.responseCode}")
+        return tag to APK
     }
 
     /** `manual` = the user tapped "Check for updates" (always says what happened). */
@@ -41,17 +65,14 @@ object Updater {
             status = "Checking..."
             done()
             runCatching {
-                val j = JSONObject(open(API).inputStream.bufferedReader().readText())
-                val tag = j.getString("tag_name")
+                val (tag, apk) = latest()
                 val mine = app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: "0"
                 if (!newer(ver(tag), ver(mine))) {
                     status = "Up to date ($mine)"
                     done()
                     return@thread
                 }
-                val assets = j.getJSONArray("assets")
-                val url = (0 until assets.length()).map { assets.getJSONObject(it) }
-                    .firstOrNull { it.getString("name") == "SpoX.apk" }?.getString("browser_download_url")
+                val url = apk
                 if (url == null) {
                     status = "$tag has no Android version yet"
                     done()
@@ -61,7 +82,10 @@ object Updater {
                 done()
                 val dir = File(app.cacheDir, "updates").apply { mkdirs() }
                 val f = File(dir, "SpoX.apk")
-                open(url).inputStream.use { inp -> f.outputStream().use { inp.copyTo(it) } }
+                // the release's own link, else the "latest" link (both end at the same file)
+                val c = open(url).let { if (it.responseCode in 200..299) it else open(APK) }
+                if (c.responseCode !in 200..299) throw java.io.IOException("download: GitHub answered ${c.responseCode}")
+                c.inputStream.use { inp -> f.outputStream().use { inp.copyTo(it) } }
                 status = "Ready: $tag"
                 done()
                 val uri = FileProvider.getUriForFile(app, "${app.packageName}.files", f)
@@ -70,7 +94,7 @@ object Updater {
                         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
             }.onFailure {
-                status = if (manual) "Couldn't check (${it.javaClass.simpleName})" else ""
+                status = if (manual) "Couldn't update: ${it.message ?: it.javaClass.simpleName}" else ""
                 done()
             }
         }
