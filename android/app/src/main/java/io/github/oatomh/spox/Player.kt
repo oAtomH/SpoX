@@ -453,7 +453,7 @@ object Player {
             bt != null -> {
                 val n = bt.productName?.toString().orEmpty()
                 // car stereos usually say so in their name
-                if (Regex("(?i)car|auto|vw|bmw|audi|mercedes|toyota|ford|kia|hyundai|skoda|seat|opel|renault|peugeot|fiat|mazda|honda|nissan|volvo|tesla|sync|uconnect|mylink|carplay").containsMatchIn(n)) Output("car", n)
+                if (Regex("(?i)\\b(car|auto|vw|bmw|audi|mercedes|toyota|ford|kia|hyundai|skoda|seat|opel|renault|peugeot|fiat|mazda|honda|nissan|volvo|tesla|sync|uconnect|mylink|carplay)\\b").containsMatchIn(n)) Output("car", n)
                 else Output("bt", n.ifEmpty { "Bluetooth" })
             }
             has(android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES, android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET) != null -> Output("wired", "Headphones")

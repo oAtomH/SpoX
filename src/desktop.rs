@@ -402,3 +402,64 @@ pub fn window_unseen() -> bool {
     #[cfg(not(windows))]
     HIDDEN.load(Ordering::SeqCst)
 }
+
+
+// ---------------- where the sound goes (for the little Bluetooth / car / headphones icon) ----------------
+
+/// Default sound output: (kind, name). kind: "bt", "car", "wired" or "speaker".
+pub static OUTPUT: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+/// Looks at Windows' default sound output every few seconds (cheap, on its own thread).
+pub fn start_output_watch(ctx: egui::Context) {
+    std::thread::Builder::new()
+        .name("output-watch".into())
+        .spawn(move || loop {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let name = cpal::default_host().default_output_device().and_then(|d| d.name().ok()).unwrap_or_default();
+            let kind = output_kind(&name).to_string();
+            let changed = {
+                let mut o = OUTPUT.lock().unwrap();
+                let c = o.1 != name;
+                *o = (kind, name);
+                c
+            };
+            if changed {
+                ctx.request_repaint();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        })
+        .ok();
+}
+
+/// Guesses the kind of output from its Windows name, e.g. "Headphones (WH-1000XM4 Stereo)".
+pub fn output_kind(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    let inner = n.split_once('(').map(|x| x.1).unwrap_or("");
+    // whole words only ("audi" is in "audio")
+    let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let car_words = ["car", "auto", "carplay", "sync", "uconnect", "mylink", "bmw", "audi", "vw", "toyota", "mercedes", "ford", "kia", "hyundai", "skoda", "tesla"];
+    let builtin = ["realtek", "high definition", "nvidia", "amd", "intel", "usb", "digital", "hdmi", "displayport", "virtual", "voicemeeter", "steam"];
+    if words.iter().any(|w| car_words.contains(w)) {
+        "car"
+    } else if n.contains("hands-free") || n.contains("bluetooth") || n.contains("airpods") || n.contains("buds") {
+        "bt"
+    } else if (n.starts_with("headphones") || n.starts_with("headset")) && !builtin.iter().any(|k| inner.contains(k)) {
+        // a named pair of headphones that isn't the PC's own sound chip: almost always Bluetooth
+        "bt"
+    } else if n.starts_with("headphones") || n.starts_with("headset") {
+        "wired"
+    } else {
+        "speaker"
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    #[test]
+    fn kinds() {
+        assert_eq!(super::output_kind("Headphones (WH-1000XM4 Stereo)"), "bt");
+        assert_eq!(super::output_kind("Headphones (Realtek(R) Audio)"), "wired");
+        assert_eq!(super::output_kind("Speakers (Realtek(R) Audio)"), "speaker");
+        assert_eq!(super::output_kind("Headset (Galaxy Buds2 Pro Hands-Free AG Audio)"), "bt");
+    }
+}

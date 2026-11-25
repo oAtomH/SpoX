@@ -256,6 +256,9 @@ impl App {
         crate::discord::start(cfg.clone(), solo.live.clone(), solo.cmd.clone());
         crate::update::start(cfg.clone(), tx.clone());
         crate::desktop::start_pacer(ctx.clone(), &crate::desktop::PACE_MS, egui::ViewportId::ROOT);
+        if !demo {
+            crate::desktop::start_output_watch(ctx.clone());
+        }
         crate::desktop::start_pacer(ctx.clone(), &crate::desktop::TB_PACE_MS, crate::tb::id());
         if let Some(t) = &tb_shared {
             crate::tb::start_watcher(t.clone(), ctx.clone());
@@ -783,13 +786,17 @@ impl App {
             .cloned()
             .collect();
         let low = |s: &str| s.to_lowercase();
-        match self.pl_sort.as_str() {
+        match self.pl_sort.trim_end_matches('!') {
             "added" => v.sort_by(|a, b| b.added.cmp(&a.added).then(a.order.cmp(&b.order))),
             "title" => v.sort_by_key(|t| low(&t.name)),
             "artist" => v.sort_by(|a, b| low(&a.artists).cmp(&low(&b.artists)).then(low(&a.album).cmp(&low(&b.album))).then(a.order.cmp(&b.order))),
             "album" => v.sort_by(|a, b| low(&a.album).cmp(&low(&b.album)).then(a.order.cmp(&b.order))),
             "length" => v.sort_by_key(|t| t.duration_ms),
             _ => v.sort_by_key(|t| t.order),
+        }
+        // "!" = the other way round (oldest first, Z-A...)
+        if self.pl_sort.ends_with('!') {
+            v.reverse();
         }
         // keep the same song selected after re-sorting
         let sel_uri = self.selected.and_then(|i| self.tracks.get(i)).map(|t| t.uri.clone());
@@ -811,17 +818,23 @@ impl App {
     }
 
     /// Sort the open playlist the next way (remembered per playlist).
-    fn cycle_sort(&mut self) {
+    fn cycle_sort(&mut self, flip: bool) {
         let order = ["added", "title", "artist", "album", "length", "custom"];
-        let i = order.iter().position(|o| *o == self.pl_sort).unwrap_or(0);
-        self.pl_sort = order[(i + 1) % order.len()].to_string();
+        let base = self.pl_sort.trim_end_matches('!').to_string();
+        let i = order.iter().position(|o| *o == base).unwrap_or(0);
+        self.pl_sort = if flip {
+            if self.pl_sort.ends_with('!') { base } else { format!("{}!", base) }
+        } else {
+            order[(i + 1) % order.len()].to_string()
+        };
         if let Some(p) = &self.sel {
             self.cfg.lock().unwrap().sorts.insert(p.uri.clone(), self.pl_sort.clone());
         }
         self.scroll[SCROLL_PL] = 0.0;
         self.apply_view();
         let name = sort_name(&self.pl_sort);
-        self.osd(format!("SORTED BY {}", name.to_uppercase()));
+        let dir = if self.pl_sort.ends_with('!') { " (REVERSED)" } else { "" };
+        self.osd(format!("SORTED BY {}{}", name.to_uppercase(), dir));
     }
 
     fn play_playlist(&mut self, p: &Playlist) {
@@ -1757,6 +1770,34 @@ impl App {
         if self.osd.is_some() {
             animating = true;
         }
+        // where the sound goes: a small Bluetooth / car / headphones icon after the title (same
+        // pixel icons as SpoX for phones); hover it for the device and the output's name
+        let (out_kind, out_name) = crate::desktop::OUTPUT.lock().unwrap().clone();
+        let icon: Option<&[&str]> = match out_kind.as_str() {
+            "bt" => Some(&["...X...", "...XX..", ".X.X.X.", "..XXX..", "...X...", "..XXX..", ".X.X.X.", "...XX..", "...X..."]),
+            "car" => Some(&["..XXXXX..", ".X.X.X.X.", "XXXXXXXXX", "X.XXXXX.X", "XXXXXXXXX", ".XX...XX."]),
+            "wired" => Some(&["..XXXXX..", ".X.....X.", "X.......X", "X.......X", "XX.....XX", "XXX...XXX", "XXX...XXX", ".X.....X."]),
+            _ => None,
+        };
+        let tr = if let Some(g) = icon.filter(|_| self.play.track.is_some()) {
+            let iw = g[0].len() as f32;
+            let ix = tr[0] + tr[2] - iw;
+            let iy = tr[1] + ((tr[3] - g.len() as f32) / 2.0).floor().max(0.0);
+            let col = self.skin.color("info");
+            for (j, row) in g.iter().enumerate() {
+                for (i, ch) in row.chars().enumerate() {
+                    if ch == 'X' {
+                        self.fill(p, o, s, ix + i as f32, iy + j as f32, 1.0, 1.0, col);
+                    }
+                }
+            }
+            if inp.over(ix - 1.0, tr[1], iw + 2.0, tr[3]) {
+                self.hover_now = Some(format!("row:Playing on {} \u{b7} sound: {}", self.device_name(), out_name));
+            }
+            [tr[0], tr[1], tr[2] - iw - 3.0, tr[3]]
+        } else {
+            tr
+        };
         animating |= self.marquee(p, o, s, tr, &title, self.skin.color("title"));
         // three-line layout (title / artist / album) when the skin defines "artist" and "album"
         let three = self.skin.json["rect"]["artist"].is_array() && self.skin.json["rect"]["album"].is_array();
@@ -2194,7 +2235,7 @@ impl App {
                             let mins = ms / 60_000;
                             let dur = if ms == 0 { String::new() } else if mins >= 60 { format!("  \u{b7}  {}h {}m", mins / 60, mins % 60) } else { format!("  \u{b7}  {}m", mins) };
                             let smart = if self.smart_on && self.smart_shuffled { "  \u{b7}  SpoX shuffle" } else { "" };
-                            let sort = match self.pl_sort.as_str() {
+                            let sort = match self.pl_sort.trim_end_matches('!') {
                                 "added" => "  \u{b7}  newest",
                                 "title" => "  \u{b7}  A-Z",
                                 "artist" => "  \u{b7}  by artist",
@@ -2759,7 +2800,7 @@ impl App {
                     self.send(command_with("get_queue", "limit", json!(0)));
                 }
             }
-            CtxAct::Sort => self.cycle_sort(),
+            CtxAct::Sort => self.cycle_sort(false),
             CtxAct::Find => self.start_find(),
             CtxAct::RemoveQ(uris) => {
                 let n = uris.len();
@@ -3642,7 +3683,7 @@ impl App {
                 match key {
                     egui::Key::F if modifiers.ctrl => self.start_find(),
                     egui::Key::F3 | egui::Key::Slash => self.start_find(),
-                    egui::Key::O if self.sel.is_some() && !self.picker => self.cycle_sort(),
+                    egui::Key::O if self.sel.is_some() && !self.picker => self.cycle_sort(modifiers.shift),
                     egui::Key::Delete if self.queue_visible() => {
                         let picks: Vec<String> = if !self.q_picked.is_empty() {
                             self.q_picked.iter().cloned().collect()
@@ -3992,7 +4033,7 @@ impl eframe::App for App {
 }
 
 fn sort_name(k: &str) -> &'static str {
-    match k {
+    match k.trim_end_matches('!') {
         "added" => "Recently added",
         "title" => "Title",
         "artist" => "Artist",

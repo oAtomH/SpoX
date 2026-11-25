@@ -61,7 +61,7 @@ Open Spotify on your phone or PC, open the **Devices** list and pick **SpoX**. S
 | `↑` / `↓` | Volume up / down |
 | `S` / `R` | SpoX shuffle / repeat on-off |
 | `Ctrl+F` (or `/`) | Find in the open playlist: type, `Enter` plays, `Esc` closes |
-| `O` | Sort the open playlist: newest first, title, artist, album, length, playlist order |
+| `O` / `Shift+O` | Sort the open playlist (newest first, title, artist, album, length, playlist order) / flip the direction |
 | `Ctrl` + click in Up next | Pick several songs; right-click or `Delete` removes them or plays them next |
 | `P` / `Q` / `L` | Playlist / Up next / Lyrics tab |
 | `T` | Always on top |

@@ -47,6 +47,7 @@ class MainActivity : Activity() {
                 "Engine" to when { !hasKey -> "add your key"; Player.fromEngine -> "on, playing"; eng.isLive -> "on"; else -> "off" },
                 "Soloist key" to if (hasKey) "set (change...)" else "add...",
                 "Engine report" to "copy",
+                "Song cache" to cacheText(),
                 "#Spotify account (library, search, likes)" to "",
                 "Account" to if (Web.signedIn) Web.userName().ifEmpty { "signed in" } else Web.status.ifEmpty { "sign in..." },
                 "Client ID" to if (Web.clientId().isEmpty()) "add..." else "set (change...)",
@@ -87,6 +88,12 @@ class MainActivity : Activity() {
                     view.postDelayed({ view.invalidate() }, 600)
                 }
                 "Soloist key" -> askKey()
+                "Song cache" -> {
+                    val sizes = listOf(500, 1024, 2048, 4096, 8192)
+                    val cur = prefs.getInt("cache_mb", 1024)
+                    view.show(PlayerView.Sheet("Song cache", listOf("Songs you play are kept on the phone, so", "playing them again uses less mobile data.", "Changes apply when SpoX Engine restarts."),
+                        sizes.map { mb -> PlayerView.SheetItem(if (mb >= 1024) "${mb / 1024} GB" else "$mb MB", "", mb == cur) { prefs.edit().putInt("cache_mb", mb).apply(); cacheAt = 0 } }))
+                }
                 "Engine report" -> {
                     val eng = io.github.oatomh.spox.engine.Engine.get(this)
                     getSystemService(android.content.ClipboardManager::class.java)
@@ -142,6 +149,19 @@ class MainActivity : Activity() {
     @Deprecated("still the simplest way for a plain Activity")
     override fun onBackPressed() {
         if (!view.back()) moveTaskToBack(true)
+    }
+
+    private var cacheTxt = ""
+    private var cacheAt = 0L
+    private fun cacheText(): String {
+        val eng = io.github.oatomh.spox.engine.Engine.get(this)
+        val max = eng.cacheMb()
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - cacheAt > 10_000) {
+            cacheAt = now
+            kotlin.concurrent.thread { val used = eng.cacheUsedMb(); cacheTxt = "$used MB of ${if (max >= 1024) "${max / 1024} GB" else "$max MB"}" }
+        }
+        return cacheTxt.ifEmpty { if (max >= 1024) "${max / 1024} GB" else "$max MB" }
     }
 
     /** RAM: SpoX itself, and SpoX Engine (Soloist) running next to it. */
@@ -203,7 +223,7 @@ class MainActivity : Activity() {
     }
 
     private fun askSearch() {
-        view.ask("Search Spotify", "Song, artist, album, playlist", ok = "Search") { q -> q.trim().takeIf { it.isNotEmpty() }?.let { view.search(it) } }
+        view.ask("Search", "Song, artist, album, playlist", ok = "Search") { q -> q.trim().takeIf { it.isNotEmpty() }?.let { view.search(it) } }
     }
 
     // ---- links from other apps: songs people send you, "Share > SpoX" -----------------------
