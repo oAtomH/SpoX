@@ -61,6 +61,8 @@ object SpoxNotification {
                 when (action) {
                     "shuffle" -> Player.toggleShuffle()
                     "repeat" -> Player.toggleRepeat()
+                    "like" -> Quick.toggleLike(ctx.applicationContext)
+                    "plus" -> Quick.togglePlaylist(ctx.applicationContext)
                 }
             }
             override fun onSkipToNext() { Player.next() }
@@ -80,6 +82,9 @@ object SpoxNotification {
         s.isActive = true
         session = s
     }
+
+    /** Which two extra buttons the phone's player shows: "like" (heart, + / -) or "modes" (shuffle, repeat). */
+    fun lockButtons(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("lock_buttons", "like") ?: "like"
 
     /** Everything that decides whether the lock screen shows SpoX's player, for "Lock screen check". */
     fun lockReport(ctx: Context): String {
@@ -284,9 +289,21 @@ object SpoxNotification {
                 .setActions(PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
                     PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO)
                 .setState(if (st.playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED, st.position(), if (st.playing) 1f else 0f)
-                // extra buttons on the phone's player (Android shows up to two)
-                .addCustomAction(PlaybackState.CustomAction.Builder("shuffle", if (st.shuffle) "Shuffle on" else "Shuffle off", if (st.shuffle) R.drawable.ic_px_shuffle_on else R.drawable.ic_px_shuffle).build())
-                .addCustomAction(PlaybackState.CustomAction.Builder("repeat", if (st.repeat) "Repeat on" else "Repeat off", if (st.repeat) R.drawable.ic_px_repeat_on else R.drawable.ic_px_repeat).build())
+                // extra buttons on the phone's player, lock screen and notification (Android shows
+                // two): heart and + / - (Settings → Lock screen buttons), or shuffle and repeat
+                .apply {
+                    if (lockButtons(ctx) == "like" && Player.fromEngine) {
+                        val lk = Quick.liked(ctx) == true
+                        addCustomAction(PlaybackState.CustomAction.Builder("like", if (lk) "Remove from Liked Songs" else "Save to Liked Songs",
+                            if (lk) R.drawable.ic_px_heart_on else R.drawable.ic_px_heart).build())
+                        val inPl = Quick.inList(ctx) == true
+                        addCustomAction(PlaybackState.CustomAction.Builder("plus", if (inPl) "Remove from the playlist" else "Add to the playlist",
+                            if (inPl) R.drawable.ic_px_minus else R.drawable.ic_px_plus).build())
+                    } else {
+                        addCustomAction(PlaybackState.CustomAction.Builder("shuffle", if (st.shuffle) "Shuffle on" else "Shuffle off", if (st.shuffle) R.drawable.ic_px_shuffle_on else R.drawable.ic_px_shuffle).build())
+                        addCustomAction(PlaybackState.CustomAction.Builder("repeat", if (st.repeat) "Repeat on" else "Repeat off", if (st.repeat) R.drawable.ic_px_repeat_on else R.drawable.ic_px_repeat).build())
+                    }
+                }
                 .build()
         )
         fun action(name: String, icon: Int, label: String) = Notification.Action.Builder(

@@ -92,7 +92,7 @@ pub fn base_size(cfg: &Shared, idle_icon: bool, info_only: bool) -> (f32, f32) {
     }
     let c = cfg.lock().unwrap();
     let tw = c.tb_text_w.clamp(32, 256) as f32;
-    let buttons = if info_only { 0.0 } else { 16.0 * (3 + c.tb_shuffle_btn as u32 + c.tb_like_btn as u32 + c.tb_add_btn as u32) as f32 };
+    let buttons = if info_only { 0.0 } else { 16.0 * (1 + c.tb_prev_btn as u32 + c.tb_next_btn as u32 + c.tb_shuffle_btn as u32 + c.tb_like_btn as u32 + c.tb_add_btn as u32) as f32 };
     (16.0 + 2.0 + tw + 2.0 + buttons, 16.0)
 }
 
@@ -400,7 +400,13 @@ pub fn ui(sh: &TbShared, ctx: &egui::Context) {
             if cfg.tb_add_btn {
                 btns.push(("addremove", if sh.in_list.load(Ordering::SeqCst) == 2 { "tb_remove" } else { "tb_add" }));
             }
-            btns.extend([("prev", "tb_prev"), ("pp", if playing { "tb_pause" } else { "tb_play" }), ("next", "tb_next")]);
+            if cfg.tb_prev_btn {
+                btns.push(("prev", "tb_prev"));
+            }
+            btns.push(("pp", if playing { "tb_pause" } else { "tb_play" }));
+            if cfg.tb_next_btn {
+                btns.push(("next", "tb_next"));
+            }
             if cfg.tb_shuffle_btn {
                 btns.push(("shuffle", shuf_name));
             }

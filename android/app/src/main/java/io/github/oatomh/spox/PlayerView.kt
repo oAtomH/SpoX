@@ -582,6 +582,7 @@ class PlayerView(ctx: Context) : View(ctx) {
         val real = Player.fromEngine && st.playing && io.github.oatomh.spox.engine.Engine.get(context).spectrum(spec)
         val dt = min(100f, (now - visAt).toFloat()).coerceAtLeast(1f)
         visAt = now
+        val mirror = context.getSharedPreferences("spox", 0).getString("vis_style", "mirror") == "mirror"
         for (i in 0 until bars) {
             val xr = i / bars.toFloat()
             val target = when {
@@ -593,11 +594,23 @@ class PlayerView(ctx: Context) : View(ctx) {
             level[i] = if (target > level[i]) target else max(target, level[i] - dt / 600f)
             if (level[i] >= peak[i]) { peak[i] = level[i]; peakHold[i] = now + 350 }
             else if (now > peakHold[i]) peak[i] = max(level[i], peak[i] - dt / 900f)
-            val bh = max(1, (level[i] * rows).toInt())
             val bx = x0 + i * (bw + gap)
-            for (yy in 0 until bh) box(cv, bx, y + h - (yy + 1) * u, bw, u, visCol(1f - yy.toFloat() / rows))
-            val py = (peak[i] * rows).toInt()
-            if (py > bh) box(cv, bx, y + h - (py + 1) * u, bw, u, skin.color("vis_peak", cHeader))
+            if (mirror) {
+                // like SpoX on PC: bars grow up from the middle, with a dimmer reflection below
+                val half = rows / 2
+                val mid = y + half * u
+                val bh = max(1, (level[i] * half).toInt())
+                for (yy in 0 until bh) {
+                    val c = visCol(1f - yy.toFloat() / half)
+                    box(cv, bx, mid - (yy + 1) * u, bw, u, c)
+                    box(cv, bx, mid + yy * u, bw, u, (c and 0x00ffffff) or (0x8c shl 24))
+                }
+            } else {
+                val bh = max(1, (level[i] * rows).toInt())
+                for (yy in 0 until bh) box(cv, bx, y + h - (yy + 1) * u, bw, u, visCol(1f - yy.toFloat() / rows))
+                val py = (peak[i] * rows).toInt()
+                if (py > bh) box(cv, bx, y + h - (py + 1) * u, bw, u, skin.color("vis_peak", cHeader))
+            }
         }
         if (st.playing || level.any { it > 0.01f }) animating = true
     }
@@ -1306,7 +1319,7 @@ class PlayerView(ctx: Context) : View(ctx) {
 
     var onDevices: (() -> Unit)? = null
 
-    private fun miniExtras(ctx: Context) = ctx.getSharedPreferences("spox", Context.MODE_PRIVATE).getBoolean("mini_extras", true)
+    private fun miniExtras(ctx: Context) = ctx.getSharedPreferences("spox", Context.MODE_PRIVATE).getBoolean("mini_extras", false)
 
     /** The playlist + / - works on: SpoX shuffle's list, else the one playing. */
     private fun plusList(): String = Smart.listUri.takeIf { Smart.on && it.startsWith("spotify:playlist:") }

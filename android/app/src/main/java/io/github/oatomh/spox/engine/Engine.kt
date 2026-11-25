@@ -324,7 +324,11 @@ class Engine private constructor(private val ctx: Context) {
         for (k in 0 until 1024) { re[k] = ring[((end - 1024 + k) and 0xffff).toInt()] * win[k]; im[k] = 0f }
         fft(re, im)
         val nyq = rate / 2f
-        val lo = 40f; val hi = minOf(16000f, nyq)
+        val lo = 50f; val hi = minOf(16000f, nyq)
+        // how loud it really comes out: the phone's media volume (silent / muted = flat bars)
+        val am = ctx.getSystemService(android.media.AudioManager::class.java)
+        val frac = runCatching { am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC).toFloat() / am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC) }.getOrDefault(1f)
+        val volDb = if (frac <= 0f) -200f else (frac - 1f) * 40f
         for (b in out.indices) {
             val f0 = lo * Math.pow((hi / lo).toDouble(), b.toDouble() / out.size).toFloat()
             val f1 = lo * Math.pow((hi / lo).toDouble(), (b + 1).toDouble() / out.size).toFloat()
@@ -332,9 +336,11 @@ class Engine private constructor(private val ctx: Context) {
             val i1 = (f1 / nyq * 512).toInt().coerceIn(i0 + 1, 512)
             var m = 0f
             for (k in i0 until i1) m = maxOf(m, re[k] * re[k] + im[k] * im[k])
-            // decibels, -60..0 dB -> 0..1
-            val db = 10f * kotlin.math.log10(m + 1e-12f) - 24f
-            out[b] = ((db + 60f) / 60f).coerceIn(0f, 1f)
+            // same scale as SpoX on PC: decibels of the (normalised) level, a gentle tilt so the
+            // highs aren't always empty, then turned down with the volume
+            val db = 10f * kotlin.math.log10(m + 1e-12f) - 48.2f + volDb
+            val tilt = 6f * b / out.size
+            out[b] = ((db + tilt + 54f) / 48f).coerceIn(0f, 1f)
         }
         return true
     }

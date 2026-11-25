@@ -238,7 +238,7 @@ impl App {
         let mut smart_tx = None;
         let hide_on_start = !demo && (std::env::args().any(|a| a == "--tray") || cfg.lock().unwrap().start_in_tray);
         if !demo {
-            let (stx, vtx) = crate::smart::start(cfg.clone(), tx.clone(), ctx.clone(), solo.cmd.clone());
+            let (stx, vtx) = crate::smart::start(cfg.clone(), tx.clone(), ctx.clone(), solo.cmd.clone(), solo.live.clone());
             solo.tap.lock().unwrap().push(vtx);
             smart_tx = Some(stx);
             // play log + Last.fm scrobbling
@@ -3140,6 +3140,8 @@ impl App {
             ("Left side offset (Ctrl+scroll)".into(), format!("{}px", c.tb_left_offset), 42),
             ("Text width".into(), format!("{}px", c.tb_text_w), 32),
             ("When idle (or paused 10 s)".into(), match c.tb_idle.as_str() { "icon" => "just the icon", "hide" => "hide", _ => "dim last song" }.into(), 33),
+            ("Previous button".into(), onoff(c.tb_prev_btn), 54),
+            ("Next button".into(), onoff(c.tb_next_btn), 55),
             ("Shuffle button".into(), onoff(c.tb_shuffle_btn), 49),
             ("Like button".into(), onoff(c.tb_like_btn), 52),
             ("+ / - playlist button".into(), onoff(c.tb_add_btn), 53),
@@ -3348,6 +3350,8 @@ impl App {
                 }
                 49 => c.tb_shuffle_btn = !c.tb_shuffle_btn,
                 52 => c.tb_like_btn = !c.tb_like_btn,
+                54 => c.tb_prev_btn = !c.tb_prev_btn,
+                55 => c.tb_next_btn = !c.tb_next_btn,
                 53 => c.tb_add_btn = !c.tb_add_btn,
                 42 => {
                     c.tb_left_offset = cycle(

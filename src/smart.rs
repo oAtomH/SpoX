@@ -284,6 +284,9 @@ struct Engine {
     used: Arc<Mutex<HashSet<String>>>,
     new_uris: Vec<String>,
     play: Play,
+    /// Soloist's own always-complete state (this thread only sees events from when it started,
+    /// so "is SpoX the active device", the context etc. are taken from here)
+    live: Arc<Mutex<Play>>,
     rng: Rng,
     finding: Arc<std::sync::atomic::AtomicUsize>,
     busy: String,
@@ -293,7 +296,7 @@ struct Engine {
     owed: Vec<String>,
 }
 
-pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<String>) -> (Sender<Cmd>, Sender<Value>) {
+pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<String>, live: Arc<Mutex<Play>>) -> (Sender<Cmd>, Sender<Value>) {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     let (vtx, vrx) = std::sync::mpsc::channel::<Value>();
     let _ = TX.set(Mutex::new(tx.clone()));
@@ -344,12 +347,14 @@ pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<Strin
                 used: Default::default(),
                 new_uris: Vec::new(),
                 play: Play::default(),
+                live,
                 rng: Rng::new(),
                 finding: Default::default(),
                 busy: String::new(),
                 warm_until: None,
                 owed: Vec::new(),
             };
+            e.play = e.live.lock().unwrap().clone();
             e.restore();
             e.report();
             e.run(rx);
@@ -369,7 +374,14 @@ impl Engine {
                 Ok(Cmd::Start { playlist, tracks, order, first, shuffle, position }) => self.begin(playlist, tracks, order, first, shuffle, position),
                 Ok(Cmd::Stop) => self.stop(),
                 Ok(Cmd::Ev(v)) => {
-                    let changed = self.play.apply(&v);
+                    let old = self.play.track.as_ref().map(|t| t.uri.clone());
+                    self.play.apply(&v);
+                    // the full picture (is_active, context, queue...) from Soloist's own state
+                    let full = self.live.lock().unwrap().clone();
+                    if full.track.is_some() {
+                        self.play = full;
+                    }
+                    let changed = old != self.play.track.as_ref().map(|t| t.uri.clone());
                     if self.on {
                         self.harvest();
                         if changed {
@@ -842,6 +854,14 @@ impl Engine {
             || self.playlist.as_ref().map(|p| &p.uri == c).unwrap_or(false)
     }
 
+    /// You started another list / album / artist (in SpoX or another Spotify app): SpoX hands over.
+    /// Anything else unexpected (a stray song, a slow report) never throws the order away.
+    fn other_list(&self) -> bool {
+        let c = &self.play.context_uri;
+        let list = ["spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:show:", ":collection"].iter().any(|k| c.contains(k));
+        list && self.playlist.as_ref().map(|p| &p.uri != c).unwrap_or(true)
+    }
+
     fn on_track(&mut self) {
         let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
         if cur.is_empty() || cur == self.last_track {
@@ -888,7 +908,7 @@ impl Engine {
             } else if self.fallthrough() {
                 // Spotify's own pick after a song, or next pressed on another device
                 fix = true;
-            } else if now_ms() >= HOLD_UNTIL.load(std::sync::atomic::Ordering::SeqCst) {
+            } else if self.other_list() && now_ms() >= HOLD_UNTIL.load(std::sync::atomic::Ordering::SeqCst) {
                 // you played something else: SpoX hands back to Spotify
                 self.stop();
                 return;

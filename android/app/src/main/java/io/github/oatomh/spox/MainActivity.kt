@@ -57,10 +57,12 @@ class MainActivity : Activity() {
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's player"; else -> "off" },
                 "Lock screen player" to SpoxNotification.lockStatus(this),
                 "Lock screen check" to "copy report",
+                "Lock screen buttons" to if (SpoxNotification.lockButtons(this) == "like") "heart and + / -" else "shuffle and repeat",
                 "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "card" -> "SpoX card"; else -> "pixel cover" },
-                "Mini player: heart and + / -" to if (prefs.getBoolean("mini_extras", true)) "on" else "off",
+                "Mini player: heart and + / -" to if (prefs.getBoolean("mini_extras", false)) "on" else "off",
                 "App icon follows colour pack" to if (AppIcon.follows(this)) "on (when you leave SpoX)" else "off",
                 "Keep screen on" to when (prefs.getString("keep_on", "off")) { "player" -> "while playing"; "always" -> "while SpoX is open"; else -> "off" },
+                "Visualizer" to if (prefs.getString("vis_style", "mirror") == "mirror") "mirror" else "bars",
                 "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
                 "#Listening" to "",
                 "Sleep timer" to Player.sleepLabel(),
@@ -114,6 +116,11 @@ class MainActivity : Activity() {
                     view.show(PlayerView.Sheet("Song cache", listOf("Songs you play are kept on the phone, so", "playing them again uses less mobile data.", "Changes apply when SpoX Engine restarts."),
                         sizes.map { mb -> PlayerView.SheetItem(if (mb >= 1024) "${mb / 1024} GB" else "$mb MB", "", mb == cur) { prefs.edit().putInt("cache_mb", mb).apply(); cacheAt = 0 } }))
                 }
+                "Visualizer" -> prefs.edit().putString("vis_style", if (prefs.getString("vis_style", "mirror") == "mirror") "bars" else "mirror").apply()
+                "Lock screen buttons" -> {
+                    prefs.edit().putString("lock_buttons", if (SpoxNotification.lockButtons(this) == "like") "modes" else "like").apply()
+                    SpoxNotification.refresh(this)
+                }
                 "Lock screen check" -> {
                     SpoxNotification.refresh(this)
                     getSystemService(android.content.ClipboardManager::class.java)
@@ -148,7 +155,7 @@ class MainActivity : Activity() {
                 }
                 "Pause when headphones disconnect" -> prefs.edit().putBoolean("pause_noisy", !prefs.getBoolean("pause_noisy", true)).apply()
                 "Carry on after calls" -> prefs.edit().putBoolean("resume_after_call", !prefs.getBoolean("resume_after_call", true)).apply()
-                "Mini player: heart and + / -" -> prefs.edit().putBoolean("mini_extras", !prefs.getBoolean("mini_extras", true)).apply()
+                "Mini player: heart and + / -" -> prefs.edit().putBoolean("mini_extras", !prefs.getBoolean("mini_extras", false)).apply()
                 "App icon follows colour pack" -> {
                     val on = !AppIcon.follows(this)
                     AppIcon.setFollows(this, on)

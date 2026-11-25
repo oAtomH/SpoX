@@ -460,7 +460,9 @@ object Smart {
                         Player.isSkipped(cur) -> {}
                         // Spotify's own pick after a song (autoplay), or next pressed on another device
                         isFallthrough(n) -> fix = true
-                        else -> leave = true
+                        // you started another list / album / artist: SpoX hands over. Anything else
+                        // unexpected never throws the order away.
+                        otherList(n) -> leave = true
                     }
                 }
             }
@@ -482,6 +484,12 @@ object Smart {
     private fun nearest(uri: String): Int {
         val lo = maxOf(0, index - BEHIND)
         return (lo until deck.size).filter { deck[it].uri == uri }.minByOrNull { kotlin.math.abs(it - index - 1) } ?: -1
+    }
+
+    private fun otherList(n: Engine.Now): Boolean {
+        val c = n.contextUri
+        return listOf("spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:show:", ":collection").any { c.contains(it) } && c != listUri &&
+            !(listUri == "liked" && c.contains(":collection"))
     }
 
     private fun isFallthrough(n: Engine.Now): Boolean {
