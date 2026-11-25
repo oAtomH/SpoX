@@ -831,7 +831,7 @@ impl Engine {
     }
 
     fn arm(&mut self) {
-        if self.target.is_some() || self.play.repeat == "track" {
+        if self.target.is_some() || self.play.repeat == "track" || !self.play.is_active {
             return;
         }
         let Some(t) = self.play.track.as_ref() else { return };
@@ -852,7 +852,7 @@ impl Engine {
 
     /// The song ended with nothing after it (or Spotify stopped): play the next one.
     fn ended(&mut self) {
-        if self.target.is_some() {
+        if self.target.is_some() || !self.play.is_active {
             return;
         }
         let Some(t) = self.play.track.clone() else { return };
@@ -910,6 +910,12 @@ impl Engine {
         }
         self.last_track = cur.clone();
         self.ended_for.clear();
+        // another device plays (SpoX on the phone, the Spotify app...): its songs are none of this
+        // SpoX's business; reacting to them made the two take the music from each other
+        if self.target.is_none() && !self.play.is_active {
+            slog(&format!("another device plays {}: leaving it alone", cur));
+            return;
+        }
         let ck = self.cur_key();
         slog(&format!("now: {} (target {:?}, index {}, context {})", cur, self.target, self.index, self.play.context_uri));
         let mut fix = false;

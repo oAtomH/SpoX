@@ -24,6 +24,7 @@ pub struct Shared_ {
     pub skin: Mutex<Arc<Skin>>,
     pub live: Arc<Mutex<Play>>,
     pub solo: Mutex<Sender<String>>,
+    #[allow(dead_code)]
     pub web: Mutex<Sender<crate::web::Req>>,
     pub cfg: Shared,
     pub liked: Mutex<(String, bool)>,
@@ -152,15 +153,15 @@ fn act(sh: &TbShared, ctx: &egui::Context, action: &str, p: &Play) {
             crate::desktop::wake(ctx);
         }
         "like" => {
+            // the main window likes it (and keeps both hearts the same)
             drop(solo);
             if let Some(t) = &p.track {
                 let mut l = sh.liked.lock().unwrap();
                 let on = !(l.0 == t.uri && l.1);
                 *l = (t.uri.clone(), on);
-                let _ = sh.web.lock().unwrap().send(crate::web::Req::SetLiked(t.uri.clone(), on));
-                drop(l);
-                osd(sh, if on { "Liked" } else { "Unliked" });
             }
+            sh.app_actions.lock().unwrap().push("like".to_string());
+            crate::desktop::wake(ctx);
         }
         "copy_link" => {
             drop(solo);

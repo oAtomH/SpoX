@@ -4005,6 +4005,15 @@ impl eframe::App for App {
             tr.set_visible(!(c.tb_on && c.tb_idle != "hide" && c.hide_tray_with_player));
         }
         if let Some(t) = &self.tb {
+            // heart on the taskbar player follows the main window (also right after you press it)
+            if let Some(u) = self.play.track.as_ref().map(|x| x.uri.clone()) {
+                let want = (u, self.liked == Some(true));
+                let mut l = t.liked.lock().unwrap();
+                if *l != want {
+                    *l = want;
+                    self.ctx.request_repaint_of(crate::tb::id());
+                }
+            }
             let il = match self.in_playing_playlist_peek() {
                 None => 0u8,
                 Some((_, false)) => 1,
@@ -4046,6 +4055,10 @@ impl eframe::App for App {
                         crate::tb::osd(t, if self.muted_from.is_some() { "Muted" } else { "Unmuted" });
                         self.ctx.request_repaint_of(crate::tb::id());
                     }
+                }
+                "like" => {
+                    self.toggle_like();
+                    self.ctx.request_repaint_of(crate::tb::id());
                 }
                 "addremove" => {
                     let m = self.add_remove_current();

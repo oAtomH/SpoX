@@ -408,7 +408,7 @@ object Smart {
             if (target >= 0 || !isAt(index, t.uri)) return
             deck.getOrNull(index + 1)?.uri ?: return
         }
-        if (n.repeat == "track") return
+        if (n.repeat == "track" || !n.active) return
         if (t.durationMs <= 0 || t.durationMs - n.position() > ARM_MS) return
         if (armed == want) return
         synchronized(lock) { if (armed != null) dropArmed(); armed = want }
@@ -419,7 +419,7 @@ object Smart {
     private fun ended() {
         val n = engine.now
         val t = n.track ?: return
-        if (target >= 0 || t.uri == endedFor) return
+        if (target >= 0 || t.uri == endedFor || !n.active) return
         val atEnd = t.durationMs > 0 && n.position() >= t.durationMs - 1200
         if (!atEnd || n.playing) return
         if (synchronized(lock) { !isAt(index, t.uri) }) return
@@ -437,6 +437,9 @@ object Smart {
         val now = System.currentTimeMillis()
         lastTrack = cur
         endedFor = ""
+        // another device plays (SpoX on the PC, the Spotify app...): none of this SpoX's business;
+        // reacting to its songs made the two take the music from each other
+        if (target < 0 && !n.active) return
         var fix = false
         var leave = false
         synchronized(lock) {
