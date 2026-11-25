@@ -67,7 +67,7 @@ impl Api {
     /// Finds one Spotify track for an artist + title (used by smart shuffle).
     pub fn search_track(&self, artist: &str, title: &str) -> Option<Track> {
         let q = format!("track:{} artist:{}", title, artist);
-        let v = self.get(&format!("/search?type=track&limit=3&q={}", enc(&q))).ok()?;
+        let v = self.get_bg(&format!("/search?type=track&limit=3&q={}", enc(&q)))?;
         let items = v.pointer("/tracks/items")?.as_array()?;
         items.iter().find_map(Self::parse_track)
     }
@@ -79,10 +79,10 @@ impl Api {
         }
         let q = format!("artist:\"{}\"", artist);
         let off = (crate::config::now_ms() as u64 / 1000) % 3 * 10;
-        let Ok(v) = self.get(&format!("/search?type=track&limit=10&offset={}&q={}", off, enc(&q))) else { return Vec::new() };
+        let Some(v) = self.get_bg(&format!("/search?type=track&limit=10&offset={}&q={}", off, enc(&q))) else { return Vec::new() };
         let mut out: Vec<Track> = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
         if out.is_empty() && off > 0 {
-            if let Ok(v) = self.get(&format!("/search?type=track&limit=10&q={}", enc(&q))) {
+            if let Some(v) = self.get_bg(&format!("/search?type=track&limit=10&q={}", enc(&q))) {
                 out = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
             }
         }
@@ -258,13 +258,11 @@ impl Api {
     fn get(&self, path: &str) -> Result<Value, String> {
         let url = if path.starts_with("http") { path.to_string() } else { format!("{}{}", API, path) };
         for attempt in 0..3 {
+            wait_cool(30);
             let tok = self.token()?;
             match net::agent().get(&url).set("Authorization", &format!("Bearer {}", tok)).call() {
                 Ok(r) => return r.into_json().map_err(|e| e.to_string()),
-                Err(ureq::Error::Status(429, r)) => {
-                    let wait = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(2u64);
-                    std::thread::sleep(Duration::from_secs(wait.min(30)));
-                }
+                Err(ureq::Error::Status(429, r)) => limited(&r),
                 Err(ureq::Error::Status(401, _)) if attempt == 0 => {
                     self.cfg.lock().unwrap().token_expires = 0;
                 }
@@ -275,31 +273,50 @@ impl Api {
         Err("rate limited".into())
     }
 
-    fn put(&self, path: &str, body: Value) -> Result<(), String> {
-        let tok = self.token()?;
-        match net::agent()
-            .put(&format!("{}{}", API, path))
-            .set("Authorization", &format!("Bearer {}", tok))
-            .send_json(body)
-        {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, _)) => Err(format!("http {}", code)),
-            Err(e) => Err(e.to_string()),
+    /// Background work (finding new songs): one request at a time, 1.5 s apart, and nothing
+    /// while Spotify asks to slow down (it tries again later instead of blocking play / likes).
+    fn get_bg(&self, path: &str) -> Option<Value> {
+        let _one = BG_LOCK.lock().unwrap();
+        if cooling() {
+            return None;
+        }
+        let since = now_ms() - LAST_BG.load(Ordering::SeqCst);
+        if since < 1500 {
+            std::thread::sleep(Duration::from_millis((1500 - since) as u64));
+        }
+        LAST_BG.store(now_ms(), Ordering::SeqCst);
+        let tok = self.token().ok()?;
+        match net::agent().get(&format!("{}{}", API, path)).set("Authorization", &format!("Bearer {}", tok)).call() {
+            Ok(r) => r.into_json().ok(),
+            Err(ureq::Error::Status(429, r)) => {
+                limited(&r);
+                None
+            }
+            Err(_) => None,
         }
     }
 
+    fn put(&self, path: &str, body: Value) -> Result<(), String> {
+        self.send("PUT", path, Some(body))
+    }
+
     fn send(&self, method: &str, path: &str, body: Option<Value>) -> Result<(), String> {
-        let tok = self.token()?;
-        let req = net::agent().request(method, &format!("{}{}", API, path)).set("Authorization", &format!("Bearer {}", tok));
-        let r = match body {
-            Some(b) => req.send_json(b),
-            None => req.set("Content-Length", "0").call(),
-        };
-        match r {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, _)) => Err(format!("http {}", code)),
-            Err(e) => Err(e.to_string()),
+        for _ in 0..2 {
+            wait_cool(30);
+            let tok = self.token()?;
+            let req = net::agent().request(method, &format!("{}{}", API, path)).set("Authorization", &format!("Bearer {}", tok));
+            let r = match &body {
+                Some(b) => req.send_json(b.clone()),
+                None => req.set("Content-Length", "0").call(),
+            };
+            match r {
+                Ok(_) => return Ok(()),
+                Err(ureq::Error::Status(429, r)) => limited(&r),
+                Err(ureq::Error::Status(code, _)) => return Err(format!("http {}", code)),
+                Err(e) => return Err(e.to_string()),
+            }
         }
+        Err("rate limited".into())
     }
 
     fn me(&self) {
@@ -697,5 +714,38 @@ mod iso_tests {
     fn iso() {
         assert_eq!(super::iso_secs("1970-01-01T00:00:00Z"), 0);
         assert_eq!(super::iso_secs("2026-11-25T01:02:03Z"), 1795568523);
+    }
+}
+
+
+// ---------------- Spotify's request limit ----------------
+// Spotify answers "429: too many requests, wait N s" when an app asks too much (SpoX on the PC
+// and the phone share one limit); then every request fails for a while, also "play". After a 429
+// nothing is sent until the wait is over, and background work goes one at a time, spaced out.
+
+use std::sync::atomic::AtomicI64;
+static COOL_UNTIL: AtomicI64 = AtomicI64::new(0);
+static LAST_BG: AtomicI64 = AtomicI64::new(0);
+static BG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn now_ms() -> i64 {
+    crate::config::now_ms()
+}
+
+fn cooling() -> bool {
+    now_ms() < COOL_UNTIL.load(Ordering::SeqCst)
+}
+
+fn limited(r: &ureq::Response) {
+    let wait: i64 = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(5).clamp(2, 600);
+    COOL_UNTIL.fetch_max(now_ms() + wait * 1000, Ordering::SeqCst);
+    web_log(&format!("Spotify asked to slow down: waiting {}s", wait));
+}
+
+/// Waits out a cool-down (at most `max_s` seconds) before something you pressed.
+fn wait_cool(max_s: i64) {
+    let until = COOL_UNTIL.load(Ordering::SeqCst).min(now_ms() + max_s * 1000);
+    while now_ms() < until {
+        std::thread::sleep(Duration::from_millis(250));
     }
 }

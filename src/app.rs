@@ -120,6 +120,7 @@ pub struct App {
     smart_new: std::collections::HashSet<String>,
     smart_shuffled: bool,
     smart_list: String,
+    smart_list_uri: String,
     smart_upcoming: Vec<(Track, String)>,
     smart_busy: String,
     /// Up next as shown (SpoX shuffle's own order, or Soloist's queue)
@@ -336,6 +337,7 @@ impl App {
             smart_new: Default::default(),
             smart_shuffled: true,
             smart_list: String::new(),
+            smart_list_uri: String::new(),
             smart_upcoming: Vec::new(),
             smart_busy: String::new(),
             q_list: Vec::new(),
@@ -624,14 +626,19 @@ impl App {
                 }
             }
             Ev::Osd(m) => self.osd(m),
-            Ev::Smart { on, shuffled, list, new_uris, upcoming, busy } => {
-                if on != self.smart_on {
-                    self.play.shuffle = on && shuffled;
-                    self.hold_shuffle = Some((on && shuffled, Instant::now()));
-                }
+            Ev::Smart {
+                on,
+                shuffled,
+                list,
+                list_uri,
+                new_uris,
+                upcoming,
+                busy,
+            } => {
                 self.smart_on = on;
                 self.smart_shuffled = shuffled;
                 self.smart_list = list;
+                self.smart_list_uri = list_uri;
                 self.smart_new = new_uris.into_iter().collect();
                 self.smart_upcoming = upcoming;
                 self.smart_busy = busy;
@@ -875,9 +882,8 @@ impl App {
         let Some(p) = self.sel.clone() else { return };
         // shuffle on: SpoX shuffle from this song. Off and sorted or searched: the list exactly as
         // you see it (like Spotify's own sorting). Off in the list's own order: Spotify plays the list.
-        let shuffle = (self.smart_on && self.smart_shuffled) || self.play.shuffle;
-        let as_shown = self.pl_sort != "custom" || self.pl_find.as_deref().map(|f| !f.is_empty()).unwrap_or(false);
-        if self.signed_in && (shuffle || as_shown) {
+        let shuffle = self.shuffle_mode() != "off";
+        if self.signed_in {
             if let Some(sm) = &self.smart {
                 let tracks = if shuffle { self.tracks_all.clone() } else { self.tracks.clone() };
                 let _ = sm.send(crate::smart::Cmd::Start { playlist: p, tracks, first: Some(t.uri.clone()), shuffle, position: 0 });
@@ -957,9 +963,18 @@ impl App {
         }
     }
 
+    /// The list playing now: SpoX plays songs one by one (no Spotify context), so it's the list SpoX plays.
+    fn playing_list_uri(&self) -> String {
+        if self.smart_on && !self.smart_list_uri.is_empty() {
+            if self.smart_list_uri == "liked" { self.liked_uri() } else { self.smart_list_uri.clone() }
+        } else {
+            self.play.context_uri.clone()
+        }
+    }
+
     /// The playlist smart shuffle (and the +/- button) works with: the one playing, else the open one.
     fn smart_source(&self) -> Option<(Playlist, Vec<Track>)> {
-        let ctx = self.play.context_uri.clone();
+        let ctx = self.playing_list_uri();
         if let Some(pl) = self.playlists.iter().find(|p| self.playlist_uri(p) == ctx && !ctx.is_empty()) {
             if self.sel.as_ref().map(|s| s.id == pl.id).unwrap_or(false) && !self.tracks_all.is_empty() {
                 return Some((pl.clone(), self.tracks_all.clone()));
@@ -1029,43 +1044,48 @@ impl App {
         }
     }
 
-    /// Shuffle button: off <-> SpoX shuffle (signed in, on one of your lists); else Spotify's.
-    fn cycle_shuffle(&mut self) {
-        if self.smart_on && self.smart_shuffled {
-            // back to the list in its own order, carrying on with the song playing now
-            match (self.smart_source(), &self.smart) {
-                (Some((pl, tracks)), Some(sm)) => {
-                    let mut tracks = tracks;
-                    tracks.sort_by_key(|t| t.order);
-                    let cur = self.play.track.as_ref().map(|t| t.uri.clone());
-                    let at = self.play.position(now_ms()) as u64;
-                    let _ = sm.send(crate::smart::Cmd::Start { playlist: pl, tracks, first: cur, shuffle: false, position: at });
-                }
-                _ => self.stop_smart(),
-            }
-            self.play.shuffle = false;
-            self.hold_shuffle = Some((false, Instant::now()));
-            self.osd("SHUFFLE OFF");
-        } else if self.play.shuffle && self.signed_in && self.smart_source().is_some() {
-            // off -> Spotify's shuffle -> SpoX shuffle -> off
-            self.send(command_with("set_shuffle", "enabled", json!(false)));
-            self.smart_on = false;
-            self.toggle_smart();
-        } else {
-            self.toggle_shuffle();
-        }
-        self.refresh_at = Some(Instant::now() + Duration::from_millis(700));
+    /// The shuffle mode (a setting that sticks): "off", "shuffle" or "spox".
+    fn shuffle_mode(&self) -> String {
+        self.cfg.lock().unwrap().shuffle_mode.clone()
     }
 
-    fn toggle_shuffle(&mut self) {
-        let v = !self.play.shuffle;
-        self.send(command_with("set_shuffle", "enabled", json!(v)));
-        self.play.shuffle = v; // show it right away; Soloist's real state follows
-        self.hold_shuffle = Some((v, Instant::now()));
-        if v && self.smart_on {
-            self.stop_smart();
+    /// Shuffle button: off -> shuffle -> SpoX shuffle -> off. It's a setting: applies to the list
+    /// playing now (carrying on with this song) and to whatever list you play next.
+    fn cycle_shuffle(&mut self) {
+        let next = match self.shuffle_mode().as_str() {
+            "off" => "shuffle",
+            "shuffle" => "spox",
+            _ => "off",
+        };
+        self.cfg.lock().unwrap().shuffle_mode = next.to_string();
+        if self.play.shuffle {
+            self.send(command_with("set_shuffle", "enabled", json!(false)));
         }
-        self.osd(if v { "SHUFFLE ON" } else { "SHUFFLE OFF" });
+        let label = match next {
+            "spox" => "SPOX SHUFFLE",
+            "shuffle" => "SHUFFLE",
+            _ => "SHUFFLE OFF",
+        };
+        match (self.signed_in, self.smart_source(), &self.smart) {
+            (true, Some((pl, tracks)), Some(sm)) => {
+                let mut tracks = tracks;
+                if next == "off" {
+                    tracks.sort_by_key(|t| t.order);
+                }
+                let cur = self.play.track.as_ref().map(|t| t.uri.clone());
+                let at = self.play.position(now_ms()) as u64;
+                let _ = sm.send(crate::smart::Cmd::Start {
+                    playlist: pl,
+                    tracks,
+                    first: cur,
+                    shuffle: next != "off",
+                    position: at,
+                });
+                self.osd(label);
+            }
+            _ => self.osd(format!("{} \u{b7} FOR THE NEXT LIST", label)),
+        }
+        self.refresh_at = Some(Instant::now() + Duration::from_millis(700));
     }
 
     fn track_link(&self) -> Option<String> {
@@ -1110,9 +1130,29 @@ impl App {
                 "btn_pause" => "Pause",
                 "btn_next" => "Next",
                 "btn_panel" => "Panel",
-                "btn_shuffle" => if self.smart_on && self.smart_shuffled { "SpoX shuffle" } else if self.play.shuffle { "Shuffle" } else { "Shuffle: off" },
-                "btn_repeat" => if self.play.repeat != "off" { "Repeat" } else { "Repeat: off" },
-                "btn_like" => if self.liked == Some(true) { "Liked" } else { "Like" },
+                "btn_shuffle" => {
+                    if self.shuffle_mode() == "spox" {
+                        "SpoX shuffle (with new songs)"
+                    } else if self.shuffle_mode() == "shuffle" {
+                        "Shuffle"
+                    } else {
+                        "Shuffle: off"
+                    }
+                }
+                "btn_repeat" => {
+                    if self.play.repeat != "off" {
+                        "Repeat"
+                    } else {
+                        "Repeat: off"
+                    }
+                }
+                "btn_like" => {
+                    if self.liked == Some(true) {
+                        "Liked"
+                    } else {
+                        "Like"
+                    }
+                }
                 "btn_add" => {
                     return Some(match self.in_playing_playlist_peek() {
                         Some((n, true)) => format!("Remove from {}", n),
@@ -1185,9 +1225,45 @@ impl App {
         self.text(p, o, s, x + 4.0, y + 3.0, &text, self.skin.color("menu_text"));
     }
 
+    /// + / -: add the playing song to the playlist you're playing, or take it out again.
+    /// Returns a message to show when it can't.
+    fn add_remove_current(&mut self) -> Option<&'static str> {
+        let in_it = self.in_playing_playlist();
+        match (&self.play.track, in_it) {
+            (None, _) => return Some("NOTHING PLAYING"),
+            _ if !self.signed_in => return Some("SIGN IN FIRST (MENU)"),
+            (_, None) => return Some("PLAY ONE OF YOUR PLAYLISTS"),
+            (Some(t), Some((pl, inside))) => {
+                let uri = t.uri.clone();
+                if inside {
+                    // the copy in the playlist may be another version of the same song
+                    let key = crate::smart::key(&t.name, &t.artists);
+                    let real = load_tracks_cache(&self.playlist_uri(&pl))
+                        .and_then(|ts| {
+                            ts.into_iter()
+                                .find(|x| {
+                                    x.uri == uri || crate::smart::key(&x.name, &x.artists) == key
+                                })
+                                .map(|x| x.uri)
+                        })
+                        .unwrap_or(uri);
+                    let _ = self.web.send(Req::RemoveFrom {
+                        playlist: pl,
+                        uri: real,
+                        key,
+                    });
+                } else {
+                    let _ = self.web.send(Req::AddTo { playlist: pl, uri });
+                }
+            }
+        }
+        None
+    }
+
     fn in_playing_playlist_peek(&self) -> Option<(String, bool)> {
         let t = self.play.track.as_ref()?;
-        let pl = self.playlists.iter().find(|p| p.owned && p.id != "liked" && p.uri == self.play.context_uri)?;
+        let ctx = self.playing_list_uri();
+        let pl = self.playlists.iter().find(|p| p.owned && p.id != "liked" && p.uri == ctx)?;
         let set = self.contents.get(&pl.uri)?;
         Some((pl.name.clone(), set.contains(&t.uri) || set.contains(&crate::smart::key(&t.name, &t.artists))))
     }
@@ -1195,7 +1271,7 @@ impl App {
     /// The playing playlist (if it's yours) and whether the current song is already in it.
     fn in_playing_playlist(&mut self) -> Option<(Playlist, bool)> {
         let t = self.play.track.clone()?;
-        let ctx = self.play.context_uri.clone();
+        let ctx = self.playing_list_uri();
         let pl = self.playlists.iter().find(|p| p.owned && p.id != "liked" && p.uri == ctx).cloned()?;
         if !self.contents.contains_key(&pl.uri) {
             let set = self.contents.entry(pl.uri.clone()).or_default();
@@ -1890,9 +1966,14 @@ impl App {
         self.spr(p, o, s, "vol_thumb", vx + ((vw - tw_) * vf).round(), vy);
 
         // shuffle / repeat
-        let shuf_var = if self.smart_on && self.smart_shuffled {
-            Some(if self.skin.sprite("btn_shuffle_smart").is_some() { "btn_shuffle_smart" } else { "btn_shuffle_down" })
-        } else if self.play.shuffle && !self.smart_on {
+        let mode = self.shuffle_mode();
+        let shuf_var = if mode == "spox" {
+            Some(if self.skin.sprite("btn_shuffle_smart").is_some() {
+                "btn_shuffle_smart"
+            } else {
+                "btn_shuffle_down"
+            })
+        } else if mode == "shuffle" {
             Some("btn_shuffle_down")
         } else {
             None
@@ -1985,24 +2066,23 @@ impl App {
         }
         // + / -: add the song to the playlist you're playing, or take it out again
         let in_it = self.in_playing_playlist();
-        if self.skin.json["pos"]["btn_add"].is_array() && self.button(p, o, s, inp, 0.0, "btn_add", in_it.as_ref().map(|(_, i)| *i).unwrap_or(false).then_some("btn_remove")) {
-            match (&self.play.track, in_it) {
-                (None, _) => self.osd("NOTHING PLAYING"),
-                _ if !self.signed_in => self.osd("SIGN IN FIRST (MENU)"),
-                (_, None) => self.osd("PLAY ONE OF YOUR PLAYLISTS"),
-                (Some(t), Some((pl, inside))) => {
-                    let uri = t.uri.clone();
-                    if inside {
-                        // the copy in the playlist may be another version of the same song
-                        let key = crate::smart::key(&t.name, &t.artists);
-                        let real = load_tracks_cache(&self.playlist_uri(&pl))
-                            .and_then(|ts| ts.into_iter().find(|x| x.uri == uri || crate::smart::key(&x.name, &x.artists) == key).map(|x| x.uri))
-                            .unwrap_or(uri);
-                        let _ = self.web.send(Req::RemoveFrom { playlist: pl, uri: real, key });
-                    } else {
-                        let _ = self.web.send(Req::AddTo { playlist: pl, uri });
-                    }
-                }
+        if self.skin.json["pos"]["btn_add"].is_array()
+            && self.button(
+                p,
+                o,
+                s,
+                inp,
+                0.0,
+                "btn_add",
+                in_it
+                    .as_ref()
+                    .map(|(_, i)| *i)
+                    .unwrap_or(false)
+                    .then_some("btn_remove"),
+            )
+        {
+            if let Some(m) = self.add_remove_current() {
+                self.osd(m);
             }
         }
         if self.skin.json["pos"]["btn_link"].is_array() && self.button(p, o, s, inp, 0.0, "btn_link", None) {
@@ -3032,8 +3112,23 @@ impl App {
             ("Text width".into(), format!("{}px", c.tb_text_w), 32),
             ("When idle (or paused 10 s)".into(), match c.tb_idle.as_str() { "icon" => "just the icon", "hide" => "hide", _ => "dim last song" }.into(), 33),
             ("Shuffle button".into(), onoff(c.tb_shuffle_btn), 49),
-            ("Hide tray icon while it's on".into(), onoff(c.hide_tray_with_player), 64),
-            ("Text lines".into(), match c.tb_lines.as_str() { "one" => "one (scrolls)", "two" => "two", _ => "auto (fits)" }.into(), 43),
+            ("Like button".into(), onoff(c.tb_like_btn), 52),
+            ("+ / - playlist button".into(), onoff(c.tb_add_btn), 53),
+            (
+                "Hide tray icon while it's on".into(),
+                onoff(c.hide_tray_with_player),
+                64,
+            ),
+            (
+                "Text lines".into(),
+                match c.tb_lines.as_str() {
+                    "one" => "one (scrolls)",
+                    "two" => "two",
+                    _ => "auto (fits)",
+                }
+                .into(),
+                43,
+            ),
             ("Dim when paused".into(), onoff(c.tb_paused_dim), 44),
             ("Volume bar".into(), onoff(c.tb_volume_bar), 45),
             ("Show".into(), if c.tb_show_when == "hidden" { "only when SpoX is hidden" } else { "always" }.into(), 46),
@@ -3223,7 +3318,18 @@ impl App {
                     c.tb_monitor = cycle(&c.tb_monitor, &o);
                 }
                 49 => c.tb_shuffle_btn = !c.tb_shuffle_btn,
-                42 => c.tb_left_offset = cycle(&c.tb_left_offset.to_string(), &["0", "8", "16", "32", "64", "96", "128", "160", "200", "240", "320"]).parse().unwrap_or(8),
+                52 => c.tb_like_btn = !c.tb_like_btn,
+                53 => c.tb_add_btn = !c.tb_add_btn,
+                42 => {
+                    c.tb_left_offset = cycle(
+                        &c.tb_left_offset.to_string(),
+                        &[
+                            "0", "8", "16", "32", "64", "96", "128", "160", "200", "240", "320",
+                        ],
+                    )
+                    .parse()
+                    .unwrap_or(8)
+                }
                 43 => c.tb_lines = cycle(&c.tb_lines, &["auto", "one", "two"]),
                 44 => c.tb_paused_dim = !c.tb_paused_dim,
                 45 => c.tb_volume_bar = !c.tb_volume_bar,
@@ -3849,7 +3955,18 @@ impl eframe::App for App {
             tr.set_visible(!(c.tb_on && c.tb_idle != "hide" && c.hide_tray_with_player));
         }
         if let Some(t) = &self.tb {
-            if t.smart_on.swap(self.smart_on, std::sync::atomic::Ordering::SeqCst) != self.smart_on {
+            let il = match self.in_playing_playlist_peek() {
+                None => 0u8,
+                Some((_, false)) => 1,
+                Some((_, true)) => 2,
+            };
+            if t.in_list.swap(il, std::sync::atomic::Ordering::SeqCst) != il {
+                self.ctx.request_repaint_of(crate::tb::id());
+            }
+            if t.smart_on
+                .swap(self.smart_on, std::sync::atomic::Ordering::SeqCst)
+                != self.smart_on
+            {
                 self.ctx.request_repaint_of(crate::tb::id());
             }
         }
@@ -3880,10 +3997,21 @@ impl eframe::App for App {
                         self.ctx.request_repaint_of(crate::tb::id());
                     }
                 }
+                "addremove" => {
+                    let m = self.add_remove_current();
+                    if let (Some(t), Some(m)) = (&self.tb, m) {
+                        crate::tb::osd(t, &m.to_lowercase());
+                        self.ctx.request_repaint_of(crate::tb::id());
+                    }
+                }
                 "shuffle" => {
                     self.cycle_shuffle();
                     if let Some(t) = &self.tb {
-                        let m = if self.smart_on { "SpoX smart shuffle" } else if self.play.shuffle { "Spotify shuffle" } else { "Shuffle off" };
+                        let m = match self.shuffle_mode().as_str() {
+                            "spox" => "SpoX shuffle",
+                            "shuffle" => "Shuffle",
+                            _ => "In order",
+                        };
                         crate::tb::osd(t, m);
                         self.ctx.request_repaint_of(crate::tb::id());
                     }

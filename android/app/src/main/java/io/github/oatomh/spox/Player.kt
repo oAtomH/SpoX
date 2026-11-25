@@ -105,7 +105,7 @@ object Player {
         return State(
             title = t.title, artist = t.artist, album = t.album, art = n.art,
             durationMs = t.durationMs, positionMs = heard, positionAt = nowT,
-            playing = n.playing, shuffle = n.shuffle || (Smart.on && Smart.shuffled), repeat = n.repeat != "off",
+            playing = n.playing, shuffle = Smart.mode(app) != "off", repeat = n.repeat != "off",
             app = "io.github.oatomh.spox.engine",
         )
     }
@@ -364,25 +364,16 @@ object Player {
 
     fun toggleShuffle() {
         eng?.let { e ->
-            // off -> Spotify's shuffle -> SpoX shuffle (SpoX's own order, with the Spotify
-            // sign-in) -> off
+            // the button is a setting: off -> shuffle -> SpoX shuffle -> off. It applies to the
+            // list playing now (carrying on with this song) and to whatever list you play next.
+            val m = Smart.nextMode(Smart.mode(app))
+            Smart.setMode(app, m)
+            expect(shuffle = m != "off")
+            if (e.now.shuffle) e.command("set_shuffle", mapOf("enabled" to false))
             val list = Smart.playingList()
-            when {
-                !Smart.on && !state.shuffle -> { expect(shuffle = true); e.command("set_shuffle", mapOf("enabled" to true)) }
-                Smart.on && Smart.shuffled -> {
-                    // back to the list in its own order, carrying on with the song playing now
-                    expect(shuffle = false)
-                    val l = list
-                    if (l != null && Web.signedIn) Smart.start(app, l, null, e.now.track?.uri, false, state.position())
-                    else Smart.stop()
-                }
-                Web.signedIn && list != null -> {
-                    if (state.shuffle) e.command("set_shuffle", mapOf("enabled" to false))
-                    Smart.start(app, list, null, e.now.track?.uri, true, state.position())
-                    changed()
-                }
-                else -> { expect(shuffle = !state.shuffle); e.command("set_shuffle", mapOf("enabled" to state.shuffle)) }
-            }
+            if (list != null && Web.signedIn) Smart.start(app, list, null, e.now.track?.uri, m != "off", state.position())
+            else PlayerView.say(app, when (m) { "spox" -> "SpoX shuffle"; "shuffle" -> "Shuffle"; else -> "Shuffle off" } + " · for the next list you play")
+            changed()
             return
         }
         if (controller == null) return
@@ -394,6 +385,7 @@ object Player {
                 .setShuffleMode(if (state.shuffle) PlaybackStateCompat.SHUFFLE_MODE_ALL else PlaybackStateCompat.SHUFFLE_MODE_NONE)
         }
     }
+
 
     fun toggleRepeat() {
         eng?.let { e -> expect(repeat = !state.repeat); e.command("set_repeat_context", mapOf("enabled" to state.repeat)); return }
@@ -511,7 +503,7 @@ object Player {
                 QRow(-1, t.uri, t.title, t.artist, "Next in queue", Web.knows(t.title, t.artist) == false, false)
             }
             val listName = Smart.listName.ifEmpty { "your list" }
-            val group = if (Smart.shuffled) "SpoX shuffle · $listName" else "Next from $listName"
+            val group = when { !Smart.shuffled -> "Next from $listName"; Smart.mode(app) == "spox" -> "SpoX shuffle · $listName"; else -> "Shuffle · $listName" }
             return queuedRows + Smart.upcoming().take(100).mapIndexed { i, t ->
                 QRow(i.toLong(), t.uri, t.title, t.artist, group, Web.knows(t.title, t.artist) == false, t.isNew)
             }

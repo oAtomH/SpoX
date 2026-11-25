@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_bg_ambercrt">#100F0C</color>
+    <color name="ic_bg_ice">#0C0F12</color>
+    <color name="ic_bg_rose">#0F0D0F</color>
+    <color name="ic_bg_lime">#0B0C0D</color>
+    <color name="ic_bg_mono">#0B0C0D</color>
+    <color name="ic_bg_gameboy">#14170C</color>
+    <color name="ic_bg_vapor">#100D14</color>
+    <color name="ic_bg_blood">#0E090A</color>
+    <color name="ic_bg_ocean">#0A0E12</color>
+    <color name="ic_bg_sunset">#110D0D</color>
+    <color name="ic_bg_paper">#161717</color>
+</resources>

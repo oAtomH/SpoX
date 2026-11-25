@@ -52,7 +52,7 @@ pub enum Ev {
     UpdateReady(String),
     /// SpoX shuffle state: on/off, shuffled or in your order, the list's name, songs it picked as
     /// "new", and what's coming (the whole rest of its order: (song, kind "list"/"new"/"user"))
-    Smart { on: bool, shuffled: bool, list: String, new_uris: Vec<String>, upcoming: Vec<(Track, String)>, busy: String },
+    Smart { on: bool, shuffled: bool, list: String, list_uri: String, new_uris: Vec<String>, upcoming: Vec<(Track, String)>, busy: String },
 }
 
 #[derive(Clone, Debug)]
