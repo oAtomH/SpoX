@@ -187,7 +187,7 @@ object Smart {
                 seeds = clean; ordered = ord
                 used.clear(); clean.forEach { used += Web.key(it.title, it.sub) }
                 deck.forEach { used += Web.key(it.title, it.artist) }
-                newUris.clear(); pool.clear(); queued.clear(); acc = 0.0; needNew = 0
+                newUris.clear(); pool.clear(); queued.clear(); owed.clear(); acc = 0.0; needNew = 0
                 dropArmed()
             }
             loadFound(list.uri)
@@ -251,7 +251,7 @@ object Smart {
             val ahead = deck.subList(index + 1, deck.size).toList()
             while (deck.size > index + 1) deck.removeAt(deck.size - 1)
             ahead.filter { it.isMine }.forEach { deck += it }
-            needNew = 0; acc = 0.0
+            needNew = 0; acc = 0.0; owed.clear()
             if (keepOrder) {
                 // same list songs in the same order, only the new songs are mixed again
                 bag.clear()
@@ -264,7 +264,7 @@ object Smart {
     }
 
     fun stop() {
-        synchronized(lock) { on = false; deck.clear(); index = 0; bag.clear(); target = -1; queued.clear(); dropArmed() }
+        synchronized(lock) { on = false; deck.clear(); index = 0; bag.clear(); target = -1; queued.clear(); owed.clear(); dropArmed() }
         pool.clear()
         busy = ""
         save()
@@ -498,7 +498,8 @@ object Smart {
      */
     private fun plan(): Boolean = synchronized(lock) {
         val r = share()
-        var hungry = false
+        fillOwed()
+        var hungry = owed.isNotEmpty()
         while (deck.size - index - 1 < AHEAD) {
             if (r >= 100 || needNew > 0) {
                 val t = pick(deck.lastOrNull()?.artist.orEmpty())
@@ -509,6 +510,9 @@ object Smart {
                 }
                 hungry = true
                 if (System.currentTimeMillis() < warmUntil && deck.size - index - 1 >= 5) break
+                // none found yet: the list carries on (never waits), and the new songs owed here
+                // are slotted in at this spot as soon as they're found (the share stays even)
+                deck.lastOrNull()?.let { e -> repeat(maxOf(needNew, 1)) { owed += e } }
                 needNew = 0
                 if (r >= 100 && bag.isEmpty() && seeds.isEmpty()) break
             }
@@ -525,6 +529,28 @@ object Smart {
             }
         }
         hungry
+    }
+
+    /** Spots in the plan still owed a new song (the entry it goes after), oldest first. */
+    private val owed = ArrayList<Entry>()
+
+    /** Puts found new songs into the owed spots, only further ahead than the next two songs:
+     *  nothing already planned moves or disappears, new songs just appear between them. */
+    private fun fillOwed() {
+        if (owed.isEmpty()) return
+        if (share() == 0) { owed.clear(); return }
+        var added = false
+        val it = owed.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            val pos = deck.indexOfFirst { x -> x === e }
+            if (pos < 0 || pos <= index + 1) { it.remove(); continue }
+            val t = pick(e.artist) ?: break
+            deck.add(pos + 1, Entry(t.uri, t.title, t.sub, "new"))
+            it.remove()
+            added = true
+        }
+        if (added && armed != null && armed != deck.getOrNull(index + 1)?.uri) dropArmed()
     }
 
     // ---- new songs ---------------------------------------------------------------------------
@@ -594,6 +620,8 @@ object Smart {
                 val wasWarm = warmUntil > 0
                 if (pool.size >= 6) warmUntil = 0
                 plan()
+                // still owed: look again right away (the slow lane keeps Spotify happy)
+                if (synchronized(lock) { owed.isNotEmpty() }) main.postDelayed({ discover() }, 2000)
                 if (wasWarm && warmUntil == 0L) rearm()
                 save(); changed()
             }
@@ -601,7 +629,7 @@ object Smart {
     }
 
     /**
-     * Finds new songs: three artists similar to the seed (Deezer), then ONE Spotify search per
+     * Finds new songs: five artists similar to the seed (Deezer), then ONE Spotify search per
      * artist that brings ten of their songs; up to three you don't know are kept per artist.
      * (Before, every single song cost its own Spotify search: that ran into Spotify's limit.)
      */
@@ -609,7 +637,7 @@ object Smart {
         val artist = seed?.split(", ")?.firstOrNull() ?: seedArtist()
         if (artist.isEmpty()) return
         val found = ArrayList<Web.Item>()
-        for (a in similarArtists(artist).take(3).ifEmpty { listOf(artist) }) {
+        for (a in similarArtists(artist).take(5).ifEmpty { listOf(artist) }) {
             val r = Web.getBg("/search?type=track&limit=10&q=" + enc("artist:\"$a\""))?.optJSONObject("tracks")?.optJSONArray("items") ?: continue
             val songs = (0 until r.length()).mapNotNull { Web.track(r.optJSONObject(it)) }
                 .filter { it.sub.split(", ").first().equals(a, true) && !known(it.title, it.sub) && pool.none { p -> p.uri == it.uri } && it.uri !in newUris }

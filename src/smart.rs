@@ -289,6 +289,8 @@ struct Engine {
     busy: String,
     /// the first seconds of a list with no new songs yet
     warm_until: Option<Instant>,
+    /// spots in the plan still owed a new song: the song it goes after (uri, and its place then)
+    owed: Vec<String>,
 }
 
 pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<String>) -> (Sender<Cmd>, Sender<Value>) {
@@ -346,6 +348,7 @@ pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<Strin
                 finding: Default::default(),
                 busy: String::new(),
                 warm_until: None,
+                owed: Vec::new(),
             };
             e.restore();
             e.report();
@@ -537,6 +540,7 @@ impl Engine {
         self.pool.lock().unwrap().clear();
         self.acc = 0.0;
         self.need_new = 0;
+        self.owed.clear();
         self.drop_armed();
         {
             let mut used = self.used.lock().unwrap();
@@ -607,6 +611,7 @@ impl Engine {
         self.deck.extend(ahead.iter().filter(|e| e.kind == "user").cloned());
         self.need_new = 0;
         self.acc = 0.0;
+        self.owed.clear();
         if keep_order {
             self.bag = ahead.into_iter().filter(|e| e.kind == "list").map(|e| e.t).collect();
         } else {
@@ -628,6 +633,7 @@ impl Engine {
         self.queued.clear();
         self.target = None;
         self.go_at = None;
+        self.owed.clear();
         self.drop_armed();
         self.busy.clear();
         self.save();
@@ -899,9 +905,41 @@ impl Engine {
     }
 
     /// Fills the order up to AHEAD songs ahead. True while new songs are owed but not found yet.
+    /// Puts found new songs into the owed spots, only further ahead than the next song: nothing
+    /// already planned moves or disappears, new songs just appear between them.
+    fn fill_owed(&mut self) {
+        if self.owed.is_empty() {
+            return;
+        }
+        if self.ratio() == 0 {
+            self.owed.clear();
+            return;
+        }
+        let mut added = false;
+        while let Some(u) = self.owed.first().cloned() {
+            let pos = (self.index + 2..self.deck.len()).find(|&k| self.deck[k].t.uri == u);
+            let Some(pos) = pos else {
+                self.owed.remove(0);
+                continue;
+            };
+            let artist = self.deck[pos].t.artists.clone();
+            let Some(t) = self.pick_new(&artist) else { break };
+            self.deck.insert(pos + 1, Entry { t, kind: "new".into() });
+            self.owed.remove(0);
+            added = true;
+        }
+        if added {
+            let want = self.deck.get(self.index + 1).map(|e| e.t.uri.clone());
+            if self.armed.is_some() && self.armed != want {
+                self.drop_armed();
+            }
+        }
+    }
+
     fn plan(&mut self) -> bool {
         let r = self.ratio();
-        let mut hungry = false;
+        self.fill_owed();
+        let mut hungry = !self.owed.is_empty();
         while self.deck.len() - self.index - 1 < AHEAD {
             if r >= 100 || self.need_new > 0 {
                 let last = self.deck.last().map(|e| e.t.artists.clone()).unwrap_or_default();
@@ -913,6 +951,13 @@ impl Engine {
                 hungry = true;
                 if self.warm_until.map(|t| Instant::now() < t).unwrap_or(false) && self.deck.len() - self.index - 1 >= 5 {
                     break;
+                }
+                // none found yet: the list carries on (never waits), and the new songs owed here
+                // are slotted in at this spot once found (the share stays even)
+                if let Some(e) = self.deck.last() {
+                    for _ in 0..self.need_new.max(1) {
+                        self.owed.push(e.t.uri.clone());
+                    }
                 }
                 self.need_new = 0;
                 if r >= 100 && self.bag.is_empty() && self.seeds.is_empty() {
@@ -1190,12 +1235,12 @@ impl Discover {
 
     fn run(self) {
         let mut found: Vec<Track> = Vec::new();
-        // three artists similar to the seed (Deezer), then ONE Spotify search per artist that
+        // five artists similar to the seed (Deezer), then ONE Spotify search per artist that
         // brings ten of their songs; up to three you don't know are kept per artist. (Before,
         // every song cost its own search, which ran into Spotify's request limit.)
         let seed_artist = first_artist_raw(&self.seed.artists);
         let mut artists = similar_artists(&seed_artist);
-        artists.truncate(3);
+        artists.truncate(5);
         if artists.is_empty() {
             artists.push(seed_artist);
         }
