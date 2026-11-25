@@ -503,13 +503,13 @@ class PlayerView(ctx: Context) : View(ctx) {
         drawIcon(cv, spk, pad, floor(iconY / u) * u, u, if (muted || flash || pressed == "mute") cTitle else cDim)
         hit(0f, y - 8 * u, pad + 12 * u, y + volH + 8 * u, "mute")
         val pctW = if (flash) tw("100", u) + 6 * u else 0f
-        val bx = pad + 13 * u
-        val bw = w - 13 * u - pctW
-        volRect = RectF(bx, y, bx + bw, y + volH)
-        nine(cv, "vol_track", bx, y, bw, volH, u, 2)
-        val vw = floor(bw * vol / u) * u
-        if (vw > 0) nine(cv, "vol_fill", bx, y, vw, volH, u, 2)
-        spr(cv, "vol_thumb", (bx + vw - 4 * u).coerceIn(bx, bx + bw - 8 * u), y, u)
+        val vbx = pad + 13 * u
+        val vbw = w - 13 * u - pctW
+        volRect = RectF(vbx, y, vbx + vbw, y + volH)
+        nine(cv, "vol_track", vbx, y, vbw, volH, u, 2)
+        val vw = floor(vbw * vol / u) * u
+        if (vw > 0) nine(cv, "vol_fill", vbx, y, vw, volH, u, 2)
+        spr(cv, "vol_thumb", (vbx + vw - 4 * u).coerceIn(vbx, vbx + vbw - 8 * u), y, u)
         if (flash) {
             val pct = "${(vol * 100).roundToInt()}"
             txt(cv, pct, pad + w - tw(pct, u), y, u, cTitle)
