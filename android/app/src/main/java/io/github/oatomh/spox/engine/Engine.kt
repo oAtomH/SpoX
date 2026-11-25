@@ -275,6 +275,14 @@ class Engine private constructor(private val ctx: Context) {
 
     // ---- the real visualizer: a copy of the sound, read where the speaker is right now -------
 
+    /** Silence the phone at once (headphones disconnected: not a note out of the speaker) and pause. */
+    @Volatile private var hushedUntil = 0L
+    fun hush() {
+        hushedUntil = System.currentTimeMillis() + 1500
+        runCatching { playing?.let { it.pause(); it.flush() } }
+        command("pause")
+    }
+
     private val ring = FloatArray(1 shl 16)
     @Volatile private var ringFrames = 0L
     @Volatile private var playing: android.media.AudioTrack? = null
@@ -415,6 +423,10 @@ class Engine private constructor(private val ctx: Context) {
                 buf.clear(); buf.put(arr, 0, n); buf.flip()
                 tap(arr, n, fmt == 0x11b, ch)
                 playing = track
+                // just hushed: drop what Soloist still sends before its pause lands
+                if (System.currentTimeMillis() < hushedUntil) continue
+                // stopped by hush() (headphones pulled out): start again with the next sound
+                if (track.playState != android.media.AudioTrack.PLAYSTATE_PLAYING) track.play()
                 while (buf.hasRemaining()) {
                     val w = track.write(buf, buf.remaining(), android.media.AudioTrack.WRITE_BLOCKING)
                     if (w < 0) { log("[audio] write error $w"); return }

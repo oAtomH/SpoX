@@ -118,6 +118,16 @@ Each friend needs:
 - Tray mode, global media keys and launch on startup.
 
 
+## New in v0.9 (Windows + Android)
+
+- **SpoX shuffle rebuilt again, properly this time.** Spotify now gets a real playing list from SpoX (20 songs back, 80 ahead), so next / previous work everywhere (headphones, lock screen, car) and going back goes to the song before, not the start of the session. Up next is always about 100 songs, fully planned with the new songs in place; it only grows at the bottom. When the list has been played through, a new shuffled round follows.
+- **Shuffle button:** off → shuffle → SpoX shuffle. Every playlist also has *Play*, *Shuffle* and *SpoX shuffle* at the top (phone).
+- **Phone:**
+  - Pulling out headphones / Bluetooth disconnecting pauses at once. Calls and voice notes pause the music and it carries on after.
+  - The volume number is always shown on the Player tab, and volume changed from Bluetooth headphones or a car shows in SpoX too.
+  - The library reopens on the playlist you had open.
+  - Settings → *Lock screen player* says why the lock screen player is missing, and fixes it with a tap.
+
 ## New in v0.8 (Windows + Android)
 
 - **SpoX shuffle plans ahead.** New songs are placed into the order as soon as they're found, so Up next shows a long, fixed list with the new songs already in it. Going back and forth never swaps them. New songs are picked like a radio: from artists similar to the song next to them. Spotify only gets the next 3 songs at a time; the rest stays SpoX's.

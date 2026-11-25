@@ -1046,10 +1046,9 @@ impl App {
             self.play.shuffle = false;
             self.hold_shuffle = Some((false, Instant::now()));
             self.osd("SHUFFLE OFF");
-        } else if self.signed_in && self.smart_source().is_some() {
-            if self.play.shuffle {
-                self.send(command_with("set_shuffle", "enabled", json!(false)));
-            }
+        } else if self.play.shuffle && self.signed_in && self.smart_source().is_some() {
+            // off -> Spotify's shuffle -> SpoX shuffle -> off
+            self.send(command_with("set_shuffle", "enabled", json!(false)));
             self.smart_on = false;
             self.toggle_smart();
         } else {
@@ -1111,7 +1110,7 @@ impl App {
                 "btn_pause" => "Pause",
                 "btn_next" => "Next",
                 "btn_panel" => "Panel",
-                "btn_shuffle" => if self.smart_on { "SpoX smart shuffle" } else if self.play.shuffle { "Shuffle" } else { "Shuffle: off" },
+                "btn_shuffle" => if self.smart_on && self.smart_shuffled { "SpoX shuffle" } else if self.play.shuffle { "Shuffle" } else { "Shuffle: off" },
                 "btn_repeat" => if self.play.repeat != "off" { "Repeat" } else { "Repeat: off" },
                 "btn_like" => if self.liked == Some(true) { "Liked" } else { "Like" },
                 "btn_add" => {
@@ -1891,9 +1890,9 @@ impl App {
         self.spr(p, o, s, "vol_thumb", vx + ((vw - tw_) * vf).round(), vy);
 
         // shuffle / repeat
-        let shuf_var = if self.smart_on {
+        let shuf_var = if self.smart_on && self.smart_shuffled {
             Some(if self.skin.sprite("btn_shuffle_smart").is_some() { "btn_shuffle_smart" } else { "btn_shuffle_down" })
-        } else if self.play.shuffle {
+        } else if self.play.shuffle && !self.smart_on {
             Some("btn_shuffle_down")
         } else {
             None

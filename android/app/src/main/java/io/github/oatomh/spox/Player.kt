@@ -364,10 +364,11 @@ object Player {
 
     fun toggleShuffle() {
         eng?.let { e ->
-            // with the Spotify sign-in: off <-> SpoX shuffle (SpoX's own order, saved between runs).
-            // Without it: Spotify's shuffle.
+            // off -> Spotify's shuffle -> SpoX shuffle (SpoX's own order, with the Spotify
+            // sign-in) -> off
             val list = Smart.playingList()
             when {
+                !Smart.on && !state.shuffle -> { expect(shuffle = true); e.command("set_shuffle", mapOf("enabled" to true)) }
                 Smart.on && Smart.shuffled -> {
                     // back to the list in its own order, carrying on with the song playing now
                     expect(shuffle = false)
@@ -481,7 +482,7 @@ object Player {
     fun playQueueItem(id: Long, uri: String = "") {
         if (Smart.on && uri.isNotEmpty() && Smart.jumpTo(uri)) return
         val e = eng ?: run { tc?.skipToQueueItem(id); return }
-        val i = id.toInt()
+        val i = if (id < 0) e.now.queue.indexOfFirst { it.uri == uri } else id.toInt()
         val t = e.now.queue.getOrNull(i) ?: return
         Smart.holdUntil = System.currentTimeMillis() + 450L * (i + 1) + 2500
         val ctx = e.now.contextUri
@@ -504,14 +505,14 @@ object Player {
     /** Up next for the list, grouped like Spotify's queue, with "new" marks. */
     fun queueRows(): List<QRow> {
         if (Smart.on) {
-            // SpoX's own order: the whole rest of the list, not just Spotify's next few
+            // songs you queued first (Spotify plays them next), then SpoX's own order
+            val mine = Smart.queuedUris()
+            val queuedRows = eng?.now?.queue.orEmpty().filter { it.uri in mine }.map { t ->
+                QRow(-1, t.uri, t.title, t.artist, "Next in queue", Web.knows(t.title, t.artist) == false, false)
+            }
             val listName = Smart.listName.ifEmpty { "your list" }
-            return Smart.upcoming().take(300).mapIndexed { i, t ->
-                val group = when {
-                    t.kind == "user" -> "Next in queue"
-                    !Smart.shuffled -> "Next from $listName"
-                    else -> "SpoX shuffle · $listName"
-                }
+            val group = if (Smart.shuffled) "SpoX shuffle · $listName" else "Next from $listName"
+            return queuedRows + Smart.upcoming().take(100).mapIndexed { i, t ->
                 QRow(i.toLong(), t.uri, t.title, t.artist, group, Web.knows(t.title, t.artist) == false, t.isNew)
             }
         }

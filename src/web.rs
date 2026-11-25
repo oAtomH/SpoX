@@ -493,13 +493,16 @@ impl Api {
 
     /// Plays exactly these songs (up to 100), in order, on the SpoX device: SpoX shuffle and
     /// playing a list in your own sort order. `position_ms` starts the first one part-way.
-    pub fn play_uris(&self, device: &str, uris: &[String], position_ms: u64) -> Result<(), String> {
+    pub fn play_uris(&self, device: &str, uris: &[String], position_ms: u64, offset: usize) -> Result<(), String> {
         if uris.is_empty() {
             return Err("nothing to play".into());
         }
         let id = self.device_id(device).ok_or("device not found")?;
         let window: Vec<&String> = uris.iter().take(100).collect();
         let mut body = json!({ "uris": window });
+        if offset > 0 {
+            body["offset"] = json!({ "position": offset });
+        }
         if position_ms > 0 {
             body["position_ms"] = json!(position_ms);
         }

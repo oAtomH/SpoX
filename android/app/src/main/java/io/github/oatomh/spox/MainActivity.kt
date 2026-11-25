@@ -55,6 +55,7 @@ class MainActivity : Activity() {
                 "#Look" to "",
                 "Colour pack" to Skin.packName(this),
                 "Player in notifications" to when (SpoxNotification.style(this)) { "pixel" -> "pixel card"; "media" -> "phone's player"; else -> "off" },
+                "Lock screen player" to SpoxNotification.lockStatus(this),
                 "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "card" -> "SpoX card"; else -> "pixel cover" },
                 "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
                 "#Listening" to "",
@@ -79,6 +80,14 @@ class MainActivity : Activity() {
             when (what) {
                 "access", "Notification access" -> startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                 "Player in notifications" -> SpoxNotification.cycleStyle(this)
+                "Lock screen player" -> {
+                    val st = SpoxNotification.lockStatus(this)
+                    when {
+                        st.startsWith("blocked") -> startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, packageName))
+                        st.startsWith("pixel") || st.startsWith("off") -> { getSharedPreferences("spox", 0).edit().putString("notif_style", "pixel").apply(); SpoxNotification.cycleStyle(this) }
+                        else -> { SpoxNotification.refresh(this); view.say("Player posted again: check the lock screen") }
+                    }
+                }
                 "Engine" -> {
                     val eng = io.github.oatomh.spox.engine.Engine.get(this)
                     when {
