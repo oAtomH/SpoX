@@ -1247,8 +1247,8 @@ class PlayerView(ctx: Context) : View(ctx) {
         // the shuffle button decides: SpoX shuffle, shuffle, or in the order you see
         val mode = Smart.mode(context)
         if (Web.signedIn && Player.fromEngine || Web.signedIn && io.github.oatomh.spox.engine.Engine.get(context).isLive) {
-            if (mode == "off") Smart.start(context, l, songs, first ?: songs.firstOrNull()?.uri, false)
-            else Smart.start(context, l, p.items.filter { it.kind == "track" }, first, true)
+            if (mode == "off") Smart.start(context, l, p.items.filter { it.kind == "track" }, first ?: songs.firstOrNull()?.uri, false, order = songs)
+            else Smart.start(context, l, p.items.filter { it.kind == "track" }, first, true, order = songs)
         } else kotlin.concurrent.thread { if (!Web.playIn(l.uri.takeIf { l.kind != "liked" }, first ?: songs.firstOrNull()?.uri, songs.map { it.uri })) Player.playUri(l.uri) }
         tab = Tab.PLAYER
     }

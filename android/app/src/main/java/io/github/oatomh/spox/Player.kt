@@ -309,7 +309,7 @@ object Player {
     fun playPause() {
         if (state.playing) pause() else play()
     }
-    fun next() { eng?.let { it.command("skip_next"); return }; tc?.skipToNext() }
+    fun next() { eng?.let { if (Smart.on) Smart.next() else it.command("skip_next"); return }; tc?.skipToNext() }
 
     // ---- songs taken out of Up next ------------------------------------------------------------
 
@@ -343,7 +343,7 @@ object Player {
         if (Smart.on) Smart.remove(uris) else skipQueued(uris)
         changed()
     }
-    fun prev() { eng?.let { it.command("skip_prev"); return }; tc?.skipToPrevious() }
+    fun prev() { eng?.let { if (Smart.on) Smart.prev() else it.command("skip_prev"); return }; tc?.skipToPrevious() }
     fun seek(ms: Long) {
         eng?.let { e ->
             state = state.copy(positionMs = ms, positionAt = SystemClock.elapsedRealtime())
@@ -371,6 +371,8 @@ object Player {
             expect(shuffle = m != "off")
             if (e.now.shuffle) e.command("set_shuffle", mapOf("enabled" to false))
             val list = Smart.playingList()
+            // SpoX already plays the list: only what's ahead changes, at once (the song carries on)
+            if (Smart.applyMode(app, m)) { changed(); return }
             if (list != null && Web.signedIn) Smart.start(app, list, null, e.now.track?.uri, m != "off", state.position())
             else PlayerView.say(app, when (m) { "spox" -> "SpoX shuffle"; "shuffle" -> "Shuffle"; else -> "Shuffle off" } + " · for the next list you play")
             changed()
@@ -388,7 +390,13 @@ object Player {
 
 
     fun toggleRepeat() {
-        eng?.let { e -> expect(repeat = !state.repeat); e.command("set_repeat_context", mapOf("enabled" to state.repeat)); return }
+        eng?.let { e ->
+            expect(repeat = !state.repeat)
+            // SpoX plays songs one by one: repeat = this song again (the list itself never runs out)
+            if (Smart.on) e.command("set_repeat_track", mapOf("enabled" to state.repeat))
+            else e.command("set_repeat_context", mapOf("enabled" to state.repeat))
+            return
+        }
         if (controller == null) return
         expect(repeat = !state.repeat)
         if (custom("repeat")) return
@@ -498,14 +506,10 @@ object Player {
     fun queueRows(): List<QRow> {
         if (Smart.on) {
             // songs you queued first (Spotify plays them next), then SpoX's own order
-            val mine = Smart.queuedUris()
-            val queuedRows = eng?.now?.queue.orEmpty().filter { it.uri in mine }.map { t ->
-                QRow(-1, t.uri, t.title, t.artist, "Next in queue", Web.knows(t.title, t.artist) == false, false)
-            }
             val listName = Smart.listName.ifEmpty { "your list" }
             val group = when { !Smart.shuffled -> "Next from $listName"; Smart.mode(app) == "spox" -> "SpoX shuffle · $listName"; else -> "Shuffle · $listName" }
-            return queuedRows + Smart.upcoming().take(100).mapIndexed { i, t ->
-                QRow(i.toLong(), t.uri, t.title, t.artist, group, Web.knows(t.title, t.artist) == false, t.isNew)
+            return Smart.upcoming().take(100).mapIndexed { i, t ->
+                QRow(i.toLong(), t.uri, t.title, t.artist, if (t.isMine) "Next in queue" else group, Web.knows(t.title, t.artist) == false, t.isNew)
             }
         }
         val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, "", t, a, "", false, false) }
@@ -530,8 +534,9 @@ object Player {
     /** Plays a Spotify link/uri (song, album, playlist, artist) on SpoX Engine. */
     fun playUri(uri: String) { engine?.command("play", mapOf("uri" to uri)) }
     fun addToQueue(uri: String, title: String = "", artist: String = "") {
+        // SpoX plays a list: it goes into SpoX's own order (right after this song)
+        if (Smart.noteQueued(uri, title, artist)) return
         engine?.command("add_to_queue", mapOf("uri" to uri))
-        Smart.noteQueued(uri, title, artist)
     }
 
     // ---- sleep timer ---------------------------------------------------------------------

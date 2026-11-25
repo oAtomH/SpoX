@@ -20,7 +20,7 @@ import android.media.session.PlaybackState
  * app and sends the buttons back to it. (Spotify's own player stays next to it for now.)
  */
 object SpoxNotification {
-    const val CHANNEL = "player"
+    const val CHANNEL = "playback"
     const val ID = 77
     private var session: MediaSession? = null
     private var lastKey = ""
@@ -76,8 +76,39 @@ object SpoxNotification {
                 }
             }
         })
+        s.setSessionActivity(PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
         s.isActive = true
         session = s
+    }
+
+    /** Everything that decides whether the lock screen shows SpoX's player, for "Lock screen check". */
+    fun lockReport(ctx: Context): String {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val ch = nm.getNotificationChannel(CHANNEL)
+        val posted = nm.activeNotifications.firstOrNull { it.id == ID }
+        val sb = StringBuilder()
+        sb.append("SpoX ").append(runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull()).append(" · Android ").append(android.os.Build.VERSION.RELEASE)
+            .append(" (").append(android.os.Build.VERSION.SDK_INT).append(") ").append(android.os.Build.MODEL).append('\n')
+        sb.append("style: ").append(style(ctx)).append(" · notifications on: ").append(nm.areNotificationsEnabled()).append('\n')
+        sb.append("channel: ").append(if (ch == null) "none" else "importance ${ch.importance}, lock screen ${ch.lockscreenVisibility}").append('\n')
+        sb.append("posted: ").append(posted != null)
+        if (posted != null) {
+            val n = posted.notification
+            sb.append(" · media session in it: ").append(n.extras.containsKey(Notification.EXTRA_MEDIA_SESSION))
+                .append(" · template: ").append(n.extras.getString(Notification.EXTRA_TEMPLATE))
+                .append(" · visibility: ").append(n.visibility)
+                .append(" · foreground: ").append(n.flags and Notification.FLAG_FOREGROUND_SERVICE != 0)
+        }
+        sb.append('\n')
+        val s = session
+        sb.append("session: ").append(if (s == null) "none" else "active ${s.isActive}, state ${s.controller.playbackState?.state}, title ${s.controller.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)}").append('\n')
+        val msm = ctx.getSystemService(android.media.session.MediaSessionManager::class.java)
+        val list = runCatching { msm.getActiveSessions(android.content.ComponentName(ctx, MediaListener::class.java)) }.getOrNull()
+        sb.append("Android's active players: ").append(list?.joinToString { "${it.packageName}(${it.playbackState?.state})" } ?: "needs Notification access to see").append('\n')
+        val cr = ctx.contentResolver
+        for (k in listOf("lock_screen_show_notifications", "lock_screen_allow_private_notifications", "media_controls_lock_screen", "lockscreen_show_media", "now_bar_enabled"))
+            sb.append(k).append('=').append(runCatching { android.provider.Settings.Secure.getString(cr, k) }.getOrNull()).append(' ')
+        return sb.toString()
     }
 
     private fun clear(ctx: Context) {
@@ -168,9 +199,15 @@ object SpoxNotification {
     fun channel(ctx: Context) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(CHANNEL) == null) {
+            // a fresh channel (0.10.1): the old "player" one may carry lock screen settings from
+            // before; this one is made public on the lock screen from the start
             nm.createNotificationChannel(NotificationChannel(CHANNEL, "SpoX player", NotificationManager.IMPORTANCE_LOW).apply {
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             })
+            runCatching { nm.deleteNotificationChannel("player") }
         }
     }
 
