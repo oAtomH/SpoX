@@ -493,13 +493,28 @@ class PlayerView(ctx: Context) : View(ctx) {
         }
         y += ctrlH + 10 * u
 
-        // volume = the phone's media volume
+        // volume = the phone's media volume. A speaker on the left mutes / unmutes; the volume
+        // buttons show their change right here (the pop-up is for the other tabs)
         if (now - volAt > 1000 && dragging != "vol") { vol = Player.volume(context); volAt = now }
-        volRect = RectF(pad, y, pad + w, y + volH)
-        nine(cv, "vol_track", pad, y, w, volH, u, 2)
-        val vw = floor(w * vol / u) * u
-        if (vw > 0) nine(cv, "vol_fill", pad, y, vw, volH, u, 2)
-        spr(cv, "vol_thumb", (pad + vw - 4 * u).coerceIn(pad, pad + w - 8 * u), y, u)
+        val muted = vol <= 0.001f
+        val flash = now < volOsdUntil
+        val spk = if (muted) ICON_MUTED else ICON_SPEAKER
+        val iconY = y + (volH - spk.size * u) / 2
+        drawIcon(cv, spk, pad, floor(iconY / u) * u, u, if (muted || flash || pressed == "mute") cTitle else cDim)
+        hit(0f, y - 8 * u, pad + 12 * u, y + volH + 8 * u, "mute")
+        val pctW = if (flash) tw("100", u) + 6 * u else 0f
+        val vbx = pad + 13 * u
+        val vbw = w - 13 * u - pctW
+        volRect = RectF(vbx, y, vbx + vbw, y + volH)
+        nine(cv, "vol_track", vbx, y, vbw, volH, u, 2)
+        val vw = floor(vbw * vol / u) * u
+        if (vw > 0) nine(cv, "vol_fill", vbx, y, vw, volH, u, 2)
+        spr(cv, "vol_thumb", (vbx + vw - 4 * u).coerceIn(vbx, vbx + vbw - 8 * u), y, u)
+        if (flash) {
+            val pct = "${(vol * 100).roundToInt()}"
+            txt(cv, pct, pad + w - tw(pct, u), y, u, cTitle)
+            animating = true
+        }
         y += volH + 8 * u
 
         // visualizer in the space that's left
@@ -734,8 +749,8 @@ class PlayerView(ctx: Context) : View(ctx) {
             val mins = rows.size
             val sub = when {
                 rows.isEmpty() -> ""
-                newCount > 0 -> "$mins songs · $newCount new · long-press to pick"
-                else -> "$mins songs · long-press to pick"
+                newCount > 0 -> "$mins songs · $newCount new · hold to pick, swipe to remove"
+                else -> "$mins songs · hold to pick, swipe to remove"
             }
             if (sub.isNotEmpty()) txt(cv, fit(sub, width - 2 * pad, u), pad, y, u, cDim)
             y += 14 * u
@@ -775,6 +790,17 @@ class PlayerView(ctx: Context) : View(ctx) {
             val id = "qrow:${q.id}:${q.uri}"
             val isSel = q.uri in selected
             val isNew = q.neverHeard || q.outside
+            // swiping this row left: "Remove" shows underneath, the row slides with your finger
+            val dx = if (swipeId == id) min(0f, swipeDx) else 0f
+            if (dx < 0f) {
+                box(cv, 0f, ry, width.toFloat(), rh, cLine)
+                val lbl = if (-dx > width * 0.3f) "Let go to remove" else "Remove"
+                txt(cv, lbl, width - pad - tw(lbl, u), ry + 10 * u, u, skin.color("list_new", cTitle))
+                cv.save()
+                cv.clipRect(0f, ry, width + dx, ry + rh)
+                cv.translate(dx, 0f)
+                box(cv, 0f, ry, width.toFloat(), rh, cBg)
+            }
             if (isSel || pressed == id) box(cv, 0f, ry, width.toFloat(), rh, cLine)
             var tx = pad
             if (selected.isNotEmpty()) {
@@ -802,10 +828,15 @@ class PlayerView(ctx: Context) : View(ctx) {
             txt(cv, fit(q.title, textW, u), tx, ry + 5 * u, u, if (isNew) accent else cList)
             txt(cv, fit(q.artist, textW, u), tx, ry + 16 * u, u, cDim)
             box(cv, pad, ry + rh - max(1f, u / 2), width - 2 * pad, max(1f, u / 2), cLine)
+            if (dx < 0f) cv.restore()
             hit(0f, max(top, ry), width.toFloat(), min(contentBottom, ry + rh), id)
         }
         cv.restore()
     }
+
+    // swipe a song in Up next to the left to take it out
+    private var swipeId: String? = null
+    private var swipeDx = 0f
 
     private fun queueTap(id: String) {
         val parts = id.split(":", limit = 3)
@@ -865,7 +896,7 @@ class PlayerView(ctx: Context) : View(ctx) {
      * One list in the library. [sort]: "added" (newest first), "title", "artist", "album",
      * "length" or "custom" (the list's own order). [filter]: words to look for in the list.
      */
-    class Page(val title: String, val list: Web.Item?, @Volatile var items: List<Web.Item> = emptyList(), @Volatile var loading: Boolean = true,
+    class Page(val title: String, val list: Web.Item?, val from: Map<Web.Item, Web.Item> = emptyMap(), @Volatile var items: List<Web.Item> = emptyList(), @Volatile var loading: Boolean = true,
                var sort: String = "", var filter: String = "", var scroll: Float = 0f) {
         private var viewKey = ""
         private var viewCache: List<Web.Item> = emptyList()
@@ -879,7 +910,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             }
             val words = filter.lowercase().split(' ').filter { it.isNotBlank() }
             var v = if (words.isEmpty()) items else items.filter { t -> val hay = index[t].orEmpty(); words.all { hay.contains(it) } }
-            v = when (sort) {
+            v = when (sort.removeSuffix("!")) {
                 "added" -> v.sortedByDescending { it.added }
                 "title" -> v.sortedBy { it.title.lowercase() }
                 "artist" -> v.sortedWith(compareBy({ it.sub.lowercase() }, { it.album.lowercase() }, { it.order }))
@@ -887,6 +918,8 @@ class PlayerView(ctx: Context) : View(ctx) {
                 "length" -> v.sortedBy { it.durationMs }
                 else -> v
             }
+            // "!" = the other way round (oldest first, Z-A, longest first...)
+            if (sort.endsWith("!")) v = v.reversed()
             viewCache = v; viewKey = k
             return v
         }
@@ -945,7 +978,42 @@ class PlayerView(ctx: Context) : View(ctx) {
         saveLibrary()
     }
 
-    fun search(q: String) = openPage("Search: $q", null) { Web.search(q) }
+    /** One search for everything: the list you have open, your library (playlists and the songs of
+     *  lists you've opened), then Spotify. */
+    fun search(q: String) {
+        val inList = pages.lastOrNull()?.takeIf { it.list != null }
+        val words = q.lowercase().split(' ').filter { it.isNotBlank() }
+        fun match(it: Web.Item) = "${it.title} ${it.sub} ${it.album}".lowercase().let { h -> words.all { w -> h.contains(w) } }
+        val from = HashMap<Web.Item, Web.Item>()
+        val local = ArrayList<Web.Item>()
+        inList?.let { pg ->
+            val m = pg.items.filter { it.kind == "track" && match(it) }.take(30)
+            if (m.isNotEmpty()) { local += Web.Item("", "In ${pg.title}", "", "header"); m.forEach { from[it] = pg.list!! }; local += m }
+        }
+        val lib = pages.firstOrNull()?.items.orEmpty()
+        val lists = lib.filter { it.kind != "header" && match(it) }.take(10)
+        val songs = ArrayList<Web.Item>()
+        val seen = HashSet<String>(local.map { it.uri })
+        for (l in lib) {
+            if (songs.size >= 30) break
+            loadList(l.uri)?.forEach { t -> if (t.kind == "track" && songs.size < 30 && match(t) && seen.add(t.uri)) { songs += t; from[t] = l } }
+        }
+        if (lists.isNotEmpty() || songs.isNotEmpty()) { local += Web.Item("", "In your library", "", "header"); local += lists; local += songs }
+        val page = Page("Search: $q", null, from)
+        page.items = local
+        pages.lastOrNull()?.scroll = scroll
+        pages += page
+        scroll = 0f
+        tab = Tab.LIBRARY
+        kotlin.concurrent.thread {
+            val sp = runCatching { Web.search(q) }.getOrDefault(emptyList())
+            post {
+                page.items = local + (if (sp.isNotEmpty()) listOf(Web.Item("", "On Spotify", "", "header")) + sp else emptyList())
+                page.loading = false
+                invalidate()
+            }
+        }
+    }
 
     private val libPrefs get() = context.getSharedPreferences("library", 0)
 
@@ -965,13 +1033,13 @@ class PlayerView(ctx: Context) : View(ctx) {
     }
 
     private fun restoreLibrary() {
-        val top = Page("Library", null, sort = libPrefs.getString("top_sort", "custom") ?: "custom", filter = libPrefs.getString("top_filter", "") ?: "")
+        val top = Page("Library", null, sort = libPrefs.getString("top_sort", "custom") ?: "custom", filter = "")
         pages += top
         load(top, "library") { Web.playlists() }
         val o = libPrefs.getString("open", null)?.let { runCatching { org.json.JSONArray(it) }.getOrNull() } ?: return
         val item = Web.Item(o.optString(0), o.optString(1), "", o.optString(2), o.optString(3))
         val p = Page(item.title, item, sort = libPrefs.getString("sort:" + item.uri, null) ?: if (item.kind == "album") "custom" else "added",
-            filter = libPrefs.getString("open_filter", "") ?: "", scroll = libPrefs.getFloat("open_scroll", 0f))
+            filter = "", scroll = libPrefs.getFloat("open_scroll", 0f))
         pages += p
         if (tab == Tab.LIBRARY) scroll = p.scroll
         load(p, item.uri) { Web.tracks(item) }
@@ -997,31 +1065,77 @@ class PlayerView(ctx: Context) : View(ctx) {
         }
         var top = header(cv, p.title, sub)
         if (pages.size > 1) hit(0f, contentTop, width.toFloat(), top, "libback")
-        // tools: sort + search in this list
-        val th = 20 * u
-        val sortLabel = "Sort: " + (if (p.list == null && pages.size == 1) (if (p.sort == "title") "A-Z" else "Recent") else sortNames[p.sort] ?: "List order")
-        val findLabel = if (p.filter.isEmpty()) "Find in list" else "\"${p.filter}\" · ${v.size}  x"
-        val sw = tw(sortLabel, u) + 12 * u
-        nine(cv, "list_bg", pad, top, sw, th, u, 4)
-        txt(cv, sortLabel, pad + 6 * u, top + 5 * u, u, cList)
-        hit(pad, top, pad + sw, top + th, "libsort")
-        val fx = pad + sw + 4 * u
-        val fw = width - pad - fx
-        nine(cv, "list_bg", fx, top, fw, th, u, 4)
-        txt(cv, fit(findLabel, fw - 12 * u, u), fx + 6 * u, top + 5 * u, u, if (p.filter.isEmpty()) cDim else cTitle)
-        hit(fx, top, fx + fw, top + th, if (p.filter.isEmpty()) "libfind" else "libfindclear")
-        top += th + 4 * u
+        // tools: one search for everything (this list, your library, Spotify), and sorting
+        val th = 22 * u
+        val isStats = p.title == STATS
+        val searching = p.list == null && pages.size > 1 && !isStats
+        if (isStats) {
+            // which time span (tap to change)
+            val lbl = when (p.sort) { "7" -> "Last 7 days"; "30" -> "Last 30 days"; "365" -> "This year"; else -> "All time" } + "  v"
+            val sw = tw(lbl, u) + 12 * u
+            nine(cv, "list_bg", pad, top, sw, th, u, 4)
+            txt(cv, lbl, pad + 6 * u, top + 6 * u, u, cList)
+            hit(pad, top, pad + sw, top + th, "libsort")
+            top += th + 4 * u
+        } else if (!searching) {
+            val sortLabel = sortLabel(p)
+            val sw = tw(sortLabel, u) + 12 * u
+            val sx = width - pad - sw
+            nine(cv, "list_bg", sx, top, sw, th, u, 4)
+            txt(cv, sortLabel, sx + 6 * u, top + 6 * u, u, if (pressed == "libsort") cTitle else cList)
+            hit(sx, top, sx + sw, top + th, "libsort")
+            val fw = sx - 4 * u - pad
+            // looks like a text box, so it's clearly where you type
+            box(cv, pad, top, fw, th, if (pressed == "libsearch") cTitle else cDim)
+            box(cv, pad + u, top + u, fw - 2 * u, th - 2 * u, skin.color("input_bg", cBg))
+            drawIcon(cv, ICON_SEARCH, pad + 5 * u, top + 7 * u, u, cDim)
+            val hint = if (p.list != null) "Search this list, library, Spotify" else "Search library and Spotify"
+            txt(cv, fit(hint, fw - 22 * u, u), pad + 16 * u, top + 6 * u, u, cDim)
+            hit(pad, top, pad + fw, top + th, "libsearch")
+            top += th + 4 * u
+        }
         val rows = mutableListOf<Triple<String, String, String>>()
-        if (pages.size == 1) rows += Triple("Search Spotify", "songs, artists, albums, playlists", "libsearch")
+        if (pages.size == 1) rows += Triple("Your listening stats", "top artists, songs, time listened" + if (Stats.lastfmOn()) " · Last.fm on" else "", "libstats")
         if (p.list != null && v.isNotEmpty()) {
             val how = if (Smart.on && Smart.shuffled || Player.state.shuffle) "SpoX shuffle" else "in this order"
             rows += Triple("Play all", "${v.size} songs · $how", "libplayall")
         }
         v.forEachIndexed { i, it ->
+            if (it.kind == "header") { rows += Triple("#" + it.title, "", ""); return@forEachIndexed }
             val extra = if (it.kind == "track" && p.sort == "added" && it.added > 0) " · " + ago(it.added) else if (it.kind == "track" && p.sort == "album" && it.album.isNotEmpty()) " · " + it.album else ""
             rows += Triple(it.title, it.sub + extra, "lib:$i")
         }
-        drawRows(cv, top, rows, if (p.loading) "" else if (p.filter.isNotEmpty()) "Nothing matches \"${p.filter}\"." else "Nothing here.", valueRight = false)
+        drawRows(cv, top, rows, if (p.loading) "" else "Nothing here.", valueRight = false)
+    }
+
+    private fun dirName(k: String, rev: Boolean) = when (k) {
+        "added" -> if (rev) "oldest first" else "newest first"
+        "title", "artist", "album" -> if (rev) "Z-A" else "A-Z"
+        "length" -> if (rev) "longest first" else "shortest first"
+        else -> if (rev) "backwards" else ""
+    }
+
+    private fun sortLabel(p: Page): String {
+        val k = p.sort.removeSuffix("!")
+        if (p.list == null) return if (k == "title") "A-Z" else "Recent"
+        val short = mapOf("added" to "Newest", "title" to "A-Z", "artist" to "Artist", "album" to "Album", "length" to "Length", "custom" to "List order")
+        return if (p.sort.endsWith("!")) when (k) { "added" -> "Oldest"; "title" -> "Z-A"; "length" -> "Longest"; else -> (short[k] ?: k) + " ^" } else short[k] ?: "List order"
+    }
+
+    private fun openStats(days: String) {
+        pages.lastOrNull()?.scroll = scroll
+        val p = Page(STATS, null, sort = days)
+        p.items = Stats.rows(days.toInt()).map { (a, b, uri) ->
+            when {
+                a.startsWith("#") -> Web.Item("", a.drop(1), "", "header")
+                uri.isNotEmpty() -> Web.Item(uri, a, b, "track")
+                else -> Web.Item("", a, b, "stat")
+            }
+        }
+        p.loading = false
+        pages += p
+        scroll = 0f
+        tab = Tab.LIBRARY
     }
 
     private fun ago(t: Long): String {
@@ -1035,30 +1149,42 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "libsignin" -> onSignIn?.invoke()
             id == "libsearch" -> onSearch?.invoke()
             id == "libback" -> back()
+            id == "libstats" -> openStats("7")
+            id == "libsort" && p.title == STATS -> show(Sheet("Stats for", emptyList(), listOf("7" to "Last 7 days", "30" to "Last 30 days", "365" to "This year", "0" to "All time").map { (k, l) ->
+                SheetItem(l, "", k == p.sort) { pages.removeAt(pages.size - 1); openStats(k) }
+            }))
             id == "libsort" -> {
-                val opts = if (p.list == null && pages.size == 1) linkedMapOf("custom" to "Recent (like Spotify)", "title" to "A-Z")
-                    else if (p.list == null) linkedMapOf("custom" to "Best match", "title" to "Title")
-                    else sortNames
-                show(Sheet("Sort by", emptyList(), opts.map { (k, l) ->
-                    SheetItem(l, "", k == p.sort) {
-                        p.sort = k
-                        p.list?.let { libPrefs.edit().putString("sort:" + it.uri, k).apply() }
+                val opts = if (p.list == null) linkedMapOf("custom" to "Recent (like Spotify)", "title" to "Name") else sortNames
+                val base = p.sort.removeSuffix("!")
+                val rev = p.sort.endsWith("!")
+                show(Sheet("Sort by", listOf("Tap the one that's on to turn it around."), opts.map { (k, l) ->
+                    val on = k == base
+                    SheetItem(l, if (on) dirName(k, rev) else dirName(k, false), on) {
+                        p.sort = if (on && k != "custom") (if (rev) k else "$k!") else k
+                        p.list?.let { libPrefs.edit().putString("sort:" + it.uri, p.sort).apply() }
                         scroll = 0f
                         saveLibrary()
                     }
                 }))
             }
-            id == "libfind" -> ask("Find in ${p.title}", "title, artist or album", p.filter) { q -> p.filter = q.trim(); scroll = 0f; saveLibrary() }
-            id == "libfindclear" -> { p.filter = ""; scroll = 0f; saveLibrary() }
             id == "libplayall" -> p.list?.let { l -> playFrom(p, l, null) }
             id.startsWith("qlib:") -> libItem(id.drop(1))?.let { Player.addToQueue(it.uri, it.title, it.sub); say("Added to queue: ${it.title}") }
             id.startsWith("lib:") -> libItem(id)?.let { item ->
                 when (item.kind) {
+                    "stat", "header" -> {}
                     "playlist", "liked", "album" -> openPage(item.title, item) { Web.tracks(item) }
                     "artist" -> Player.playUri(item.uri)
                     else -> {
                         val l = p.list
-                        if (l == null) { kotlin.concurrent.thread { Player.playUri(item.uri) } } else playFrom(p, l, item.uri)
+                        val home = p.from[item]
+                        when {
+                            l != null -> playFrom(p, l, item.uri)
+                            home != null -> kotlin.concurrent.thread {
+                                val uris = loadList(home.uri)?.filter { it.kind == "track" }?.map { it.uri }.orEmpty()
+                                if (!Web.playIn(home.uri, item.uri, uris)) Player.playUri(item.uri)
+                            }
+                            else -> kotlin.concurrent.thread { Player.playUri(item.uri) }
+                        }
                         tab = Tab.PLAYER
                     }
                 }
@@ -1406,6 +1532,8 @@ class PlayerView(ctx: Context) : View(ctx) {
         }
         if (now >= volOsdUntil || volOsd < 0) return
         animating = true
+        // on the Player tab the big volume bar itself shows it
+        if (tab == Tab.PLAYER && sheet == null) return
         val segs = 16
         val sw = 5 * u
         val gap = u
@@ -1444,7 +1572,10 @@ class PlayerView(ctx: Context) : View(ctx) {
         private val ICON_CAR = arrayOf("..XXXXX..", ".X.X.X.X.", "XXXXXXXXX", "X.XXXXX.X", "XXXXXXXXX", ".XX...XX.")
         private val ICON_HEAD = arrayOf("..XXXXX..", ".X.....X.", "X.......X", "X.......X", "XX.....XX", "XXX...XXX", "XXX...XXX", ".X.....X.")
         private val ICON_PHONE = arrayOf("XXXXX", "X...X", "X...X", "X...X", "X...X", "X.X.X", "XXXXX")
+        private val ICON_SEARCH = arrayOf(".XXX..", "X...X.", "X...X.", "X...X.", ".XXX..", ".....X")
+        private val ICON_MUTED = arrayOf("...X....", "..XX....", "XXXX.X.X", "XXXX..X.", "XXXX.X.X", "..XX....", "...X....")
         private val ICON_SPEAKER = arrayOf("...X....", "..XX..X.", "XXXX...X", "XXXX.X.X", "XXXX...X", "..XX..X.", "...X....")
+        private const val STATS = "Your stats"
         val ICON_CHECK = arrayOf("......X", ".....X.", "X...X..", ".X.X...", "..X....")
 
         /** The SpoX window on screen (for messages from the player and SpoX shuffle). */
@@ -1519,6 +1650,15 @@ class PlayerView(ctx: Context) : View(ctx) {
                     invalidate()
                     return true
                 }
+                if (swipeId == null && dragging == "list" && tab == Tab.QUEUE && selected.isEmpty() && pressed?.startsWith("qrow:") == true &&
+                    abs(x - downX) > 10 * u && abs(x - downX) > abs(y - downY) * 1.5f) {
+                    swipeId = pressed; pressed = null
+                }
+                if (swipeId != null) {
+                    swipeDx = x - downX
+                    invalidate()
+                    return true
+                }
                 if (dragging == "list") {
                     scroll -= y - lastY
                     lastY = y
@@ -1530,6 +1670,21 @@ class PlayerView(ctx: Context) : View(ctx) {
             MotionEvent.ACTION_UP -> {
                 vt?.addMovement(e)
                 removeCallbacks(longPress)
+                swipeId?.let { id ->
+                    if (-swipeDx > width * 0.3f) {
+                        val q = id.split(":", limit = 3)
+                        val uri = q.getOrNull(2).orEmpty()
+                        val title = qRows.firstOrNull { it.uri == uri }?.title.orEmpty()
+                        buzz()
+                        Player.removeFromQueue(setOf(uri))
+                        say("Removed: $title")
+                    }
+                    swipeId = null; swipeDx = 0f
+                    pressed = null; dragging = null
+                    vt?.recycle(); vt = null
+                    invalidate()
+                    return true
+                }
                 if (longFired) {
                     pressed = null; dragging = null; seekPreview = -1
                     vt?.recycle(); vt = null
@@ -1553,6 +1708,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             }
             MotionEvent.ACTION_CANCEL -> {
                 removeCallbacks(longPress)
+                swipeId = null; swipeDx = 0f
                 pressed = null; dragging = null; seekPreview = -1
                 vt?.recycle(); vt = null
             }
@@ -1606,6 +1762,7 @@ class PlayerView(ctx: Context) : View(ctx) {
             id == "devices" -> onDevices?.invoke()
             id.startsWith("lib") || id.startsWith("qlib") -> libTap(id)
             id == "time" -> showRemaining = !showRemaining
+            id == "mute" -> { vol = Player.toggleMute(context); volAt = SystemClock.elapsedRealtime(); volOsdUntil = volAt + 1400; volOsd = vol }
             id.startsWith("lyric:") -> id.removePrefix("lyric:").toLongOrNull()?.let { Player.seek(it); manualUntil = 0 }
         }
         invalidate()

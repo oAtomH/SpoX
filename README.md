@@ -61,7 +61,7 @@ Open Spotify on your phone or PC, open the **Devices** list and pick **SpoX**. S
 | `↑` / `↓` | Volume up / down |
 | `S` / `R` | SpoX shuffle / repeat on-off |
 | `Ctrl+F` (or `/`) | Find in the open playlist: type, `Enter` plays, `Esc` closes |
-| `O` | Sort the open playlist: newest first, title, artist, album, length, playlist order |
+| `O` / `Shift+O` | Sort the open playlist (newest first, title, artist, album, length, playlist order) / flip the direction |
 | `Ctrl` + click in Up next | Pick several songs; right-click or `Delete` removes them or plays them next |
 | `P` / `Q` / `L` | Playlist / Up next / Lyrics tab |
 | `T` | Always on top |
@@ -117,6 +117,20 @@ Each friend needs:
 - OBS overlays: compact, standard, extended, lyrics and minimal layouts. These will be served from SpoX's existing playback state over a local WebSocket and HTTP, with no second Spotify connection.
 - Tray mode, global media keys and launch on startup.
 
+
+## New in v0.8 (Windows + Android)
+
+- **SpoX shuffle plans ahead.** New songs are placed into the order as soon as they're found, so Up next shows a long, fixed list with the new songs already in it. Going back and forth never swaps them. New songs are picked like a radio: from artists similar to the song next to them. Spotify only gets the next 3 songs at a time; the rest stays SpoX's.
+- **Listening stats:** top artists, top songs and time listened (phone: Library → *Your listening stats*; PC: right-click Recently played or press `I`).
+- **Last.fm scrobbling** (Settings → *Last.fm scrobbling*; PC: key + secret in Setup).
+- **Sorting both ways:** tap the active sort again (phone) or `Shift+O` (PC).
+- **PC:** a Bluetooth / car / headphones icon after the song title when the sound goes there (hover it for the device).
+- **Phone:**
+  - One search box for everything: the open list, your library and Spotify, in sections.
+  - Swipe a song in Up next to the left to remove it.
+  - The volume buttons show on the big volume bar on the Player tab (the pop-up is for other tabs). Tap the speaker to mute.
+  - Remembers the song and spot you were at; pressing play right after opening waits for SpoX Phone instead of failing. SpoX Engine starts faster.
+  - Songs you play are kept in a song cache (Settings → *Song cache*), so replays use less mobile data.
 
 ## New in v0.7 (Windows + Android)
 

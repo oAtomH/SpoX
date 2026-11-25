@@ -62,7 +62,7 @@ object Player {
         val cur = engine?.now?.track?.uri.orEmpty()
         if (cur != lastEngineTrack) {
             lastEngineTrack = cur
-            if (cur.isNotEmpty() && skipped.remove(cur)) engine?.command("skip_next")
+            if (cur.isNotEmpty() && takeSkip(cur)) engine?.command("skip_next")
         }
         main.post { refresh() }
     }
@@ -83,6 +83,7 @@ object Player {
         }
         engine = io.github.oatomh.spox.engine.Engine.get(app).also { it.now.listeners += engineChanged }
         Web.init(app)
+        Stats.init(app)
         Smart.init(app)
         Smart.listeners += { main.post { refresh() } }
         // notification + widget follow every change, whether or not Notification access is on
@@ -99,12 +100,49 @@ object Player {
         // a song counts as listened to after 10 s
         if (n.playing && heard > 10_000) Web.noteKnown(t.title, t.artist)
         Web.loadKnown(n.contextUri.ifEmpty { null })
+        remember(t, n.contextUri, heard, n.playing)
+        Stats.tick(t.uri, t.title, t.artist, t.album, t.durationMs, n.playing)
         return State(
             title = t.title, artist = t.artist, album = t.album, art = n.art,
             durationMs = t.durationMs, positionMs = heard, positionAt = nowT,
             playing = n.playing, shuffle = n.shuffle || (Smart.on && Smart.shuffled), repeat = n.repeat != "off",
             app = "io.github.oatomh.spox.engine",
         )
+    }
+
+    // ---- where you were: song, list and spot, kept for the next start ----------------------------
+
+    private var savedAt = 0L
+    private var savedPlaying = false
+    private fun remember(t: io.github.oatomh.spox.engine.Engine.Track, ctx: String, pos: Long, playing: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (playing && now - savedAt < 5000 && savedPlaying) return
+        if (!playing && !savedPlaying && now - savedAt < 60_000) return
+        savedAt = now; savedPlaying = playing
+        app.getSharedPreferences("last", 0).edit().putString("uri", t.uri).putString("ctx", ctx).putLong("pos", pos)
+            .putLong("dur", t.durationMs).putString("title", t.title).putString("artist", t.artist).putString("album", t.album).apply()
+    }
+
+    private fun lastState(): State? {
+        val p = app.getSharedPreferences("last", 0)
+        val title = p.getString("title", "").orEmpty()
+        if (title.isEmpty()) return null
+        return State(title = title, artist = p.getString("artist", "").orEmpty(), album = p.getString("album", "").orEmpty(),
+            durationMs = p.getLong("dur", 0), positionMs = p.getLong("pos", 0), positionAt = SystemClock.elapsedRealtime(),
+            app = "io.github.oatomh.spox.engine")
+    }
+
+    /** Nothing loaded yet (SpoX just started): play where you were, at the same spot. */
+    private fun resumeLast(): Boolean {
+        val p = app.getSharedPreferences("last", 0)
+        val uri = p.getString("uri", "").orEmpty()
+        val pos = p.getLong("pos", 0)
+        if (Smart.on) return Smart.resume(if (Smart.current()?.uri == uri) pos else 0)
+        if (uri.isEmpty() || !Web.signedIn) return false
+        expect(playing = true)
+        PlayerView.say(app, "Starting where you were...")
+        kotlin.concurrent.thread { if (!Web.resumeAt(p.getString("ctx", "").orEmpty(), uri, pos)) PlayerView.say(app, "SpoX Phone isn't ready yet: try again in a moment") }
+        return true
     }
 
     // A button press shows at once; Spotify confirms a moment later. Until then (or 1.5 s),
@@ -194,9 +232,16 @@ object Player {
         }
         val c = controller
         if (c == null) {
-            // SpoX Engine on, nothing loaded yet, SpoX shuffle saved: show where you were (play carries on)
-            val saved = Smart.current()?.takeIf { engine?.isLive == true }
-            state = if (saved != null) State(title = saved.title, artist = saved.artist, app = "io.github.oatomh.spox.engine") else State()
+            // SpoX Engine on, nothing loaded yet: show where you were (play carries on from there)
+            val live = engine?.isLive == true
+            val saved = Smart.current()?.takeIf { live }
+            val last = if (live) lastState() else null
+            state = when {
+                saved != null && last != null && last.title == saved.title -> last
+                saved != null -> State(title = saved.title, artist = saved.artist, app = "io.github.oatomh.spox.engine")
+                last != null -> last
+                else -> State()
+            }
             changed()
             return
         }
@@ -255,8 +300,8 @@ object Player {
 
     fun play() {
         eng?.let { expect(playing = true); it.command("play"); return }
-        // SpoX Engine on but nothing loaded (e.g. it just started): carry on with SpoX shuffle
-        if (engine?.isLive == true && controller == null && Smart.resume()) return
+        // SpoX Engine on but nothing loaded (e.g. it just started): carry on where you were
+        if (engine?.isLive == true && controller == null && resumeLast()) return
         if (controller != null) expect(playing = true); tc?.play()
     }
     fun pause() { eng?.let { expect(playing = false); it.command("pause"); return }; if (controller != null) expect(playing = false); tc?.pause() }
@@ -268,13 +313,34 @@ object Player {
 
     // ---- songs taken out of Up next ------------------------------------------------------------
 
-    private val skipped: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
-    fun isSkipped(uri: String) = uri in skipped
+    /** Songs to skip when they start, with how many times (the same song can be queued twice)
+     *  and since when (forgotten after 15 min, in case Spotify dropped them itself). */
+    private class Skip(var count: Int, var at: Long)
+    private val skipped = java.util.concurrent.ConcurrentHashMap<String, Skip>()
+    private val justSkipped = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun pending(uri: String): Skip? = skipped[uri]?.takeIf { System.currentTimeMillis() - it.at < 15 * 60_000 && it.count > 0 }
+
+    /** Skip these the next time they start (songs Spotify still has queued that SpoX no longer wants). */
+    fun skipQueued(uris: Collection<String>) {
+        val now = System.currentTimeMillis()
+        uris.forEach { u -> skipped.compute(u) { _, v -> if (v == null || now - v.at > 15 * 60_000) Skip(1, now) else v.apply { count++; at = now } } }
+    }
+
+    private fun takeSkip(uri: String): Boolean {
+        val s = pending(uri) ?: return false
+        if (--s.count <= 0) skipped.remove(uri)
+        justSkipped[uri] = System.currentTimeMillis()
+        return true
+    }
+
+    /** About to be (or just) skipped: SpoX shuffle shouldn't treat it as "you played something else". */
+    fun isSkipped(uri: String) = pending(uri) != null || (justSkipped[uri]?.let { System.currentTimeMillis() - it < 8000 } == true)
 
     /** Spotify can't take songs out of its queue, so SpoX skips them the moment they start. */
     fun removeFromQueue(uris: Set<String>) {
         if (uris.isEmpty()) return
-        if (Smart.on) Smart.remove(uris) else skipped += uris
+        if (Smart.on) Smart.remove(uris) else skipQueued(uris)
         changed()
     }
     fun prev() { eng?.let { it.command("skip_prev"); return }; tc?.skipToPrevious() }
@@ -311,7 +377,7 @@ object Player {
                 }
                 Web.signedIn && list != null -> {
                     if (state.shuffle) e.command("set_shuffle", mapOf("enabled" to false))
-                    Smart.start(app, list, null, e.now.track?.uri, true)
+                    Smart.start(app, list, null, e.now.track?.uri, true, state.position())
                     changed()
                 }
                 else -> { expect(shuffle = !state.shuffle); e.command("set_shuffle", mapOf("enabled" to state.shuffle)) }
@@ -353,6 +419,17 @@ object Player {
         am.setStreamVolume(AudioManager.STREAM_MUSIC, (f.coerceIn(0f, 1f) * max).toInt(), 0)
     }
 
+    /** The speaker next to the volume bar: mute, and back to where it was. */
+    fun toggleMute(ctx: Context): Float {
+        val prefs = ctx.getSharedPreferences("spox", 0)
+        val now = volume(ctx)
+        if (now > 0.001f) {
+            prefs.edit().putFloat("unmute_to", now).apply()
+            setVolume(ctx, 0f)
+        } else setVolume(ctx, prefs.getFloat("unmute_to", 0.4f).coerceAtLeast(0.07f))
+        return volume(ctx)
+    }
+
     /** Volume buttons: one step of the phone's media volume, without Android's own slider. */
     fun stepVolume(ctx: Context, up: Boolean): Float {
         val am = ctx.getSystemService(AudioManager::class.java)
@@ -378,7 +455,7 @@ object Player {
             bt != null -> {
                 val n = bt.productName?.toString().orEmpty()
                 // car stereos usually say so in their name
-                if (Regex("(?i)car|auto|vw|bmw|audi|mercedes|toyota|ford|kia|hyundai|skoda|seat|opel|renault|peugeot|fiat|mazda|honda|nissan|volvo|tesla|sync|uconnect|mylink|carplay").containsMatchIn(n)) Output("car", n)
+                if (Regex("(?i)\\b(car|auto|vw|bmw|audi|mercedes|toyota|ford|kia|hyundai|skoda|seat|opel|renault|peugeot|fiat|mazda|honda|nissan|volvo|tesla|sync|uconnect|mylink|carplay)\\b").containsMatchIn(n)) Output("car", n)
                 else Output("bt", n.ifEmpty { "Bluetooth" })
             }
             has(android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES, android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET) != null -> Output("wired", "Headphones")
@@ -440,7 +517,7 @@ object Player {
         }
         val e = eng ?: return queueItems().map { (id, t, a) -> QRow(id, "", t, a, "", false, false) }
         val name = e.now.contextName.ifEmpty { "this playlist" }
-        return e.now.queue.filter { it.uri !in skipped }.mapIndexed { i, t ->
+        return e.now.queue.filter { pending(it.uri) == null }.mapIndexed { i, t ->
             val p = t.provider
             val group = when {
                 p.contains("queue") -> "Next in queue"

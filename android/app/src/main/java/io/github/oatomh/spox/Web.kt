@@ -338,17 +338,37 @@ object Web {
         if (uris.isEmpty()) return false
         val body = JSONObject().put("uris", JSONArray(uris.take(100)))
         if (positionMs > 0) body.put("position_ms", positionMs)
-        for (attempt in 0..1) {
-            val dev = phoneDevice() ?: return false
-            if (send("PUT", "/me/player/play?device_id=${enc(dev)}", body)) return true
-            phoneId = "" // the id changes when the engine restarts: look it up again
+        return playOnPhone(body)
+    }
+
+    /**
+     * Sends a "play" to SpoX Phone. Right after SpoX Engine starts, Spotify doesn't list the phone
+     * yet: keep trying for a while instead of failing, so pressing play early still plays.
+     */
+    private fun playOnPhone(body: JSONObject): Boolean {
+        val until = System.currentTimeMillis() + 25_000
+        while (System.currentTimeMillis() < until) {
+            val dev = phoneDevice()
+            if (dev != null && send("PUT", "/me/player/play?device_id=${enc(dev)}", body)) return true
+            phoneId = "" // not listed yet, or its id changed: look it up again
+            if (!signedIn) return false
+            Thread.sleep(1200)
         }
         return false
     }
 
+    /** Carry on exactly where you were: a song inside its list, at a spot in it. */
+    fun resumeAt(context: String, track: String, positionMs: Long): Boolean {
+        val body = JSONObject()
+        if (context.startsWith("spotify:playlist:") || context.startsWith("spotify:album:")) {
+            body.put("context_uri", context).put("offset", JSONObject().put("uri", track))
+        } else body.put("uris", JSONArray().put(track))
+        if (positionMs > 0) body.put("position_ms", positionMs)
+        return playOnPhone(body)
+    }
+
     /** Play a song inside its playlist/album on SpoX Phone (so "next" continues in the list). */
     fun playIn(context: String?, track: String?, uris: List<String> = emptyList()): Boolean {
-        val dev = phoneDevice() ?: return false
         val body = JSONObject()
         if (context != null && context != "liked") {
             body.put("context_uri", context)
@@ -358,9 +378,7 @@ object Web {
             val i = uris.indexOf(track).coerceAtLeast(0)
             body.put("uris", JSONArray(uris.drop(i).take(100)))
         }
-        val ok = send("PUT", "/me/player/play?device_id=${enc(dev)}", body)
-        if (!ok) phoneId = ""
-        return ok
+        return playOnPhone(body)
     }
 
     /** Spotify Connect name of the device playing right now (for "Playing on ..."). */

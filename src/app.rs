@@ -132,6 +132,10 @@ pub struct App {
     tracks_all: Vec<Track>,
     /// how the open playlist is sorted: added / title / artist / album / length / custom
     pl_sort: String,
+    /// Recently played section shows "Your stats" instead (days: 7 / 30 / 365 / 0 = all time)
+    hist_stats: bool,
+    hist_days: i64,
+    hist_rows: Vec<(String, String, bool)>,
     /// typing to find in the open playlist (None = not finding)
     pl_find: Option<String>,
     /// last time the whole Up next list was asked for (it's refreshed while you look at it)
@@ -156,7 +160,7 @@ pub struct App {
     menu: bool,
     setup: bool,
     setup_focus: Option<usize>,
-    setup_fields: [String; 3],
+    setup_fields: [String; 4],
     vis: Vis,
     sized: Option<(f32, f32)>,
     t0: Instant,
@@ -173,6 +177,8 @@ enum CtxAct {
     RemoveQ(Vec<String>),
     /// sort the open playlist the next way
     Sort,
+    /// Recently played section: show stats for n days (0 = all time, -1 = back to the list)
+    Stats(i64),
     /// type to find in the open playlist
     Find,
     /// play these right after the current song
@@ -213,7 +219,7 @@ impl App {
             "lyrics" => Tab::Lyrics,
             _ => Tab::Playlist,
         };
-        let setup_fields = [cfg_v.soloist_key.clone(), cfg_v.client_id.clone(), cfg_v.lastfm_key.clone()];
+        let setup_fields = [cfg_v.soloist_key.clone(), cfg_v.client_id.clone(), cfg_v.lastfm_key.clone(), cfg_v.lastfm_secret.clone()];
         let pinned = [cfg_v.pinned[0], cfg_v.pinned[1], cfg_v.pinned[2], cfg_v.pinned_history];
         let saved_name = cfg_v.profile_name.clone();
         let cfg: Shared = Arc::new(Mutex::new(cfg_v));
@@ -234,6 +240,8 @@ impl App {
             let (stx, vtx) = crate::smart::start(cfg.clone(), tx.clone(), ctx.clone(), solo.cmd.clone());
             solo.tap.lock().unwrap().push(vtx);
             smart_tx = Some(stx);
+            // play log + Last.fm scrobbling
+            solo.tap.lock().unwrap().push(crate::stats::start(cfg.clone(), tx.clone()));
             // headset / keyboard media keys + Windows media flyout
             if let Some(tap) = crate::desktop::start_media(solo.cmd.clone()) {
                 solo.tap.lock().unwrap().push(tap);
@@ -256,6 +264,9 @@ impl App {
         crate::discord::start(cfg.clone(), solo.live.clone(), solo.cmd.clone());
         crate::update::start(cfg.clone(), tx.clone());
         crate::desktop::start_pacer(ctx.clone(), &crate::desktop::PACE_MS, egui::ViewportId::ROOT);
+        if !demo {
+            crate::desktop::start_output_watch(ctx.clone());
+        }
         crate::desktop::start_pacer(ctx.clone(), &crate::desktop::TB_PACE_MS, crate::tb::id());
         if let Some(t) = &tb_shared {
             crate::tb::start_watcher(t.clone(), ctx.clone());
@@ -333,6 +344,9 @@ impl App {
             tracks_all: Vec::new(),
             pl_sort: String::new(),
             pl_find: None,
+            hist_stats: false,
+            hist_days: 7,
+            hist_rows: Vec::new(),
             queue_asked: Instant::now(),
             tb: tb_shared,
             hold_shuffle: None,
@@ -446,7 +460,7 @@ impl App {
             "setup" => {
                 self.setup = true;
                 self.setup_focus = Some(1);
-                self.setup_fields = ["8f2c1e9a7b3d4c5e".into(), String::new(), String::new()];
+                self.setup_fields = ["8f2c1e9a7b3d4c5e".into(), String::new(), String::new(), String::new()];
             }
             "menu" => self.menu = true,
             "picker" => {
@@ -783,7 +797,7 @@ impl App {
             .cloned()
             .collect();
         let low = |s: &str| s.to_lowercase();
-        match self.pl_sort.as_str() {
+        match self.pl_sort.trim_end_matches('!') {
             "added" => v.sort_by(|a, b| b.added.cmp(&a.added).then(a.order.cmp(&b.order))),
             "title" => v.sort_by_key(|t| low(&t.name)),
             "artist" => v.sort_by(|a, b| low(&a.artists).cmp(&low(&b.artists)).then(low(&a.album).cmp(&low(&b.album))).then(a.order.cmp(&b.order))),
@@ -791,10 +805,24 @@ impl App {
             "length" => v.sort_by_key(|t| t.duration_ms),
             _ => v.sort_by_key(|t| t.order),
         }
+        // "!" = the other way round (oldest first, Z-A...)
+        if self.pl_sort.ends_with('!') {
+            v.reverse();
+        }
         // keep the same song selected after re-sorting
         let sel_uri = self.selected.and_then(|i| self.tracks.get(i)).map(|t| t.uri.clone());
         self.tracks = v;
         self.selected = sel_uri.and_then(|u| self.tracks.iter().position(|t| t.uri == u));
+    }
+
+    fn show_stats(&mut self, days: i64) {
+        self.hist_stats = days >= 0;
+        if days >= 0 {
+            self.hist_days = days;
+            self.hist_rows = crate::stats::rows(days);
+        }
+        self.scroll[SCROLL_HIST] = 0.0;
+        self.set_tab(Tab::History);
     }
 
     /// Start typing to find songs in the open playlist.
@@ -811,17 +839,23 @@ impl App {
     }
 
     /// Sort the open playlist the next way (remembered per playlist).
-    fn cycle_sort(&mut self) {
+    fn cycle_sort(&mut self, flip: bool) {
         let order = ["added", "title", "artist", "album", "length", "custom"];
-        let i = order.iter().position(|o| *o == self.pl_sort).unwrap_or(0);
-        self.pl_sort = order[(i + 1) % order.len()].to_string();
+        let base = self.pl_sort.trim_end_matches('!').to_string();
+        let i = order.iter().position(|o| *o == base).unwrap_or(0);
+        self.pl_sort = if flip {
+            if self.pl_sort.ends_with('!') { base } else { format!("{}!", base) }
+        } else {
+            order[(i + 1) % order.len()].to_string()
+        };
         if let Some(p) = &self.sel {
             self.cfg.lock().unwrap().sorts.insert(p.uri.clone(), self.pl_sort.clone());
         }
         self.scroll[SCROLL_PL] = 0.0;
         self.apply_view();
         let name = sort_name(&self.pl_sort);
-        self.osd(format!("SORTED BY {}", name.to_uppercase()));
+        let dir = if self.pl_sort.ends_with('!') { " (REVERSED)" } else { "" };
+        self.osd(format!("SORTED BY {}{}", name.to_uppercase(), dir));
     }
 
     fn play_playlist(&mut self, p: &Playlist) {
@@ -1412,6 +1446,7 @@ impl App {
         let key = self.setup_fields[0].trim().to_string();
         let client = self.setup_fields[1].trim().to_string();
         self.cfg.lock().unwrap().lastfm_key = self.setup_fields[2].trim().to_string();
+        self.cfg.lock().unwrap().lastfm_secret = self.setup_fields[3].trim().to_string();
         let (key_changed, client_changed, has_token) = {
             let mut c = self.cfg.lock().unwrap();
             let kc = c.soloist_key != key;
@@ -1757,6 +1792,34 @@ impl App {
         if self.osd.is_some() {
             animating = true;
         }
+        // where the sound goes: a small Bluetooth / car / headphones icon after the title (same
+        // pixel icons as SpoX for phones); hover it for the device and the output's name
+        let (out_kind, out_name) = crate::desktop::OUTPUT.lock().unwrap().clone();
+        let icon: Option<&[&str]> = match out_kind.as_str() {
+            "bt" => Some(&["...X...", "...XX..", ".X.X.X.", "..XXX..", "...X...", "..XXX..", ".X.X.X.", "...XX..", "...X..."]),
+            "car" => Some(&["..XXXXX..", ".X.X.X.X.", "XXXXXXXXX", "X.XXXXX.X", "XXXXXXXXX", ".XX...XX."]),
+            "wired" => Some(&["..XXXXX..", ".X.....X.", "X.......X", "X.......X", "XX.....XX", "XXX...XXX", "XXX...XXX", ".X.....X."]),
+            _ => None,
+        };
+        let tr = if let Some(g) = icon.filter(|_| self.play.track.is_some()) {
+            let iw = g[0].len() as f32;
+            let ix = tr[0] + tr[2] - iw;
+            let iy = tr[1] + ((tr[3] - g.len() as f32) / 2.0).floor().max(0.0);
+            let col = self.skin.color("info");
+            for (j, row) in g.iter().enumerate() {
+                for (i, ch) in row.chars().enumerate() {
+                    if ch == 'X' {
+                        self.fill(p, o, s, ix + i as f32, iy + j as f32, 1.0, 1.0, col);
+                    }
+                }
+            }
+            if inp.over(ix - 1.0, tr[1], iw + 2.0, tr[3]) {
+                self.hover_now = Some(format!("row:Playing on {} \u{b7} sound: {}", self.device_name(), out_name));
+            }
+            [tr[0], tr[1], tr[2] - iw - 3.0, tr[3]]
+        } else {
+            tr
+        };
         animating |= self.marquee(p, o, s, tr, &title, self.skin.color("title"));
         // three-line layout (title / artist / album) when the skin defines "artist" and "album"
         let three = self.skin.json["rect"]["artist"].is_array() && self.skin.json["rect"]["album"].is_array();
@@ -2194,7 +2257,7 @@ impl App {
                             let mins = ms / 60_000;
                             let dur = if ms == 0 { String::new() } else if mins >= 60 { format!("  \u{b7}  {}h {}m", mins / 60, mins % 60) } else { format!("  \u{b7}  {}m", mins) };
                             let smart = if self.smart_on && self.smart_shuffled { "  \u{b7}  SpoX shuffle" } else { "" };
-                            let sort = match self.pl_sort.as_str() {
+                            let sort = match self.pl_sort.trim_end_matches('!') {
                                 "added" => "  \u{b7}  newest",
                                 "title" => "  \u{b7}  A-Z",
                                 "artist" => "  \u{b7}  by artist",
@@ -2225,6 +2288,10 @@ impl App {
                     },
                     "tab_lyrics",
                 ),
+                Tab::History if self.hist_stats => {
+                    let span = match self.hist_days { 7 => "last 7 days", 30 => "last 30 days", 365 => "this year", _ => "all time" };
+                    ("tab_history", format!("Your stats  \u{b7}  {}  (right-click)", span), "tab_history")
+                }
                 Tab::History => ("tab_history", format!("Recently played  \u{b7}  {}", self.history.len()), "tab_history"),
             };
             let open = content.is_some();
@@ -2434,6 +2501,13 @@ impl App {
                     empty_msg = vec![if !self.smart_busy.is_empty() { self.smart_busy.clone() } else if self.connected { "Nothing queued.".into() } else { "Waiting for Soloist...".into() }];
                 }
             }
+            Tab::History if self.hist_stats => {
+                scroll_idx = SCROLL_HIST;
+                let hcol = self.skin.color("header");
+                for (l, r, head) in &self.hist_rows {
+                    rows.push(Row { left: l.clone(), right: r.clone(), color: if *head { hcol } else { list_col }, center: false });
+                }
+            }
             Tab::History => {
                 scroll_idx = SCROLL_HIST;
                 let now = config::now_secs();
@@ -2615,6 +2689,11 @@ impl App {
                         ];
                     }
                 }
+                Tab::History if self.hist_stats => {
+                    let next = match self.hist_days { 7 => 30, 30 => 365, 365 => 0, _ => 7 };
+                    let span = match next { 7 => "last 7 days", 30 => "last 30 days", 365 => "this year", _ => "all time" };
+                    items = vec![(format!("Show {}", span), CtxAct::Stats(next)), ("Back to recently played".into(), CtxAct::Stats(-1))];
+                }
                 Tab::History => {
                     if let Some(r) = clicked {
                         let u = self.history[r].0.uri.clone();
@@ -2625,6 +2704,7 @@ impl App {
                             ("Save to Liked Songs".into(), CtxAct::Like(u.clone())),
                             ("Add to playlist...".into(), CtxAct::AddTo(u.clone())),
                             ("Copy song link".into(), CtxAct::CopyLink(u)),
+                            ("Your listening stats  (I)".into(), CtxAct::Stats(7)),
                         ];
                     }
                 }
@@ -2704,6 +2784,7 @@ impl App {
                         }
                     }
                 }
+                Tab::History if self.hist_stats => {}
                 Tab::History => {
                     if let Some(r) = clicked {
                         if inp.dbl {
@@ -2759,7 +2840,8 @@ impl App {
                     self.send(command_with("get_queue", "limit", json!(0)));
                 }
             }
-            CtxAct::Sort => self.cycle_sort(),
+            CtxAct::Sort => self.cycle_sort(false),
+            CtxAct::Stats(d) => self.show_stats(d),
             CtxAct::Find => self.start_find(),
             CtxAct::RemoveQ(uris) => {
                 let n = uris.len();
@@ -2942,6 +3024,7 @@ impl App {
             ("SpoX shuffle: new songs".into(), format!("{}%", c.smart_ratio), 20),
             ("Same artist twice in a row".into(), if c.smart_avoid_artist { "avoid" } else { "allow" }.into(), 21),
             ("Last.fm key (more new songs)".into(), if c.lastfm_key.is_empty() { "add...".into() } else { "set".into() }, 22),
+            ("Last.fm scrobbling".into(), if c.lastfm_sk.is_empty() { "connect...".into() } else { c.lastfm_user.clone() }, 23),
             ("Taskbar player".into(), String::new(), 0),
             ("Show on taskbar".into(), onoff(c.tb_on), 30),
             ("Monitor".into(), match c.tb_monitor.as_str() { "main" => "main".to_string(), "follow" => "follow active window".to_string(), n => format!("monitor {}", n) }, 41),
@@ -3187,6 +3270,26 @@ impl App {
                     self.install_page = true;
                 }
             }
+            23 => {
+                let (connected, ready) = {
+                    let c = self.cfg.lock().unwrap();
+                    (!c.lastfm_sk.is_empty(), !c.lastfm_key.trim().is_empty() && !c.lastfm_secret.trim().is_empty())
+                };
+                if connected {
+                    let mut c = self.cfg.lock().unwrap();
+                    c.lastfm_sk.clear();
+                    c.lastfm_user.clear();
+                    drop(c);
+                    self.osd("LAST.FM DISCONNECTED");
+                } else if !ready {
+                    self.settings = false;
+                    self.setup = true;
+                    self.setup_focus = Some(2);
+                    self.osd("ADD YOUR LAST.FM KEY + SECRET, THEN CONNECT");
+                } else {
+                    crate::stats::connect(self.cfg.clone(), self.tx.clone(), self.ctx.clone());
+                }
+            }
             22 | 50 => {
                 self.settings = false;
                 self.setup = true;
@@ -3348,10 +3451,11 @@ impl App {
         let x = lr[0] + 1.0;
         let mut y = lr[1] + 1.0;
         // step text, link label, url, field index
-        let steps: [(&str, &str, &str, Option<usize>); 3] = [
+        let steps: [(&str, &str, &str, Option<usize>); 4] = [
             ("1. Soloist API key (needs Premium)", "[get key]", "https://developer.spotify.com/documentation/soloist", Some(0)),
             ("2. Client ID (new app, tick Web API)", "[dashboard]", "https://developer.spotify.com/dashboard", Some(1)),
-            ("3. Last.fm key (optional)", "[get key]", "https://www.last.fm/api/account/create", Some(2)),
+            ("3. Last.fm API key (optional)", "[get key]", "https://www.last.fm/api/account/create", Some(2)),
+            ("4. Last.fm shared secret (scrobbling)", "[my keys]", "https://www.last.fm/api/accounts", Some(3)),
         ];
         for (n, (label, ltxt, url, field)) in steps.iter().enumerate() {
             let lw = self.tw(ltxt);
@@ -3415,7 +3519,7 @@ impl App {
                 self.save_setup();
             }
         }
-        let tip = self.fit("4. Then once: Spotify > Devices > SpoX", lr[2] - w1 - 10.0);
+        let tip = self.fit("5. Then once: Spotify > Devices > SpoX", lr[2] - w1 - 10.0);
         self.text(p, o, s, x + w1 + 8.0, y, &tip, dim);
     }
 
@@ -3593,7 +3697,7 @@ impl App {
                                 self.setup_fields[f].pop();
                             }
                         }
-                        egui::Key::Tab => self.setup_focus = Some((f + 1) % 3),
+                        egui::Key::Tab => self.setup_focus = Some((f + 1) % 4),
                         egui::Key::Enter => self.save_setup(),
                         egui::Key::Escape => {
                             self.setup = false;
@@ -3642,7 +3746,10 @@ impl App {
                 match key {
                     egui::Key::F if modifiers.ctrl => self.start_find(),
                     egui::Key::F3 | egui::Key::Slash => self.start_find(),
-                    egui::Key::O if self.sel.is_some() && !self.picker => self.cycle_sort(),
+                    egui::Key::O if self.sel.is_some() && !self.picker => self.cycle_sort(modifiers.shift),
+                    egui::Key::I => {
+                        if self.hist_stats { self.show_stats(-1) } else { self.show_stats(self.hist_days) }
+                    }
                     egui::Key::Delete if self.queue_visible() => {
                         let picks: Vec<String> = if !self.q_picked.is_empty() {
                             self.q_picked.iter().cloned().collect()
@@ -3992,7 +4099,7 @@ impl eframe::App for App {
 }
 
 fn sort_name(k: &str) -> &'static str {
-    match k {
+    match k.trim_end_matches('!') {
         "added" => "Recently added",
         "title" => "Title",
         "artist" => "Artist",

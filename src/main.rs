@@ -10,6 +10,7 @@ mod lyrics;
 mod net;
 mod skin;
 mod soloist;
+mod stats;
 mod smart;
 mod state;
 mod tb;

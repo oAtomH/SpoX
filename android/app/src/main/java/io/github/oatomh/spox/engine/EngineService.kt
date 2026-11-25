@@ -70,7 +70,8 @@ class EngineService : Service() {
         main.removeCallbacks(idleQuit)
         stopping = false
         if (!engine.isLive) engine.startLive(engine.prefs.getString("key", "").orEmpty())
-        SpoxNotification.update(this)
+        // startForeground just put the plain "starting" card up: put the real player back over it
+        SpoxNotification.refresh(this)
         main.removeCallbacks(refresh)
         main.postDelayed(refresh, 45_000)
         return START_STICKY

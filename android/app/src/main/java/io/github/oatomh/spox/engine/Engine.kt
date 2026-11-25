@@ -40,7 +40,13 @@ class Engine private constructor(private val ctx: Context) {
     private val bin get() = File(dir, "soloist")
     private val run get() = File(ctx.filesDir, "spoxrun")
     private val data get() = File(ctx.filesDir, "soloist-data")
-    private val cache get() = File(ctx.cacheDir, "soloist-cache")
+    // kept in the app's own storage (Android empties "cache" folders when it likes), so songs you
+    // play again come from the phone instead of the internet: less mobile data
+    private val cache get() = File(ctx.filesDir, "soloist-cache")
+
+    /** Song cache size in MB (Settings > Song cache); Soloist's minimum is 100. */
+    fun cacheMb() = ctx.getSharedPreferences("spox", 0).getInt("cache_mb", 1024)
+    fun cacheUsedMb(): Long = (cache.walkTopDown().filter { it.isFile }.sumOf { it.length() }) / (1024 * 1024)
 
     // ---- log (shown in the app, copied as the report) --------------------------------------
 
@@ -125,16 +131,7 @@ class Engine private constructor(private val ctx: Context) {
     }
 
     /** Linux looks in /etc for DNS servers, certificates, users...: spoxrun points it here. */
-    private fun writeEtc() {
-        val etc = File(root, "etc").apply { mkdirs() }
-        // the phone's own DNS servers, then public ones as backup
-        val dns = runCatching {
-            val cm = ctx.getSystemService(ConnectivityManager::class.java)
-            cm.getLinkProperties(cm.activeNetwork)?.dnsServers?.mapNotNull { it.hostAddress?.substringBefore('%') }
-        }.getOrNull().orEmpty().filter { ':' !in it }.take(2) + listOf("1.1.1.1", "8.8.8.8")
-        File(etc, "resolv.conf").writeText(dns.distinct().take(3).joinToString("") { "nameserver $it\n" } + "options timeout:2 attempts:2\n")
-        // Spotify's main server names, looked up by Android: Soloist finds them even if its own
-        // lookups fail
+    private fun lookUpHosts(hosts: File) {
         val names = listOf("apresolve.spotify.com", "spclient.wg.spotify.com", "dealer.spotify.com",
             "login5.spotify.com", "clienttoken.spotify.com", "api.spotify.com", "accounts.spotify.com",
             "ap.spotify.com", "ap-gew1.spotify.com", "ap-gew4.spotify.com", "ap-gue1.spotify.com", "ap-gae2.spotify.com",
@@ -150,11 +147,27 @@ class Engine private constructor(private val ctx: Context) {
         val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
         val found = names.map { n -> pool.submit<String?> {
             runCatching { java.net.InetAddress.getAllByName(n).firstOrNull { it is java.net.Inet4Address }?.hostAddress }.getOrNull()?.let { "$it $n\n" }
-        } }.mapNotNull { runCatching { it.get(6, TimeUnit.SECONDS) }.getOrNull() }
+        } }.mapNotNull { runCatching { it.get(4, TimeUnit.SECONDS) }.getOrNull() }
         pool.shutdownNow()
         found.forEach { lines.append(it) }
-        File(etc, "hosts").writeText(lines.toString())
+        if (found.size > 10 || !hosts.exists()) hosts.writeText(lines.toString())
         log("hosts: ${found.size} of ${names.size} Spotify servers looked up")
+    }
+
+    private fun writeEtc() {
+        val etc = File(root, "etc").apply { mkdirs() }
+        // the phone's own DNS servers, then public ones as backup
+        val dns = runCatching {
+            val cm = ctx.getSystemService(ConnectivityManager::class.java)
+            cm.getLinkProperties(cm.activeNetwork)?.dnsServers?.mapNotNull { it.hostAddress?.substringBefore('%') }
+        }.getOrNull().orEmpty().filter { ':' !in it }.take(2) + listOf("1.1.1.1", "8.8.8.8")
+        File(etc, "resolv.conf").writeText(dns.distinct().take(3).joinToString("") { "nameserver $it\n" } + "options timeout:2 attempts:2\n")
+        // Spotify's server addresses, looked up by Android (Soloist finds them even if its own
+        // lookups fail). Looking ~40 names up takes seconds: reuse the list from last time if it's
+        // recent and refresh it in the background, so the engine starts at once.
+        val hosts = File(etc, "hosts")
+        val fresh = hosts.exists() && System.currentTimeMillis() - hosts.lastModified() < 12 * 3600_000L && hosts.readLines().size > 15
+        if (fresh) thread(name = "spox-hosts") { runCatching { lookUpHosts(hosts) } } else lookUpHosts(hosts)
         File(etc, "nsswitch.conf").writeText("passwd: files\ngroup: files\nhosts: files dns\n")
         val uid = android.system.Os.getuid()
         File(etc, "passwd").writeText("spox:x:$uid:$uid:SpoX:${ctx.filesDir.path}:/bin/sh\n")
@@ -214,13 +227,14 @@ class Engine private constructor(private val ctx: Context) {
             try {
                 prepare(force = false)
                 data.mkdirs(); cache.mkdirs()
+                File(ctx.cacheDir, "soloist-cache").takeIf { it.exists() }?.deleteRecursively()
                 File(data, "ws.port").delete()
                 tracing = false
                 startAudio()
                 // Spotify Connect finds devices by multicast on the Wi-Fi; Android filters it unless asked
                 multicast = ctx.getSystemService(WifiManager::class.java).createMulticastLock("spox").apply { setReferenceCounted(false); acquire() }
                 val cmd = listOf(run.path, loaderPath(), "--library-path", lib.path, bin.path,
-                    "-n", "SpoX Phone", "-k", key, "-D", data.path, "-C", cache.path, "-w", "127.0.0.1:0", "-v")
+                    "-n", "SpoX Phone", "-k", key, "-D", data.path, "-C", cache.path, "-z", cacheMb().coerceAtLeast(100).toString(), "-w", "127.0.0.1:0", "-v")
                 log("\n== Soloist running (tap 2 again to stop) ==")
                 val pb = ProcessBuilder(cmd).directory(dir).redirectErrorStream(true)
                 pb.environment().putAll(linuxEnv())
