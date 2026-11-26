@@ -209,6 +209,241 @@
             </intent-filter>
         </activity-alias>
 
+        <activity-alias
+            android:name=".Icon_catppuccin"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_catppuccin"
+            android:roundIcon="@mipmap/ic_launcher_catppuccin"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_catppuccinlatte"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_catppuccinlatte"
+            android:roundIcon="@mipmap/ic_launcher_catppuccinlatte"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_dracula"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_dracula"
+            android:roundIcon="@mipmap/ic_launcher_dracula"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_nord"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_nord"
+            android:roundIcon="@mipmap/ic_launcher_nord"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_gruvbox"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_gruvbox"
+            android:roundIcon="@mipmap/ic_launcher_gruvbox"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_gruvboxlight"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_gruvboxlight"
+            android:roundIcon="@mipmap/ic_launcher_gruvboxlight"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_tokyonight"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_tokyonight"
+            android:roundIcon="@mipmap/ic_launcher_tokyonight"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_solarized"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_solarized"
+            android:roundIcon="@mipmap/ic_launcher_solarized"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_solarizedlight"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_solarizedlight"
+            android:roundIcon="@mipmap/ic_launcher_solarizedlight"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_onedark"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_onedark"
+            android:roundIcon="@mipmap/ic_launcher_onedark"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_rosepine"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_rosepine"
+            android:roundIcon="@mipmap/ic_launcher_rosepine"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_everforest"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_everforest"
+            android:roundIcon="@mipmap/ic_launcher_everforest"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_kanagawa"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_kanagawa"
+            android:roundIcon="@mipmap/ic_launcher_kanagawa"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_monokai"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_monokai"
+            android:roundIcon="@mipmap/ic_launcher_monokai"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_synthwave84"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_synthwave84"
+            android:roundIcon="@mipmap/ic_launcher_synthwave84"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_ayu"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_ayu"
+            android:roundIcon="@mipmap/ic_launcher_ayu"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_githubdark"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_githubdark"
+            android:roundIcon="@mipmap/ic_launcher_githubdark"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".Icon_matrix"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_matrix"
+            android:roundIcon="@mipmap/ic_launcher_matrix"
+            android:label="SpoX"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
         <!-- reads + controls the music app's player (needs "Notification access" once) -->
         <service
             android:name=".MediaListener"

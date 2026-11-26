@@ -11,4 +11,22 @@
     <color name="ic_bg_ocean">#0A0E12</color>
     <color name="ic_bg_sunset">#110D0D</color>
     <color name="ic_bg_paper">#161717</color>
+    <color name="ic_bg_catppuccin">#1E1E2E</color>
+    <color name="ic_bg_catppuccinlatte">#EFF1F5</color>
+    <color name="ic_bg_dracula">#282A36</color>
+    <color name="ic_bg_nord">#2E3440</color>
+    <color name="ic_bg_gruvbox">#282828</color>
+    <color name="ic_bg_gruvboxlight">#FBF1C7</color>
+    <color name="ic_bg_tokyonight">#1A1B26</color>
+    <color name="ic_bg_solarized">#002B36</color>
+    <color name="ic_bg_solarizedlight">#FDF6E3</color>
+    <color name="ic_bg_onedark">#282C34</color>
+    <color name="ic_bg_rosepine">#191724</color>
+    <color name="ic_bg_everforest">#2D353B</color>
+    <color name="ic_bg_kanagawa">#1F1F28</color>
+    <color name="ic_bg_monokai">#272822</color>
+    <color name="ic_bg_synthwave84">#262335</color>
+    <color name="ic_bg_ayu">#1F2430</color>
+    <color name="ic_bg_githubdark">#0D1117</color>
+    <color name="ic_bg_matrix">#030A04</color>
 </resources>

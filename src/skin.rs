@@ -356,6 +356,29 @@ impl Font {
     }
 }
 
+/// Recolours a pixel into a theme palette (same maths as the phone): greys run from the theme's
+/// background (darkest greys of the skin) to its text colour (lightest), coloured pixels run from
+/// the background through the accent (the skin's accent green) to white.
+fn palette(pal: &[[f32; 3]; 3], px: [u8; 4]) -> [u8; 4] {
+    let (r, g, b) = (px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
+    let mx = r.max(g).max(b);
+    let d = mx - r.min(g).min(b);
+    let sat = if mx > 0.0 { d / mx } else { 0.0 };
+    let [bg, fg, acc] = *pal;
+    let lerp = |a: [f32; 3], c: [f32; 3], k: f32| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * k).round().clamp(0.0, 255.0) as u8);
+    let out = if sat < 0.22 || d < 0.06 {
+        if mx < 0.045 {
+            lerp([bg[0] * 0.6, bg[1] * 0.6, bg[2] * 0.6], bg, mx / 0.045)
+        } else {
+            lerp(bg, fg, ((mx - 0.045) / (0.78 - 0.045)).min(1.0))
+        }
+    } else {
+        let k = mx / 0.89;
+        if k <= 1.0 { lerp(bg, acc, k) } else { lerp(acc, [255.0; 3], (k - 1.0) * 2.0) }
+    };
+    [out[0], out[1], out[2], px[3]]
+}
+
 // ---- colour packs ------------------------------------------------------------------------
 // A pack recolours the whole skin at load time: accent (coloured) pixels get their hue turned
 // and saturation scaled, greys stay as drawn. Exact colour swaps ("map") win over the hue turn.
@@ -370,6 +393,8 @@ pub struct Pack {
     /// grey brightness multiplier
     light: f32,
     map: HashMap<[u8; 3], [u8; 3]>,
+    /// a theme palette: background, text, accent
+    pal: Option<[[f32; 3]; 3]>,
 }
 
 /// name, hue turn, saturation, grey tint colour, tint strength, grey brightness
@@ -387,6 +412,34 @@ const BUILTIN_PACKS: [(&str, f32, f32, [u8; 3], f32, f32); 12] = [
     ("Sunset", -120.0, 1.1, [255, 110, 60], 0.12, 1.0),
     ("Paper", 0.0, 0.8, [255, 240, 210], 0.10, 1.6),
 ];
+
+/// Themes in the colours of popular editor / app themes (their published palettes): the
+/// background greys go from the theme's background to its text colour, the accent becomes the
+/// theme's accent. name, background, text, accent.
+const PALETTE_PACKS: [(&str, u32, u32, u32); 18] = [
+    ("Catppuccin", 0x1E1E2E, 0xCDD6F4, 0xCBA6F7),
+    ("Catppuccin Latte", 0xEFF1F5, 0x4C4F69, 0x8839EF),
+    ("Dracula", 0x282A36, 0xF8F8F2, 0xBD93F9),
+    ("Nord", 0x2E3440, 0xECEFF4, 0x88C0D0),
+    ("Gruvbox", 0x282828, 0xEBDBB2, 0xFABD2F),
+    ("Gruvbox Light", 0xFBF1C7, 0x3C3836, 0xD65D0E),
+    ("Tokyo Night", 0x1A1B26, 0xC0CAF5, 0x7AA2F7),
+    ("Solarized", 0x002B36, 0x93A1A1, 0x268BD2),
+    ("Solarized Light", 0xFDF6E3, 0x586E75, 0x268BD2),
+    ("One Dark", 0x282C34, 0xABB2BF, 0x61AFEF),
+    ("Rose Pine", 0x191724, 0xE0DEF4, 0xEBBCBA),
+    ("Everforest", 0x2D353B, 0xD3C6AA, 0xA7C080),
+    ("Kanagawa", 0x1F1F28, 0xDCD7BA, 0x7E9CD8),
+    ("Monokai", 0x272822, 0xF8F8F2, 0xA6E22E),
+    ("Synthwave 84", 0x262335, 0xF0EFF4, 0xFF7EDB),
+    ("Ayu", 0x1F2430, 0xCBCCC6, 0xFFCC66),
+    ("GitHub Dark", 0x0D1117, 0xC9D1D9, 0x58A6FF),
+    ("Matrix", 0x030A04, 0x8FD9A0, 0x00FF41),
+];
+
+fn rgb(c: u32) -> [f32; 3] {
+    [((c >> 16) & 255) as f32, ((c >> 8) & 255) as f32, (c & 255) as f32]
+}
 
 /// Swatches for the colour editor (style lab).
 pub const SWATCHES: [&str; 16] = [
@@ -429,7 +482,7 @@ fn packs_dir() -> PathBuf {
 }
 
 pub fn pack_names() -> Vec<String> {
-    let mut v: Vec<String> = BUILTIN_PACKS.iter().map(|p| p.0.to_string()).collect();
+    let mut v: Vec<String> = BUILTIN_PACKS.iter().map(|p| p.0.to_string()).chain(PALETTE_PACKS.iter().map(|p| p.0.to_string())).collect();
     if let Ok(rd) = std::fs::read_dir(packs_dir()) {
         let mut extra: Vec<String> = rd.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(|s| s.to_string())).collect();
         extra.sort();
@@ -469,7 +522,7 @@ pub fn pack_colors(name: &str) -> std::collections::BTreeMap<String, String> {
 
 impl Pack {
     pub fn from_cfg(cfg: &crate::config::Config) -> Self {
-        let mut p = Pack { hue: 0.0, sat: 1.0, tint: [0.0; 3], tint_k: 0.0, light: 1.0, map: HashMap::new() };
+        let mut p = Pack { hue: 0.0, sat: 1.0, tint: [0.0; 3], tint_k: 0.0, light: 1.0, map: HashMap::new(), pal: None };
         let name = cfg.color_pack.as_str();
         if let Some(b) = BUILTIN_PACKS.iter().find(|b| b.0 == name || (name == "Amber" && b.0 == "Amber CRT")) {
             p.hue = b.1;
@@ -477,6 +530,8 @@ impl Pack {
             p.tint = [b.3[0] as f32, b.3[1] as f32, b.3[2] as f32];
             p.tint_k = b.4;
             p.light = b.5;
+        } else if let Some(t) = PALETTE_PACKS.iter().find(|t| t.0 == name) {
+            p.pal = Some([rgb(t.1), rgb(t.2), rgb(t.3)]);
         } else if let Some(j) = std::fs::read(packs_dir().join(format!("{}.json", name))).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
             p.hue = j["hue"].as_f64().unwrap_or(0.0) as f32;
             p.sat = j["sat"].as_f64().unwrap_or(1.0) as f32;
@@ -523,9 +578,12 @@ impl Pack {
         p
     }
     pub fn is_identity(&self) -> bool {
-        self.hue.rem_euclid(360.0) == 0.0 && self.sat == 1.0 && self.map.is_empty() && self.tint_k == 0.0 && self.light == 1.0
+        self.pal.is_none() && self.hue.rem_euclid(360.0) == 0.0 && self.sat == 1.0 && self.map.is_empty() && self.tint_k == 0.0 && self.light == 1.0
     }
     pub fn apply(&self, px: [u8; 4]) -> [u8; 4] {
+        if let Some(pal) = &self.pal {
+            return palette(pal, px);
+        }
         let px = match self.map.get(&[px[0], px[1], px[2]]) {
             Some(m) => [m[0], m[1], m[2], px[3]],
             None => px,

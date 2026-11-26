@@ -160,7 +160,7 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
 
         // ---- colour packs (the same ones as SpoX on Windows) ----------------------------------
         // name, hue turn, saturation, grey tint colour, tint strength, grey brightness
-        class Pack(val name: String, val hue: Float, val sat: Float, val tint: Int, val tintK: Float, val light: Float)
+        class Pack(val name: String, val hue: Float, val sat: Float, val tint: Int, val tintK: Float, val light: Float, val pal: IntArray? = null)
 
         val PACKS = listOf(
             Pack("Default", 0f, 1f, 0x000000, 0f, 1f),
@@ -175,6 +175,25 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             Pack("Ocean", 70f, 1f, 0x2878C8, 0.16f, 0.95f),
             Pack("Sunset", -120f, 1.1f, 0xFF6E3C, 0.12f, 1f),
             Pack("Paper", 0f, 0.8f, 0xFFF0D2, 0.10f, 1.6f),
+            // the colours of popular editor / app themes (background, text, accent)
+            Pack("Catppuccin", 0f, 1f, 0, 0f, 1f, intArrayOf(0x1E1E2E, 0xCDD6F4, 0xCBA6F7)),
+            Pack("Catppuccin Latte", 0f, 1f, 0, 0f, 1f, intArrayOf(0xEFF1F5, 0x4C4F69, 0x8839EF)),
+            Pack("Dracula", 0f, 1f, 0, 0f, 1f, intArrayOf(0x282A36, 0xF8F8F2, 0xBD93F9)),
+            Pack("Nord", 0f, 1f, 0, 0f, 1f, intArrayOf(0x2E3440, 0xECEFF4, 0x88C0D0)),
+            Pack("Gruvbox", 0f, 1f, 0, 0f, 1f, intArrayOf(0x282828, 0xEBDBB2, 0xFABD2F)),
+            Pack("Gruvbox Light", 0f, 1f, 0, 0f, 1f, intArrayOf(0xFBF1C7, 0x3C3836, 0xD65D0E)),
+            Pack("Tokyo Night", 0f, 1f, 0, 0f, 1f, intArrayOf(0x1A1B26, 0xC0CAF5, 0x7AA2F7)),
+            Pack("Solarized", 0f, 1f, 0, 0f, 1f, intArrayOf(0x002B36, 0x93A1A1, 0x268BD2)),
+            Pack("Solarized Light", 0f, 1f, 0, 0f, 1f, intArrayOf(0xFDF6E3, 0x586E75, 0x268BD2)),
+            Pack("One Dark", 0f, 1f, 0, 0f, 1f, intArrayOf(0x282C34, 0xABB2BF, 0x61AFEF)),
+            Pack("Rose Pine", 0f, 1f, 0, 0f, 1f, intArrayOf(0x191724, 0xE0DEF4, 0xEBBCBA)),
+            Pack("Everforest", 0f, 1f, 0, 0f, 1f, intArrayOf(0x2D353B, 0xD3C6AA, 0xA7C080)),
+            Pack("Kanagawa", 0f, 1f, 0, 0f, 1f, intArrayOf(0x1F1F28, 0xDCD7BA, 0x7E9CD8)),
+            Pack("Monokai", 0f, 1f, 0, 0f, 1f, intArrayOf(0x272822, 0xF8F8F2, 0xA6E22E)),
+            Pack("Synthwave 84", 0f, 1f, 0, 0f, 1f, intArrayOf(0x262335, 0xF0EFF4, 0xFF7EDB)),
+            Pack("Ayu", 0f, 1f, 0, 0f, 1f, intArrayOf(0x1F2430, 0xCBCCC6, 0xFFCC66)),
+            Pack("GitHub Dark", 0f, 1f, 0, 0f, 1f, intArrayOf(0x0D1117, 0xC9D1D9, 0x58A6FF)),
+            Pack("Matrix", 0f, 1f, 0, 0f, 1f, intArrayOf(0x030A04, 0x8FD9A0, 0x00FF41)),
         )
 
         fun packName(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("pack", "Default") ?: "Default"
@@ -182,6 +201,7 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
         /** Accent (coloured) pixels get their hue turned and saturation scaled; greys keep their
          *  shape and only get the pack's tint / brightness. Same maths as the desktop app. */
         private fun recolor(c: Int, p: Pack): Int {
+            p.pal?.let { return palette(c, it) }
             val a = Color.alpha(c)
             val r = Color.red(c) / 255f; val g = Color.green(c) / 255f; val b = Color.blue(c) / 255f
             val mx = maxOf(r, g, b); val mn = minOf(r, g, b); val d = mx - mn
@@ -203,6 +223,27 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             val (r1, g1, b1) = when ((h / 60f).toInt()) { 0 -> Triple(cc, x, 0f); 1 -> Triple(x, cc, 0f); 2 -> Triple(0f, cc, x); 3 -> Triple(0f, x, cc); 4 -> Triple(x, 0f, cc); else -> Triple(cc, 0f, x) }
             fun q(f: Float) = ((f + m) * 255f).toInt().coerceIn(0, 255)
             return Color.argb(a, q(r1), q(g1), q(b1))
+        }
+
+        /** A theme palette (same maths as the desktop app): greys run from the theme's background
+         *  to its text colour, coloured pixels from the background through the accent to white. */
+        private fun palette(c: Int, pal: IntArray): Int {
+            val r = Color.red(c) / 255f; val g = Color.green(c) / 255f; val b = Color.blue(c) / 255f
+            val mx = maxOf(r, g, b); val d = mx - minOf(r, g, b)
+            val sat = if (mx > 0) d / mx else 0f
+            fun ch(x: Int, s: Int) = ((x shr s) and 255).toFloat()
+            fun lerp(a: FloatArray, z: FloatArray, k: Float) = Color.argb(Color.alpha(c),
+                (a[0] + (z[0] - a[0]) * k).toInt().coerceIn(0, 255), (a[1] + (z[1] - a[1]) * k).toInt().coerceIn(0, 255), (a[2] + (z[2] - a[2]) * k).toInt().coerceIn(0, 255))
+            val bg = floatArrayOf(ch(pal[0], 16), ch(pal[0], 8), ch(pal[0], 0))
+            val fg = floatArrayOf(ch(pal[1], 16), ch(pal[1], 8), ch(pal[1], 0))
+            val acc = floatArrayOf(ch(pal[2], 16), ch(pal[2], 8), ch(pal[2], 0))
+            return if (sat < 0.22f || d < 0.06f) {
+                if (mx < 0.045f) lerp(floatArrayOf(bg[0] * 0.6f, bg[1] * 0.6f, bg[2] * 0.6f), bg, mx / 0.045f)
+                else lerp(bg, fg, minOf(1f, (mx - 0.045f) / (0.78f - 0.045f)))
+            } else {
+                val k = mx / 0.89f
+                if (k <= 1f) lerp(bg, acc, k) else lerp(acc, floatArrayOf(255f, 255f, 255f), (k - 1f) * 2f)
+            }
         }
 
         private fun load(ctx: Context): Skin {

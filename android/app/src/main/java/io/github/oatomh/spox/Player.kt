@@ -62,7 +62,7 @@ object Player {
         val cur = engine?.now?.track?.uri.orEmpty()
         if (cur != lastEngineTrack) {
             lastEngineTrack = cur
-            if (cur.isNotEmpty() && takeSkip(cur)) engine?.command("skip_next")
+            if (cur.isNotEmpty() && engine?.now?.active == true && takeSkip(cur)) engine?.command("skip_next")
         }
         main.post { refresh() }
     }

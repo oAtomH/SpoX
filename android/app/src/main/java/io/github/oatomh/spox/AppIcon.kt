@@ -7,7 +7,8 @@ import android.content.pm.PackageManager
 /** Launcher icon in the colours of the colour pack: one activity-alias per pack, switched when
  *  SpoX goes to the background (switching while it's open can close it on some launchers). */
 object AppIcon {
-    private val SLUGS = listOf("ambercrt", "ice", "rose", "lime", "mono", "gameboy", "vapor", "blood", "ocean", "sunset", "paper")
+    private val SLUGS = listOf("ambercrt", "ice", "rose", "lime", "mono", "gameboy", "vapor", "blood", "ocean", "sunset", "paper",
+        "catppuccin", "catppuccinlatte", "dracula", "nord", "gruvbox", "gruvboxlight", "tokyonight", "solarized", "solarizedlight", "onedark", "rosepine", "everforest", "kanagawa", "monokai", "synthwave84", "ayu", "githubdark", "matrix")
 
     fun follows(ctx: Context) = ctx.getSharedPreferences("spox", 0).getBoolean("icon_follows", false)
 

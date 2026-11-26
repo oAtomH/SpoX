@@ -306,6 +306,7 @@ struct Engine {
     warm_until: Option<Instant>,
     /// spots in the plan still owed a new song: the song it goes after (uri, and its place then)
     owed: Vec<String>,
+    last_disc: Instant,
 }
 
 pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<String>, live: Arc<Mutex<Play>>) -> (Sender<Cmd>, Sender<Value>) {
@@ -365,6 +366,7 @@ pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, solo: Sender<Strin
                 busy: String::new(),
                 warm_until: None,
                 owed: Vec::new(),
+                last_disc: Instant::now() - Duration::from_secs(60),
             };
             e.play = e.live.lock().unwrap().clone();
             e.restore();
@@ -513,7 +515,10 @@ impl Engine {
             self.rearm();
         }
         let hungry = self.plan();
-        if self.ratio() > 0 && (hungry || self.pool.lock().unwrap().len() < 20) {
+        // only while this SpoX plays (not when the phone or another device does), and at most
+        // every 15 s: the Spotify requests are shared with everything else SpoX does
+        if self.ratio() > 0 && self.play.is_active && (hungry || self.pool.lock().unwrap().len() < 20) && self.last_disc.elapsed() > Duration::from_secs(15) {
+            self.last_disc = Instant::now();
             self.discover();
         }
         self.save();
@@ -1022,7 +1027,7 @@ impl Engine {
                 hungry = true;
                 // none found yet: the list carries on (never waits), and the new songs owed here
                 // are slotted in at this spot once found (the share stays even)
-                if let Some(e) = self.deck.last() {
+                if let Some(e) = self.deck.last().filter(|_| self.owed.len() < 40) {
                     for _ in 0..self.need_new.max(1) {
                         self.owed.push(e.t.uri.clone());
                     }

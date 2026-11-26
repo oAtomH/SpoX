@@ -151,9 +151,11 @@ class EngineService : Service() {
                     .setOnAudioFocusChangeListener { c ->
                         when (c) {
                             // another app plays music / a video: stop for good
-                            AudioManager.AUDIOFOCUS_LOSS -> { pausedForCall = false; engine.command("pause") }
+                            // only when the phone itself plays: a pause sent while another device
+                            // (SpoX on the PC) plays would pause that one
+                            AudioManager.AUDIOFOCUS_LOSS -> { pausedForCall = false; if (engine.now.active) engine.command("pause") }
                             // a call, a voice note, navigation...: pause, and carry on after
-                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> { if (engine.now.playing) { pausedForCall = true; engine.command("pause") } }
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> { if (engine.now.playing && engine.now.active) { pausedForCall = true; engine.command("pause") } }
                             AudioManager.AUDIOFOCUS_GAIN -> { if (pausedForCall) { pausedForCall = false; if (getSharedPreferences("spox", 0).getBoolean("resume_after_call", true)) engine.command("play") } }
                         }
                     }
@@ -181,7 +183,7 @@ class EngineService : Service() {
     private var noisyOn = false
     private val noisy = object : android.content.BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            if (i.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY && c.getSharedPreferences("spox", 0).getBoolean("pause_noisy", true)) {
+            if (i.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY && engine.now.active && c.getSharedPreferences("spox", 0).getBoolean("pause_noisy", true)) {
                 pausedForCall = false
                 engine.hush()
                 io.github.oatomh.spox.PlayerView.say(c, "Paused: headphones disconnected")

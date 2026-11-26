@@ -654,8 +654,13 @@ impl App {
                 if !name.is_empty() || self.profile_name.is_empty() {
                     self.profile_name = name;
                 }
-                self.pfp = img.map(|i| self.ctx.load_texture("pfp", i, egui::TextureOptions::NEAREST));
-                self.pfp_small = small.map(|i| self.ctx.load_texture("pfp8", i, egui::TextureOptions::NEAREST));
+                // a failed look-up (Spotify busy) keeps the picture you had
+                if let Some(i) = img {
+                    self.pfp = Some(self.ctx.load_texture("pfp", i, egui::TextureOptions::NEAREST));
+                }
+                if let Some(i) = small {
+                    self.pfp_small = Some(self.ctx.load_texture("pfp8", i, egui::TextureOptions::NEAREST));
+                }
             }
             Ev::Liked { uri, liked } => {
                 if let Some(t) = &self.tb {
@@ -2396,8 +2401,19 @@ impl App {
                     "tab_playlist",
                 ),
                 Tab::Queue => {
-                    let ms: u64 = self.play.upcoming.iter().map(|t| t.duration_ms).sum();
-                    let l = if self.play.upcoming.is_empty() { "Up next".to_string() } else { format!("Up next  \u{b7}  {} songs  \u{b7}  {}m", self.play.upcoming.len(), ms / 60_000) };
+                    // SpoX's own Up next while it plays a list, else Spotify's queue
+                    let list: Vec<&Track> = if self.smart_on { self.smart_upcoming.iter().map(|x| &x.0).collect() } else { self.play.upcoming.iter().collect() };
+                    let ms: u64 = list.iter().map(|t| t.duration_ms).sum();
+                    let newn = if self.smart_on { list.iter().filter(|t| self.smart_new.contains(&t.uri)).count() } else { 0 };
+                    let l = if list.is_empty() {
+                        "Up next".to_string()
+                    } else if newn > 0 {
+                        format!("Up next  \u{b7}  {} songs  \u{b7}  {} new", list.len(), newn)
+                    } else if ms > 0 {
+                        format!("Up next  \u{b7}  {} songs  \u{b7}  {}m", list.len(), ms / 60_000)
+                    } else {
+                        format!("Up next  \u{b7}  {} songs", list.len())
+                    };
                     ("tab_queue", l, "tab_queue")
                 }
                 Tab::Lyrics => (

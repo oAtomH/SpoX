@@ -532,7 +532,7 @@ object Smart {
                 hungry = true
                 // none found yet: the list carries on (never waits), and the new songs owed here
                 // are slotted in at this spot as soon as they're found (the share stays even)
-                deck.lastOrNull()?.let { e -> repeat(maxOf(needNew, 1)) { owed += e } }
+                deck.lastOrNull()?.takeIf { owed.size < 40 }?.let { e -> repeat(maxOf(needNew, 1)) { owed += e } }
                 needNew = 0
                 if (r >= 100 && bag.isEmpty() && seeds.isEmpty()) break
             }
@@ -632,8 +632,13 @@ object Smart {
     @Volatile private var warmUntil = 0L
 
     /** One worker looks for new songs (Spotify requests go through its slow background lane). */
+    private var lastDisc = 0L
+
     private fun discover() {
+        // only while this SpoX plays (not the PC or another device), at most every 15 s
+        if (!engine.now.active || System.currentTimeMillis() - lastDisc < 15_000) return
         if (!finding.compareAndSet(0, 1)) return
+        lastDisc = System.currentTimeMillis()
         thread(name = "spox-discover") {
             try { discoverNow(null) } finally { finding.set(0) }
             if (on && pool.isNotEmpty()) runCatching {
@@ -641,7 +646,7 @@ object Smart {
                 if (pool.size >= 6) warmUntil = 0
                 plan()
                 // still owed: look again right away (the slow lane keeps Spotify happy)
-                if (synchronized(lock) { owed.isNotEmpty() }) main.postDelayed({ discover() }, 2000)
+                if (synchronized(lock) { owed.isNotEmpty() }) main.postDelayed({ discover() }, 15_000)
                 if (wasWarm && warmUntil == 0L) rearm()
                 save(); changed()
             }
@@ -658,14 +663,43 @@ object Smart {
         if (artist.isEmpty()) return
         val found = ArrayList<Web.Item>()
         for (a in similarArtists(artist).take(5).ifEmpty { listOf(artist) }) {
-            val r = Web.getBg("/search?type=track&limit=10&q=" + enc("artist:\"$a\""))?.optJSONObject("tracks")?.optJSONArray("items") ?: continue
-            val songs = (0 until r.length()).mapNotNull { Web.track(r.optJSONObject(it)) }
+            val songs = artistSongs(a)
                 .filter { it.sub.split(", ").first().equals(a, true) && !known(it.title, it.sub) && pool.none { p -> p.uri == it.uri } && it.uri !in newUris }
                 .shuffled().take(3)
             pool.addAll(songs)
             found += songs
         }
         if (found.isNotEmpty()) saveFound(found)
+    }
+
+    /** Songs by an artist. Each artist is asked once every two weeks (kept on the phone), and at
+     *  most 8 searches go out per 10 minutes: new songs never eat the request budget SpoX (phone
+     *  and PC share one Spotify app) needs for playing, likes and lists. */
+    private val searches = ArrayList<Long>()
+    private val artistFile get() = File(app.filesDir, "artists.json")
+    private val artistCache: JSONObject by lazy { runCatching { JSONObject(artistFile.readText()) }.getOrDefault(JSONObject()) }
+
+    private fun artistSongs(a: String): List<Web.Item> {
+        val k = a.lowercase()
+        val now = System.currentTimeMillis()
+        synchronized(artistCache) {
+            artistCache.optJSONArray(k)?.let { e ->
+                if (now - e.optLong(0) < 14 * 86_400_000L) return items(e.optJSONArray(1))
+            }
+        }
+        synchronized(searches) {
+            searches.removeAll { now - it > 600_000 }
+            if (searches.size >= 8) return emptyList()
+            searches += now
+        }
+        val r = Web.getBg("/search?type=track&limit=10&q=" + enc("artist:\"$a\""))?.optJSONObject("tracks")?.optJSONArray("items") ?: return emptyList()
+        val songs = (0 until r.length()).mapNotNull { Web.track(r.optJSONObject(it)) }
+        synchronized(artistCache) {
+            artistCache.put(k, JSONArray().put(now).put(arr(songs)))
+            val snap = artistCache.toString()
+            saver.execute { runCatching { artistFile.writeText(snap) } }
+        }
+        return songs
     }
 
     // new songs found for each list, kept on the phone: starting that list again is instant

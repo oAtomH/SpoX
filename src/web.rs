@@ -73,19 +73,38 @@ impl Api {
     }
 
     /// Songs by an artist (for smart shuffle without a Last.fm key), shuffled a bit by the search offset.
+    /// Songs by an artist, for new songs. Each artist is asked once every two weeks (kept on
+    /// disk), and at most 8 searches go out per 10 minutes: discovery never eats the request
+    /// budget SpoX (on PC and phone, same Spotify app) needs for playing, likes and lists.
     pub fn search_artist(&self, artist: &str) -> Vec<Track> {
         if artist.is_empty() {
             return Vec::new();
         }
-        let q = format!("artist:\"{}\"", artist);
-        let off = (crate::config::now_ms() as u64 / 1000) % 3 * 10;
-        let Some(v) = self.get_bg(&format!("/search?type=track&limit=10&offset={}&q={}", off, enc(&q))) else { return Vec::new() };
-        let mut out: Vec<Track> = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
-        if out.is_empty() && off > 0 {
-            if let Some(v) = self.get_bg(&format!("/search?type=track&limit=10&q={}", enc(&q))) {
-                out = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
+        let k = artist.to_lowercase();
+        let now = crate::config::now_ms();
+        if let Some((at, ts)) = artist_cache().lock().unwrap().get(&k) {
+            if now - at < 14 * 86_400_000 {
+                return ts.clone();
             }
         }
+        {
+            let mut b = SEARCHES.lock().unwrap();
+            b.retain(|t| now - t < 600_000);
+            if b.len() >= 8 {
+                return Vec::new();
+            }
+            b.push(now);
+        }
+        let q = format!("artist:\"{}\"", artist);
+        let Some(v) = self.get_bg(&format!("/search?type=track&limit=10&q={}", enc(&q))) else { return Vec::new() };
+        let out: Vec<Track> = v.pointer("/tracks/items").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(Self::parse_track).collect()).unwrap_or_default();
+        let mut c = artist_cache().lock().unwrap();
+        c.insert(k, (now, out.clone()));
+        let v: serde_json::Map<String, Value> = c
+            .iter()
+            .map(|(a, (t, ts))| (a.clone(), json!([t, ts.iter().map(|x| json!([x.uri, x.name, x.artists])).collect::<Vec<_>>()])))
+            .collect();
+        let _ = std::fs::write(crate::config::config_dir().join("artists.json"), Value::Object(v).to_string());
         out
     }
 
@@ -336,8 +355,10 @@ impl Api {
                         })
                     })
                     .unwrap_or_default();
-                if !name.is_empty() {
-                    let _ = self.ev.send(Ev::Profile { name, img: None, small: None });
+                // the picture from last time
+                let (img, small) = pfp_images(std::fs::read(crate::config::cache_dir().join("pfp.img")).ok());
+                if !name.is_empty() || img.is_some() {
+                    let _ = self.ev.send(Ev::Profile { name, img, small });
                     self.ctx.request_repaint();
                 }
                 return;
@@ -350,22 +371,18 @@ impl Api {
             .and_then(|x| x.as_array())
             .and_then(|a| a.iter().filter_map(|i| Some((i.get("width").and_then(|w| w.as_u64()).unwrap_or(9999), i.get("url")?.as_str()?.to_string()))).min_by_key(|x| x.0))
             .map(|x| x.1);
-        let img = url.and_then(|u| {
-            let r = net::agent().get(&u).call().ok()?;
-            let mut b = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(r.into_reader(), 4 << 20), &mut b).ok()?;
-            let im = image::load_from_memory(&b).ok()?.to_rgba8();
-            // 12x12 for the menu header, 8x8 for the menu button
-            let make = |n: u32| {
-                let px = crate::art::pixelate(&im, n, 8);
-                egui::ColorImage::from_rgba_unmultiplied([n as usize, n as usize], &px)
-            };
-            Some((make(12), make(8)))
-        });
-        let (img, small) = match img {
-            Some((a, b)) => (Some(a), Some(b)),
-            None => (None, None),
-        };
+        // the picture is kept on disk: it shows at once next time, even if Spotify is busy
+        let pfp_file = crate::config::cache_dir().join("pfp.img");
+        let bytes = url
+            .and_then(|u| {
+                let r = net::agent().get(&u).call().ok()?;
+                let mut b = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::Read::take(r.into_reader(), 4 << 20), &mut b).ok()?;
+                let _ = std::fs::write(&pfp_file, &b);
+                Some(b)
+            })
+            .or_else(|| std::fs::read(&pfp_file).ok());
+        let (img, small) = pfp_images(bytes);
         let _ = self.ev.send(Ev::Profile { name, img, small });
         self.ctx.request_repaint();
     }
@@ -682,6 +699,46 @@ fn load_cached_playlists() -> Option<Vec<Playlist>> {
 }
 
 /// Small log for Spotify errors (cache\\web.log), to see why something didn't load.
+static SEARCHES: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+/// Artist -> (when asked, their songs), loaded from artists.json once.
+fn artist_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<Track>)>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<Track>)>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        if let Some(Value::Object(o)) = std::fs::read(crate::config::config_dir().join("artists.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            for (a, e) in o {
+                let at = e[0].as_i64().unwrap_or(0);
+                let ts = e[1]
+                    .as_array()
+                    .map(|l| {
+                        l.iter()
+                            .map(|x| Track {
+                                uri: x[0].as_str().unwrap_or("").into(),
+                                name: x[1].as_str().unwrap_or("").into(),
+                                artists: x[2].as_str().unwrap_or("").into(),
+                                ..Default::default()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                m.insert(a, (at, ts));
+            }
+        }
+        std::sync::Mutex::new(m)
+    })
+}
+
+/// The profile picture as 12x12 (menu header) and 8x8 (menu button) pixel art.
+fn pfp_images(bytes: Option<Vec<u8>>) -> (Option<egui::ColorImage>, Option<egui::ColorImage>) {
+    let Some(im) = bytes.and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_rgba8()) else { return (None, None) };
+    let make = |n: u32| {
+        let px = crate::art::pixelate(&im, n, 8);
+        egui::ColorImage::from_rgba_unmultiplied([n as usize, n as usize], &px)
+    };
+    (Some(make(12)), Some(make(8)))
+}
+
 pub fn web_log(line: &str) {
     use std::io::Write as _;
     let p = crate::config::cache_dir().join("web.log");
