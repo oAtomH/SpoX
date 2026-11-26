@@ -799,9 +799,18 @@ fn cooling() -> bool {
 }
 
 fn limited(r: &ureq::Response) {
-    let wait: i64 = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(5).clamp(2, 600);
+    // Spotify's own number: a few seconds normally, hours when the app (its Client ID, shared by
+    // every SpoX that uses it) went over its limit. Background work honours it in full; things
+    // you press still try after at most 30 s
+    let raw: i64 = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let wait = raw.clamp(2, 6 * 3600);
     COOL_UNTIL.fetch_max(now_ms() + wait * 1000, Ordering::SeqCst);
-    web_log(&format!("Spotify asked to slow down: waiting {}s", wait));
+    web_log(&format!("Spotify asked to slow down: Retry-After {}s", raw));
+}
+
+/// Seconds Spotify still wants SpoX to wait (0 = fine), for Settings.
+pub fn limit_left() -> i64 {
+    ((COOL_UNTIL.load(Ordering::SeqCst) - now_ms()) / 1000).max(0)
 }
 
 /// Waits out a cool-down (at most `max_s` seconds) before something you pressed.

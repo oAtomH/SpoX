@@ -104,6 +104,9 @@ pub struct App {
     add_scroll: usize,
     profile_name: String,
     pfp: Option<egui::TextureHandle>,
+    /// liked or not, for songs SpoX has seen (answers, your toggles, your Liked Songs list): the
+    /// heart is right at once, even when Spotify is slow to answer or makes SpoX wait
+    liked_known: std::collections::HashMap<String, bool>,
     pfp_small: Option<egui::TextureHandle>,
     refresh_at: Option<Instant>,
     seek_hover: Option<f64>,
@@ -323,6 +326,7 @@ impl App {
             add_scroll: 0,
             profile_name: saved_name,
             pfp: None,
+            liked_known: Default::default(),
             pfp_small: None,
             refresh_at: None,
             seek_hover: None,
@@ -668,6 +672,7 @@ impl App {
                 if let Some(t) = &self.tb {
                     *t.liked.lock().unwrap() = (uri.clone(), liked);
                 }
+                self.liked_known.insert(uri.clone(), liked);
                 if self.play.track.as_ref().map(|t| t.uri == uri).unwrap_or(false) {
                     self.liked = Some(liked);
                     self.liked_uri = uri;
@@ -735,7 +740,13 @@ impl App {
         self.request_art();
         if let Some(t) = &self.play.track {
             if t.uri != self.liked_uri {
-                self.liked = None;
+                if self.liked_known.is_empty() {
+                    // your Liked Songs as last loaded
+                    if let Some(ts) = load_tracks_cache(&self.liked_uri()) {
+                        self.liked_known.extend(ts.into_iter().map(|t| (t.uri, true)));
+                    }
+                }
+                self.liked = self.liked_known.get(&t.uri).copied();
                 self.liked_uri = t.uri.clone();
                 if self.signed_in && t.uri.starts_with("spotify:track:") {
                     let _ = self.web.send(Req::CheckLiked(t.uri.clone()));
@@ -1157,6 +1168,7 @@ impl App {
         }
         let on = !self.liked.unwrap_or(false);
         self.liked = Some(on);
+        self.liked_known.insert(t.uri.clone(), on);
         let _ = self.web.send(Req::SetLiked(t.uri, on));
     }
 
@@ -3130,6 +3142,21 @@ impl App {
     fn settings_rows(&self) -> Vec<(String, String, u16)> {
         let c = self.cfg.lock().unwrap().clone();
         let mut out = Vec::new();
+        // Spotify keeps one request budget per Client ID (shared by every SpoX that uses it): when
+        // it says wait, likes, the profile, new songs and lists can't load until it's over
+        {
+            let left = crate::web::limit_left();
+            let v = if left == 0 {
+                "ok".to_string()
+            } else if left < 120 {
+                format!("waiting {}s", left)
+            } else if left < 7200 {
+                format!("waiting {}m", left / 60)
+            } else {
+                format!("waiting {}h {}m", left / 3600, left % 3600 / 60)
+            };
+            out.push(("Spotify requests".into(), v, 98));
+        }
         for r in self.settings_rows_base() {
             if r.0 == "@lab" {
                 if c.dev_mode {

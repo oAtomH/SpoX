@@ -647,14 +647,32 @@ mod win {
             if MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != mon {
                 return false;
             }
+            let cls = class_of(fg);
+            // the desktop, the taskbar and Windows' own pop-ups (Start, search, Alt-Tab, the tray
+            // overflow, notification / quick settings panels) are never "a fullscreen app", even
+            // though some of them are invisible windows as big as the screen: treating them so made
+            // the player jump away whenever the Win key was pressed
+            if matches!(
+                cls.as_str(),
+                "Progman"
+                    | "WorkerW"
+                    | "Shell_TrayWnd"
+                    | "Shell_SecondaryTrayWnd"
+                    | "Windows.UI.Core.CoreWindow"
+                    | "XamlExplorerHostIslandWindow"
+                    | "TopLevelWindowForOverflowXamlIsland"
+                    | "MultitaskingViewFrame"
+                    | "ForegroundStaging"
+                    | "Shell_InputSwitchTopLevelWindow"
+                    | "NotifyIconOverflowWindow"
+                    | "ControlCenterWindow"
+            ) {
+                return false;
+            }
             let mut state = 0;
             if SHQueryUserNotificationState(&mut state) == 0 && (state == 3 || state == 4) {
                 // QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE
                 return true;
-            }
-            let cls = class_of(fg);
-            if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-                return false;
             }
             let Some(r) = rect(fg) else { return false };
             let Some(m) = monitor_rect(mon) else { return false };

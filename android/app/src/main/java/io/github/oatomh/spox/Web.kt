@@ -139,8 +139,13 @@ object Web {
 
     private fun cooling() = System.currentTimeMillis() < coolUntil
 
+    /** Seconds Spotify still wants SpoX to wait (0 = fine), for Settings. */
+    fun limitLeft(): Long = maxOf(0L, (coolUntil - System.currentTimeMillis()) / 1000)
+
     private fun limited(c: HttpURLConnection) {
-        val wait = c.getHeaderField("Retry-After")?.toLongOrNull()?.coerceIn(2, 600) ?: 5
+        // Spotify's own number: seconds normally, hours when the Client ID (shared by every SpoX
+        // that uses it) went over its limit; background work honours it in full
+        val wait = c.getHeaderField("Retry-After")?.toLongOrNull()?.coerceIn(2, 6 * 3600) ?: 5
         coolUntil = maxOf(coolUntil, System.currentTimeMillis() + wait * 1000)
         lastLimit = "Spotify asked to wait ${wait}s at " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())
     }
