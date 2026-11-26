@@ -227,7 +227,7 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
 
         /** A theme palette (same maths as the desktop app): greys run from the theme's background
          *  to its text colour, coloured pixels from the background through the accent to white. */
-        private fun palette(c: Int, pal: IntArray): Int {
+        private fun palette(c: Int, pal: IntArray, down: Boolean = false): Int {
             val r = Color.red(c) / 255f; val g = Color.green(c) / 255f; val b = Color.blue(c) / 255f
             val mx = maxOf(r, g, b); val d = mx - minOf(r, g, b)
             val sat = if (mx > 0) d / mx else 0f
@@ -240,10 +240,11 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             // light themes: keep the button bevels the right way round (highlight lighter than the
             // button, shadow darker) instead of turned inside out
             val light = bg.sum() > fg.sum()
-            when (c and 0xFFFFFF) {
-                0x585B63 -> if (light) return lerp(bg, floatArrayOf(255f, 255f, 255f), 0.75f)
-                0x1F2123 -> if (light) return lerp(bg, fg, 0.30f)
-                0x34363B -> if (light) return lerp(bg, fg, 0.10f)
+            // pressed art (its face is the shadow grey): darker face, shadow top-left, light bottom-right
+            if (light) when (c and 0xFFFFFF) {
+                0x585B63 -> return lerp(bg, floatArrayOf(255f, 255f, 255f), 0.75f)
+                0x1F2123 -> return lerp(bg, fg, if (down) 0.14f else 0.25f)
+                0x34363B -> return lerp(bg, fg, if (down) 0.30f else 0.06f)
             }
             return if (sat < 0.22f || d < 0.06f) {
                 if (mx < 0.045f) lerp(floatArrayOf(bg[0] * 0.6f, bg[1] * 0.6f, bg[2] * 0.6f), bg, mx / 0.045f)
@@ -268,7 +269,12 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
                     if (pack != null) {
                         val px = IntArray(b.width * b.height)
                         b.getPixels(px, 0, b.width, 0, 0, b.width, b.height)
-                        for (i in px.indices) if (Color.alpha(px[i]) != 0) px[i] = rc(px[i])
+                        val pal = pack.pal
+                        if (pal != null) {
+                            // pressed-looking art (its face is the shadow grey) is coloured as pressed
+                            val down = px.count { it and 0xFFFFFF == 0x1F2123 } > maxOf(8, px.count { it and 0xFFFFFF == 0x34363B })
+                            for (i in px.indices) if (Color.alpha(px[i]) != 0) px[i] = palette(px[i], pal, down)
+                        } else for (i in px.indices) if (Color.alpha(px[i]) != 0) px[i] = rc(px[i])
                         b.setPixels(px, 0, b.width, 0, 0, b.width, b.height)
                     }
                     map[f.removeSuffix(".png")] = b

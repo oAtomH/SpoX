@@ -359,7 +359,7 @@ impl Font {
 /// Recolours a pixel into a theme palette (same maths as the phone): greys run from the theme's
 /// background (darkest greys of the skin) to its text colour (lightest), coloured pixels run from
 /// the background through the accent (the skin's accent green) to white.
-fn palette(pal: &[[f32; 3]; 3], px: [u8; 4]) -> [u8; 4] {
+fn palette(pal: &[[f32; 3]; 3], px: [u8; 4], down: bool) -> [u8; 4] {
     let (r, g, b) = (px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
     let mx = r.max(g).max(b);
     let d = mx - r.min(g).min(b);
@@ -372,10 +372,15 @@ fn palette(pal: &[[f32; 3]; 3], px: [u8; 4]) -> [u8; 4] {
     // than the button, shadow darker
     let key = [px[0], px[1], px[2]];
     if light && (key == [88, 91, 99] || key == [31, 33, 35] || key == [52, 54, 59]) {
-        let o = match key {
-            [88, 91, 99] => lerp(bg, [255.0; 3], 0.75),
-            [31, 33, 35] => lerp(bg, fg, 0.30),
-            _ => lerp(bg, fg, 0.10),
+        // raised: light top-left edge, button a touch darker than the page, dark bottom-right.
+        // pressed (the button art uses the shadow grey as its face): a darker face, shadow along
+        // the top-left, light along the bottom-right, the way a pressed-in key looks on paper
+        let o = match (key, down) {
+            ([88, 91, 99], _) => lerp(bg, [255.0; 3], 0.75),
+            ([31, 33, 35], false) => lerp(bg, fg, 0.25),
+            ([31, 33, 35], true) => lerp(bg, fg, 0.14),
+            (_, false) => lerp(bg, fg, 0.06),
+            (_, true) => lerp(bg, fg, 0.30),
         };
         return [o[0], o[1], o[2], px[3]];
     }
@@ -595,7 +600,7 @@ impl Pack {
     }
     pub fn apply(&self, px: [u8; 4]) -> [u8; 4] {
         if let Some(pal) = &self.pal {
-            return palette(pal, px);
+            return palette(pal, px, false);
         }
         let px = match self.map.get(&[px[0], px[1], px[2]]) {
             Some(m) => [m[0], m[1], m[2], px[3]],
@@ -637,6 +642,15 @@ impl Pack {
     }
     pub fn recolor(&self, img: &mut image::RgbaImage) {
         if self.is_identity() {
+            return;
+        }
+        if let Some(pal) = &self.pal {
+            // pressed-looking art (its face is the shadow grey) is coloured as pressed
+            let n = |c: [u8; 3]| img.pixels().filter(|p| p.0[..3] == c).count();
+            let down = n([31, 33, 35]) > n([52, 54, 59]).max(8);
+            for p in img.pixels_mut() {
+                p.0 = palette(pal, self.map.get(&[p.0[0], p.0[1], p.0[2]]).map(|m| [m[0], m[1], m[2], p.0[3]]).unwrap_or(p.0), down);
+            }
             return;
         }
         for p in img.pixels_mut() {

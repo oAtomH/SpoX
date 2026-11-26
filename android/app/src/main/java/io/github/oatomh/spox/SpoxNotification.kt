@@ -129,10 +129,10 @@ object SpoxNotification {
 
     /** Pixel-art cover on the lock screen / phone's player (Settings > Pixel cover). */
     /** What the lock screen / phone's player shows as the picture: "cover", "pixel" or "card". */
-    fun lockArt(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("lock_art", "pixel") ?: "pixel"
+    fun lockArt(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("lock_art", "framed") ?: "framed"
 
     fun cycleLockArt(ctx: Context) {
-        val next = when (lockArt(ctx)) { "pixel" -> "card"; "card" -> "cover"; else -> "pixel" }
+        val next = when (lockArt(ctx)) { "framed" -> "pixel"; "pixel" -> "card"; "card" -> "cover"; else -> "framed" }
         ctx.getSharedPreferences("spox", 0).edit().putString("lock_art", next).apply()
         artFor = null; lastKey = ""
         update(ctx)
@@ -142,10 +142,10 @@ object SpoxNotification {
     private fun pixelArt(src: Bitmap?, ctx: Context): Bitmap? {
         val mode = lockArt(ctx)
         if (mode == "cover") return src
-        val key = if (mode == "card") "${Skin.packName(ctx)}|${Player.state.title}|${Player.state.artist}" else ""
+        val key = when (mode) { "card" -> "${Skin.packName(ctx)}|${Player.state.title}|${Player.state.artist}"; "framed" -> Skin.packName(ctx); else -> "" }
         if (src != null && src === artFor && key == artTitle) return artDone
         artTitle = key
-        return (if (mode == "card") card(src, ctx) else pixelArtNew(src, ctx)).also { artFor = src; artDone = it }
+        return (when (mode) { "card" -> card(src, ctx); "framed" -> framed(src, ctx); else -> pixelArtNew(src, ctx) }).also { artFor = src; artDone = it }
     }
 
     /** "SpoX card": the picture Android puts behind the player is drawn by SpoX: the skin's
@@ -168,6 +168,35 @@ object SpoxNotification {
         val artist = skin.fit(st.artist, (size - 4) * 2)
         skin.text(cv, title, (size * 2 - skin.textWidth(title)) / 2f, 104f, half, skin.color("title"))
         skin.text(cv, artist, (size * 2 - skin.textWidth(artist)) / 2f, 114f, half, skin.color("info"))
+        return out
+    }
+
+    /** "Framed": the pixel cover in a thin frame of your theme (its background, a 1-pixel line
+     *  in the list colour, the button bevel around it). Android takes the player's colours from
+     *  this picture, so the player follows your theme too. No text, no logo. */
+    private fun framed(src: Bitmap?, ctx: Context): Bitmap? {
+        val skin = Skin.get(ctx)
+        val n = skin.json.optInt("art_pixels", 24)
+        val art = src?.let { Bitmap.createScaledBitmap(it, n, n, true) } ?: skin.sprite("art_empty") ?: return null
+        val k = 8
+        val m = 3 // frame width in pixels
+        val size = n + 2 * m
+        val out = Bitmap.createBitmap(size * k, size * k, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(out)
+        val bg = skin.color("anim_bg", android.graphics.Color.rgb(10, 10, 11))
+        cv.drawColor(bg)
+        val p = Paint()
+        fun box(x: Int, y: Int, w: Int, h: Int, c: Int) { p.color = c; cv.drawRect((x * k).toFloat(), (y * k).toFloat(), ((x + w) * k).toFloat(), ((y + h) * k).toFloat(), p) }
+        // bevel: light top-left, dark bottom-right, one pixel outside the picture
+        fun mix(a: Int, b: Int, t: Float) = android.graphics.Color.rgb(
+            (android.graphics.Color.red(a) + (android.graphics.Color.red(b) - android.graphics.Color.red(a)) * t).toInt(),
+            (android.graphics.Color.green(a) + (android.graphics.Color.green(b) - android.graphics.Color.green(a)) * t).toInt(),
+            (android.graphics.Color.blue(a) + (android.graphics.Color.blue(b) - android.graphics.Color.blue(a)) * t).toInt())
+        val hi = mix(bg, android.graphics.Color.WHITE, 0.30f)
+        val lo = mix(bg, android.graphics.Color.BLACK, 0.45f)
+        box(m - 1, m - 1, n + 2, 1, hi); box(m - 1, m - 1, 1, n + 2, hi)
+        box(m - 1, m + n, n + 2, 1, lo); box(m + n, m - 1, 1, n + 2, lo)
+        cv.drawBitmap(art, null, android.graphics.Rect(m * k, m * k, (m + n) * k, (m + n) * k), Paint().apply { isFilterBitmap = false })
         return out
     }
 
