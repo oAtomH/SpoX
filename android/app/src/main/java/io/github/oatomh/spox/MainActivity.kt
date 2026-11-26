@@ -61,7 +61,7 @@ class MainActivity : Activity() {
                 "Lock screen buttons" to if (SpoxNotification.lockButtons(this) == "like") "heart and + / -" else "shuffle and repeat",
                 "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "pixel" -> "pixel cover"; else -> "framed pixel cover" },
                 "Mini player: heart and + / -" to if (prefs.getBoolean("mini_extras", false)) "on" else "off",
-                "App icon follows colour pack" to if (AppIcon.follows(this)) "on (when you leave SpoX)" else "off",
+                "App icon follows colour pack" to if (AppIcon.follows(this)) "on (switches while paused)" else "off",
                 "Keep screen on" to when (prefs.getString("keep_on", "off")) { "player" -> "while playing"; "always" -> "while SpoX is open"; else -> "off" },
                 "Visualizer" to if (prefs.getString("vis_style", "mirror") == "mirror") "mirror" else "bars",
                 "Smoothness" to when (prefs.getInt("fps", 30)) { 15 -> "battery (15 fps)"; 60 -> "smooth (60 fps)"; else -> "normal (30 fps)" },
@@ -134,12 +134,12 @@ class MainActivity : Activity() {
                         .setPrimaryClip(android.content.ClipData.newPlainText("SpoX Engine report", eng.reportText()))
                     view.say("Engine report copied")
                 }
-                "Colour pack" -> {
-                    val names = Skin.PACKS.map { it.name }
-                    val next = names[(names.indexOf(Skin.packName(this)) + 1) % names.size]
-                    prefs.edit().putString("pack", next).apply()
+                "Colour pack" -> view.packSheet { name ->
+                    prefs.edit().putString("pack", name).apply()
                     Skin.reload()
                     PlayerWidget.updateAll(this)
+                    SpoxNotification.refresh(this)
+                    view.invalidate()
                 }
                 "Lock screen art" -> SpoxNotification.cycleLockArt(this)
                 "Account" -> if (Web.signedIn) {
@@ -360,7 +360,14 @@ class MainActivity : Activity() {
     // notification shade or control panel just covers it; switching can restart the app
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
+        AppIcon.visible = false
+        AppIcon.watch(this)
         AppIcon.apply(this)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        AppIcon.visible = false
     }
 
     /** Keep screen on: off / while music plays / while SpoX is open. Checked every few seconds. */
@@ -377,6 +384,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        AppIcon.visible = true
         view.removeCallbacks(keepTick)
         view.post(keepTick)
         // opened again after being swiped away: don't quit when the music pauses

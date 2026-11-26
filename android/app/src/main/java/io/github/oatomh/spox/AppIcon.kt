@@ -10,6 +10,18 @@ object AppIcon {
     private val SLUGS = listOf("ambercrt", "ice", "rose", "lime", "mono", "gameboy", "vapor", "blood", "ocean", "sunset", "paper",
         "catppuccin", "catppuccinlatte", "dracula", "nord", "gruvbox", "gruvboxlight", "tokyonight", "solarized", "solarizedlight", "onedark", "rosepine", "everforest", "kanagawa", "monokai", "synthwave84", "ayu", "githubdark", "matrix")
 
+    @Volatile var visible = false
+    @Volatile private var pending = false
+    private var watching = false
+
+    /** Tries again when the music stops while SpoX is in the background. */
+    fun watch(ctx: Context) {
+        if (watching) return
+        watching = true
+        val app = ctx.applicationContext
+        Player.listen { if (pending && !Player.state.playing && !visible) apply(app) }
+    }
+
     fun follows(ctx: Context) = ctx.getSharedPreferences("spox", 0).getBoolean("icon_follows", false)
 
     fun setFollows(ctx: Context, on: Boolean) = ctx.getSharedPreferences("spox", 0).edit().putBoolean("icon_follows", on).apply()
@@ -24,6 +36,10 @@ object AppIcon {
         val prefs = ctx.getSharedPreferences("spox", 0)
         val tag = want ?: "default"
         if (prefs.getString("icon_applied", "default") == tag) return
+        // Samsung restarts an app whose icon changes, which would stop the music: wait until
+        // nothing plays and SpoX isn't on screen (see watch())
+        if (Player.state.playing || visible) { pending = true; return }
+        pending = false
         prefs.edit().putString("icon_applied", tag).apply()
         val names = listOf("IconDefault" to (want == null)) + SLUGS.map { "Icon_$it" to (it == want) }
         for ((n, on) in names.sortedBy { !it.second }) {

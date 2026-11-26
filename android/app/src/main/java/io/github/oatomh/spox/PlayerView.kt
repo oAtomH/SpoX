@@ -563,10 +563,26 @@ class PlayerView(ctx: Context) : View(ctx) {
     private var visAt = 0L
     private var visColors: IntArray? = null
     private var visFor: Skin? = null
+    /** Bar colour at [frac] (0 = top of the bar area, 1 = bottom): the theme's visualizer colours
+     *  in a few hard pixel-art steps (no smooth blend), richer and turning in hue towards the top,
+     *  like a vaporwave sunset. Worked out once per theme. */
     private fun visCol(frac: Float): Int {
         val b = skin.sprite("vis_colors") ?: return cTitle
         if (visFor !== skin) { visFor = skin; visColors = null }
-        val c = visColors ?: IntArray(b.height) { b.getPixel(0, it) }.also { visColors = it }
+        val c = visColors ?: run {
+            val raw = IntArray(b.height) { b.getPixel(0, it) }
+            val steps = 6
+            IntArray(steps) { i ->
+                val f = (i + 0.5f) / steps // 0 top .. 1 bottom
+                val base = raw[min(raw.size - 1, (f * raw.size).toInt())]
+                val hsv = FloatArray(3)
+                Color.colorToHSV(base, hsv)
+                hsv[0] = (hsv[0] - 50f * (1f - f) + 360f) % 360f // tops turn (pink / violet side)
+                hsv[1] = min(1f, hsv[1] * 1.35f + 0.1f) // more colour
+                hsv[2] = min(1f, hsv[2] * (1.05f + 0.15f * (1f - f))) // tops brighter
+                Color.HSVToColor(Color.alpha(base), hsv)
+            }.also { visColors = it }
+        }
         return c[min(c.size - 1, (frac * c.size).toInt().coerceAtLeast(0))]
     }
 
@@ -929,6 +945,14 @@ class PlayerView(ctx: Context) : View(ctx) {
             }
             "qmix" -> mixSheet()
         }
+    }
+
+    /** Colour packs and themes, as a list to pick from. */
+    fun packSheet(onPick: (String) -> Unit) {
+        val cur = Skin.packName(context)
+        show(Sheet("Theme", emptyList(), Skin.PACKS.map { p ->
+            SheetItem(p.name, if (p.pal != null) "theme" else "pack", p.name == cur) { onPick(p.name) }
+        }))
     }
 
     /** SpoX shuffle: how many new songs (0% = just your list, 100% = only new songs). */

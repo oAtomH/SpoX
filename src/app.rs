@@ -190,6 +190,8 @@ enum CtxAct {
     Like(String),
     AddTo(String),
     CopyLink(String),
+    /// a colour pack / theme from the dropdown
+    Pack(String),
 }
 
 struct CtxMenu {
@@ -3071,6 +3073,21 @@ impl App {
                 self.add_menu = true;
                 self.add_scroll = 0;
             }
+            CtxAct::Pack(n) => {
+                {
+                    let mut c = self.cfg.lock().unwrap();
+                    c.color_pack = n;
+                    // a pack is a fresh start for the style lab
+                    c.color_hue = 0;
+                    c.color_sat = 100;
+                    c.grey_tint = "none".into();
+                    c.grey_light = 100;
+                    c.color_over = crate::skin::pack_colors(&c.color_pack);
+                    c.save();
+                }
+                self.reload_skin();
+                self.osd = None;
+            }
             CtxAct::CopyLink(u) => {
                 let mut it = u.split(':');
                 if let (Some(_), Some(k), Some(id)) = (it.next(), it.next(), it.next()) {
@@ -3293,6 +3310,18 @@ impl App {
                 13 => c.uppercase = !c.uppercase,
                 14 => c.tooltips = !c.tooltips,
                 15 => c.show_profile = !c.show_profile,
+                16 if !back && c.color_pack != "\u{1}" => {
+                    // a dropdown with every pack and theme (right-click still steps back one)
+                    drop(c);
+                    let cur = self.cfg.lock().unwrap().color_pack.clone();
+                    let items = crate::skin::pack_names()
+                        .into_iter()
+                        .map(|n| (if n == cur { format!("> {}", n) } else { format!("  {}", n) }, CtxAct::Pack(n)))
+                        .collect();
+                    self.ctx_menu = Some(CtxMenu { x: 20.0, y: 16.0, items });
+                    self.right_used = true;
+                    return;
+                }
                 16 => {
                     let packs = crate::skin::pack_names();
                     let names: Vec<&str> = packs.iter().map(|s| s.as_str()).collect();
