@@ -237,6 +237,14 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             val bg = floatArrayOf(ch(pal[0], 16), ch(pal[0], 8), ch(pal[0], 0))
             val fg = floatArrayOf(ch(pal[1], 16), ch(pal[1], 8), ch(pal[1], 0))
             val acc = floatArrayOf(ch(pal[2], 16), ch(pal[2], 8), ch(pal[2], 0))
+            // light themes: keep the button bevels the right way round (highlight lighter than the
+            // button, shadow darker) instead of turned inside out
+            val light = bg.sum() > fg.sum()
+            when (c and 0xFFFFFF) {
+                0x585B63 -> if (light) return lerp(bg, floatArrayOf(255f, 255f, 255f), 0.75f)
+                0x1F2123 -> if (light) return lerp(bg, fg, 0.30f)
+                0x34363B -> if (light) return lerp(bg, fg, 0.10f)
+            }
             return if (sat < 0.22f || d < 0.06f) {
                 if (mx < 0.045f) lerp(floatArrayOf(bg[0] * 0.6f, bg[1] * 0.6f, bg[2] * 0.6f), bg, mx / 0.045f)
                 else lerp(bg, fg, minOf(1f, (mx - 0.045f) / (0.78f - 0.045f)))

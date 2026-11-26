@@ -366,6 +366,19 @@ fn palette(pal: &[[f32; 3]; 3], px: [u8; 4]) -> [u8; 4] {
     let sat = if mx > 0.0 { d / mx } else { 0.0 };
     let [bg, fg, acc] = *pal;
     let lerp = |a: [f32; 3], c: [f32; 3], k: f32| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * k).round().clamp(0.0, 255.0) as u8);
+    let light = bg.iter().sum::<f32>() > fg.iter().sum::<f32>();
+    // light themes: a straight bg -> text run would turn the button bevels inside out (light
+    // edges dark, dark edges light), so the bevel greys keep their meaning: highlight lighter
+    // than the button, shadow darker
+    let key = [px[0], px[1], px[2]];
+    if light && (key == [88, 91, 99] || key == [31, 33, 35] || key == [52, 54, 59]) {
+        let o = match key {
+            [88, 91, 99] => lerp(bg, [255.0; 3], 0.75),
+            [31, 33, 35] => lerp(bg, fg, 0.30),
+            _ => lerp(bg, fg, 0.10),
+        };
+        return [o[0], o[1], o[2], px[3]];
+    }
     let out = if sat < 0.22 || d < 0.06 {
         if mx < 0.045 {
             lerp([bg[0] * 0.6, bg[1] * 0.6, bg[2] * 0.6], bg, mx / 0.045)

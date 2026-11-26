@@ -2624,15 +2624,19 @@ impl App {
                     let never = !self.smart_on && crate::smart::knows(&t.name, &t.artists) == Some(false);
                     let outside = self.smart_new.contains(&t.uri) || p.contains("autoplay") || p.contains("recommend");
                     let is_new = never || outside;
+                    // like the phone: the title, the artist under it (dimmer), NEW on the right
                     if self.q_picked.contains(&t.uri) {
                         picked_rows.push(rows.len());
+                        picked_rows.push(rows.len() + 1);
                     }
                     rows.push(Row {
-                        left: format!("{} - {}", t.artists, t.name),
-                        right: if never { "NEW".into() } else if outside { "pick".into() } else if t.duration_ms > 0 { fmt_time(t.duration_ms as f64) } else { String::new() },
+                        left: format!("  {}", t.name),
+                        right: if is_new { "NEW".into() } else if t.duration_ms > 0 { fmt_time(t.duration_ms as f64) } else { String::new() },
                         color: if is_new { new_col } else { list_col },
                         center: false,
                     });
+                    q_map.push(Some(i));
+                    rows.push(Row { left: format!("  {}", t.artists), right: String::new(), color: dim, center: false });
                     q_map.push(Some(i));
                 }
                 if rows.is_empty() {
