@@ -359,7 +359,7 @@ impl Font {
 /// Recolours a pixel into a theme palette (same maths as the phone): greys run from the theme's
 /// background (darkest greys of the skin) to its text colour (lightest), coloured pixels run from
 /// the background through the accent (the skin's accent green) to white.
-fn palette(pal: &[[f32; 3]; 3], px: [u8; 4], down: bool) -> [u8; 4] {
+fn palette(pal: &[[f32; 3]; 3], px: [u8; 4], _down: bool) -> [u8; 4] {
     let (r, g, b) = (px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
     let mx = r.max(g).max(b);
     let d = mx - r.min(g).min(b);
@@ -368,32 +368,39 @@ fn palette(pal: &[[f32; 3]; 3], px: [u8; 4], down: bool) -> [u8; 4] {
     let white = [255.0f32; 3];
     let lerp = |a: [f32; 3], c: [f32; 3], k: f32| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * k.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8);
     let light = bg.iter().sum::<f32>() > fg.iter().sum::<f32>();
-    let key = [px[0], px[1], px[2]];
-    let o = if light && (key == [88, 91, 99] || key == [31, 33, 35] || key == [52, 54, 59]) {
-        // light themes, the button greys by their role (like paper UIs: a raised key is lighter
-        // than the page, lit from the top-left; a pressed key is darker, its shadow top-left)
-        match (key, down) {
-            ([52, 54, 59], false) => lerp(bg, white, 0.45), // raised face
-            ([88, 91, 99], false) => lerp(bg, white, 0.90), // its highlight, top-left
-            ([31, 33, 35], false) => lerp(bg, fg, 0.38),    // its shadow, bottom-right
-            ([31, 33, 35], true) => lerp(bg, fg, 0.12),     // pressed face
-            ([52, 54, 59], true) => lerp(bg, fg, 0.38),     // its shadow, top-left
-            _ => lerp(bg, white, 0.70),                     // its light edge, bottom-right
+    let o = if light {
+        // light themes are not the dark skin turned inside out: the relief stays the same way
+        // round (whatever is lighter in the skin stays lighter: raised keys, their top-left
+        // highlights; darker stays darker: shadows, wells, outlines), only placed around the
+        // theme's light page. Ink (text, icons) becomes the theme's dark text colour.
+        if sat < 0.22 || d < 0.06 {
+            const PAGE: f32 = 0.165;
+            if mx < 0.42 {
+                if mx <= PAGE {
+                    lerp(bg, fg, ((PAGE - mx) / PAGE).sqrt() * 0.22)
+                } else {
+                    lerp(bg, white, (mx - PAGE) / (0.42 - PAGE) * 0.95)
+                }
+            } else {
+                let ink = lerp(bg, fg, 0.55);
+                lerp([ink[0] as f32, ink[1] as f32, ink[2] as f32], fg, (mx - 0.42) / (0.78 - 0.42))
+            }
+        } else if mx < 0.3 {
+            // dark accents are backgrounds (selected row, hover): a light tint of the accent
+            lerp(bg, acc, 0.15 + mx)
+        } else {
+            // accents as ink: dark enough to read on the page
+            lerp(fg, acc, 0.35 + 0.65 * (mx / 0.89).min(1.0))
         }
     } else if sat < 0.22 || d < 0.06 {
         if mx < 0.045 {
             lerp([bg[0] * 0.6, bg[1] * 0.6, bg[2] * 0.6], bg, mx / 0.045)
         } else {
-            let t = ((mx - 0.045) / (0.78 - 0.045)).min(1.0);
-            // light themes: mid greys (dim text, lines) lean to the text colour, so they stay readable
-            lerp(bg, fg, if light { t.powf(0.6) } else { t })
+            lerp(bg, fg, ((mx - 0.045) / (0.78 - 0.045)).min(1.0))
         }
     } else {
         let k = mx / 0.89;
-        if light {
-            // on a light page dark accents stay dark (readable), the brightest are the accent itself
-            lerp(fg, acc, 0.35 + 0.65 * k.min(1.0))
-        } else if k <= 1.0 {
+        if k <= 1.0 {
             lerp(bg, acc, k)
         } else {
             lerp(acc, white, (k - 1.0) * 2.0)

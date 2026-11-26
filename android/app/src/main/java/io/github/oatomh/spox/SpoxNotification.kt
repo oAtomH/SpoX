@@ -130,10 +130,11 @@ object SpoxNotification {
 
     /** Pixel-art cover on the lock screen / phone's player (Settings > Pixel cover). */
     /** What the lock screen / phone's player shows as the picture: "cover", "pixel" or "card". */
-    fun lockArt(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("lock_art", "framed") ?: "framed"
+    fun lockArt(ctx: Context) = ctx.getSharedPreferences("spox", 0).getString("lock_art", "framed").let { if (it == "card" || it == null) "framed" else it }
 
     fun cycleLockArt(ctx: Context) {
-        val next = when (lockArt(ctx)) { "framed" -> "pixel"; "pixel" -> "card"; "card" -> "cover"; else -> "framed" }
+        // (the old "SpoX card" put the song in pixel letters right under One UI's own title: gone)
+        val next = when (lockArt(ctx)) { "framed" -> "pixel"; "pixel" -> "cover"; else -> "framed" }
         ctx.getSharedPreferences("spox", 0).edit().putString("lock_art", next).apply()
         artFor = null; lastKey = ""
         update(ctx)

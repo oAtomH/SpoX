@@ -59,7 +59,7 @@ class MainActivity : Activity() {
                 "Lock screen player" to SpoxNotification.lockStatus(this),
                 "Lock screen check" to "copy report",
                 "Lock screen buttons" to if (SpoxNotification.lockButtons(this) == "like") "heart and + / -" else "shuffle and repeat",
-                "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "card" -> "SpoX card"; "pixel" -> "pixel cover"; else -> "framed pixel cover" },
+                "Lock screen art" to when (SpoxNotification.lockArt(this)) { "cover" -> "cover"; "pixel" -> "pixel cover"; else -> "framed pixel cover" },
                 "Mini player: heart and + / -" to if (prefs.getBoolean("mini_extras", false)) "on" else "off",
                 "App icon follows colour pack" to if (AppIcon.follows(this)) "on (when you leave SpoX)" else "off",
                 "Keep screen on" to when (prefs.getString("keep_on", "off")) { "player" -> "while playing"; "always" -> "while SpoX is open"; else -> "off" },

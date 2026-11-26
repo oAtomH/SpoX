@@ -242,27 +242,30 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             val acc = floatArrayOf(ch(pal[2], 16), ch(pal[2], 8), ch(pal[2], 0))
             val white = floatArrayOf(255f, 255f, 255f)
             val light = bg.sum() > fg.sum()
-            // light themes, the button greys by their role (same as the desktop app): a raised key is
-            // lighter than the page and lit from the top-left; a pressed key is darker, shadow top-left
-            if (light) when (c and 0xFFFFFF) {
-                0x34363B -> return if (down) lerp(bg, fg, 0.38f) else lerp(bg, white, 0.45f)
-                0x585B63 -> return if (down) lerp(bg, white, 0.70f) else lerp(bg, white, 0.90f)
-                0x1F2123 -> return if (down) lerp(bg, fg, 0.12f) else lerp(bg, fg, 0.38f)
+            // light themes are not the dark skin turned inside out: the relief stays the same way
+            // round (lighter in the skin stays lighter: raised keys, highlights; darker stays
+            // darker: shadows, wells, outlines) around the theme's light page; ink (text, icons)
+            // becomes its dark text colour. Same as the desktop app.
+            if (light) {
+                return if (sat < 0.22f || d < 0.06f) {
+                    val page = 0.165f
+                    when {
+                        mx <= page -> lerp(bg, fg, Math.sqrt(((page - mx) / page).toDouble()).toFloat() * 0.22f)
+                        mx < 0.42f -> lerp(bg, white, (mx - page) / (0.42f - page) * 0.95f)
+                        else -> {
+                            val ink = floatArrayOf(bg[0] + (fg[0] - bg[0]) * 0.55f, bg[1] + (fg[1] - bg[1]) * 0.55f, bg[2] + (fg[2] - bg[2]) * 0.55f)
+                            lerp(ink, fg, (mx - 0.42f) / (0.78f - 0.42f))
+                        }
+                    }
+                } else if (mx < 0.3f) lerp(bg, acc, 0.15f + mx) // dark accents are backgrounds: a light tint
+                else lerp(fg, acc, 0.35f + 0.65f * minOf(1f, mx / 0.89f)) // accents as ink: readable
             }
             return if (sat < 0.22f || d < 0.06f) {
                 if (mx < 0.045f) lerp(floatArrayOf(bg[0] * 0.6f, bg[1] * 0.6f, bg[2] * 0.6f), bg, mx / 0.045f)
-                else {
-                    val t = minOf(1f, (mx - 0.045f) / (0.78f - 0.045f))
-                    // light themes: mid greys lean to the text colour, so they stay readable
-                    lerp(bg, fg, if (light) Math.pow(t.toDouble(), 0.6).toFloat() else t)
-                }
+                else lerp(bg, fg, minOf(1f, (mx - 0.045f) / (0.78f - 0.045f)))
             } else {
                 val k = mx / 0.89f
-                when {
-                    light -> lerp(fg, acc, 0.35f + 0.65f * minOf(1f, k))
-                    k <= 1f -> lerp(bg, acc, k)
-                    else -> lerp(acc, white, (k - 1f) * 2f)
-                }
+                if (k <= 1f) lerp(bg, acc, k) else lerp(acc, white, (k - 1f) * 2f)
             }
         }
 
