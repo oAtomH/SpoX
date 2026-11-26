@@ -365,36 +365,41 @@ fn palette(pal: &[[f32; 3]; 3], px: [u8; 4], down: bool) -> [u8; 4] {
     let d = mx - r.min(g).min(b);
     let sat = if mx > 0.0 { d / mx } else { 0.0 };
     let [bg, fg, acc] = *pal;
-    let lerp = |a: [f32; 3], c: [f32; 3], k: f32| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * k).round().clamp(0.0, 255.0) as u8);
+    let white = [255.0f32; 3];
+    let lerp = |a: [f32; 3], c: [f32; 3], k: f32| [0, 1, 2].map(|i| (a[i] + (c[i] - a[i]) * k.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8);
     let light = bg.iter().sum::<f32>() > fg.iter().sum::<f32>();
-    // light themes: a straight bg -> text run would turn the button bevels inside out (light
-    // edges dark, dark edges light), so the bevel greys keep their meaning: highlight lighter
-    // than the button, shadow darker
     let key = [px[0], px[1], px[2]];
-    if light && (key == [88, 91, 99] || key == [31, 33, 35] || key == [52, 54, 59]) {
-        // raised: light top-left edge, button a touch darker than the page, dark bottom-right.
-        // pressed (the button art uses the shadow grey as its face): a darker face, shadow along
-        // the top-left, light along the bottom-right, the way a pressed-in key looks on paper
-        let o = match (key, down) {
-            ([88, 91, 99], _) => lerp(bg, [255.0; 3], 0.75),
-            ([31, 33, 35], false) => lerp(bg, fg, 0.25),
-            ([31, 33, 35], true) => lerp(bg, fg, 0.14),
-            (_, false) => lerp(bg, fg, 0.06),
-            (_, true) => lerp(bg, fg, 0.30),
-        };
-        return [o[0], o[1], o[2], px[3]];
-    }
-    let out = if sat < 0.22 || d < 0.06 {
+    let o = if light && (key == [88, 91, 99] || key == [31, 33, 35] || key == [52, 54, 59]) {
+        // light themes, the button greys by their role (like paper UIs: a raised key is lighter
+        // than the page, lit from the top-left; a pressed key is darker, its shadow top-left)
+        match (key, down) {
+            ([52, 54, 59], false) => lerp(bg, white, 0.45), // raised face
+            ([88, 91, 99], false) => lerp(bg, white, 0.90), // its highlight, top-left
+            ([31, 33, 35], false) => lerp(bg, fg, 0.38),    // its shadow, bottom-right
+            ([31, 33, 35], true) => lerp(bg, fg, 0.12),     // pressed face
+            ([52, 54, 59], true) => lerp(bg, fg, 0.38),     // its shadow, top-left
+            _ => lerp(bg, white, 0.70),                     // its light edge, bottom-right
+        }
+    } else if sat < 0.22 || d < 0.06 {
         if mx < 0.045 {
             lerp([bg[0] * 0.6, bg[1] * 0.6, bg[2] * 0.6], bg, mx / 0.045)
         } else {
-            lerp(bg, fg, ((mx - 0.045) / (0.78 - 0.045)).min(1.0))
+            let t = ((mx - 0.045) / (0.78 - 0.045)).min(1.0);
+            // light themes: mid greys (dim text, lines) lean to the text colour, so they stay readable
+            lerp(bg, fg, if light { t.powf(0.6) } else { t })
         }
     } else {
         let k = mx / 0.89;
-        if k <= 1.0 { lerp(bg, acc, k) } else { lerp(acc, [255.0; 3], (k - 1.0) * 2.0) }
+        if light {
+            // on a light page dark accents stay dark (readable), the brightest are the accent itself
+            lerp(fg, acc, 0.35 + 0.65 * k.min(1.0))
+        } else if k <= 1.0 {
+            lerp(bg, acc, k)
+        } else {
+            lerp(acc, white, (k - 1.0) * 2.0)
+        }
     };
-    [out[0], out[1], out[2], px[3]]
+    [o[0], o[1], o[2], px[3]]
 }
 
 // ---- colour packs ------------------------------------------------------------------------

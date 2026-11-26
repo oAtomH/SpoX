@@ -232,26 +232,37 @@ class Skin private constructor(val json: JSONObject, private val sprites: Map<St
             val mx = maxOf(r, g, b); val d = mx - minOf(r, g, b)
             val sat = if (mx > 0) d / mx else 0f
             fun ch(x: Int, s: Int) = ((x shr s) and 255).toFloat()
-            fun lerp(a: FloatArray, z: FloatArray, k: Float) = Color.argb(Color.alpha(c),
-                (a[0] + (z[0] - a[0]) * k).toInt().coerceIn(0, 255), (a[1] + (z[1] - a[1]) * k).toInt().coerceIn(0, 255), (a[2] + (z[2] - a[2]) * k).toInt().coerceIn(0, 255))
+            fun lerp(a: FloatArray, z: FloatArray, k0: Float): Int {
+                val k = k0.coerceIn(0f, 1f)
+                return Color.argb(Color.alpha(c), (a[0] + (z[0] - a[0]) * k).toInt().coerceIn(0, 255),
+                    (a[1] + (z[1] - a[1]) * k).toInt().coerceIn(0, 255), (a[2] + (z[2] - a[2]) * k).toInt().coerceIn(0, 255))
+            }
             val bg = floatArrayOf(ch(pal[0], 16), ch(pal[0], 8), ch(pal[0], 0))
             val fg = floatArrayOf(ch(pal[1], 16), ch(pal[1], 8), ch(pal[1], 0))
             val acc = floatArrayOf(ch(pal[2], 16), ch(pal[2], 8), ch(pal[2], 0))
-            // light themes: keep the button bevels the right way round (highlight lighter than the
-            // button, shadow darker) instead of turned inside out
+            val white = floatArrayOf(255f, 255f, 255f)
             val light = bg.sum() > fg.sum()
-            // pressed art (its face is the shadow grey): darker face, shadow top-left, light bottom-right
+            // light themes, the button greys by their role (same as the desktop app): a raised key is
+            // lighter than the page and lit from the top-left; a pressed key is darker, shadow top-left
             if (light) when (c and 0xFFFFFF) {
-                0x585B63 -> return lerp(bg, floatArrayOf(255f, 255f, 255f), 0.75f)
-                0x1F2123 -> return lerp(bg, fg, if (down) 0.14f else 0.25f)
-                0x34363B -> return lerp(bg, fg, if (down) 0.30f else 0.06f)
+                0x34363B -> return if (down) lerp(bg, fg, 0.38f) else lerp(bg, white, 0.45f)
+                0x585B63 -> return if (down) lerp(bg, white, 0.70f) else lerp(bg, white, 0.90f)
+                0x1F2123 -> return if (down) lerp(bg, fg, 0.12f) else lerp(bg, fg, 0.38f)
             }
             return if (sat < 0.22f || d < 0.06f) {
                 if (mx < 0.045f) lerp(floatArrayOf(bg[0] * 0.6f, bg[1] * 0.6f, bg[2] * 0.6f), bg, mx / 0.045f)
-                else lerp(bg, fg, minOf(1f, (mx - 0.045f) / (0.78f - 0.045f)))
+                else {
+                    val t = minOf(1f, (mx - 0.045f) / (0.78f - 0.045f))
+                    // light themes: mid greys lean to the text colour, so they stay readable
+                    lerp(bg, fg, if (light) Math.pow(t.toDouble(), 0.6).toFloat() else t)
+                }
             } else {
                 val k = mx / 0.89f
-                if (k <= 1f) lerp(bg, acc, k) else lerp(acc, floatArrayOf(255f, 255f, 255f), (k - 1f) * 2f)
+                when {
+                    light -> lerp(fg, acc, 0.35f + 0.65f * minOf(1f, k))
+                    k <= 1f -> lerp(bg, acc, k)
+                    else -> lerp(acc, white, (k - 1f) * 2f)
+                }
             }
         }
 

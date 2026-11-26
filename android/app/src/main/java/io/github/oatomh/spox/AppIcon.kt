@@ -20,6 +20,11 @@ object AppIcon {
     fun apply(ctx: Context) {
         val pm = ctx.packageManager
         val want = if (follows(ctx)) slug(Skin.packName(ctx)).takeIf { it in SLUGS } else null
+        // once per change: if the launcher didn't take it, don't keep trying every time
+        val prefs = ctx.getSharedPreferences("spox", 0)
+        val tag = want ?: "default"
+        if (prefs.getString("icon_applied", "default") == tag) return
+        prefs.edit().putString("icon_applied", tag).apply()
         val names = listOf("IconDefault" to (want == null)) + SLUGS.map { "Icon_$it" to (it == want) }
         for ((n, on) in names.sortedBy { !it.second }) {
             val cn = ComponentName(ctx.packageName, "${ctx.packageName}.$n")

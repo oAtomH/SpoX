@@ -113,6 +113,7 @@ object SpoxNotification {
         val cr = ctx.contentResolver
         for (k in listOf("lock_screen_show_notifications", "lock_screen_show_silent_notifications", "lock_screen_allow_private_notifications", "media_controls_lock_screen", "lockscreen_show_media", "now_bar_enabled"))
             sb.append(k).append('=').append(runCatching { android.provider.Settings.Secure.getString(cr, k) }.getOrNull()).append(' ')
+        sb.append("\nlast crash: ").append(CrashLog.last(ctx))
         return sb.toString()
     }
 

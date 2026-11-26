@@ -15,6 +15,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.install(this)
         Player.init(this)
         Web.init(this)
         view = PlayerView(this)
@@ -355,8 +356,10 @@ class MainActivity : Activity() {
         return super.dispatchKeyEvent(e)
     }
 
-    override fun onStop() {
-        super.onStop()
+    // the icon switches only when you really leave SpoX (home / recents), never when the
+    // notification shade or control panel just covers it; switching can restart the app
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
         AppIcon.apply(this)
     }
 

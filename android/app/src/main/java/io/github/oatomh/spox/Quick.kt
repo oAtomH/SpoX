@@ -19,24 +19,24 @@ object Quick {
         if (uri != likedFor || now - likedAt > 30_000) {
             if (uri != likedFor) liked = null
             likedFor = uri; likedAt = now
-            thread {
+            thread { runCatching {
                 val r = Web.isLiked(uri.substringAfterLast(':'))
                 if (likedFor == uri && r != null && r != liked) { liked = r; SpoxNotification.refresh(ctx) }
-            }
+            } }
         }
         return liked
     }
 
     fun toggleLike(ctx: Context) {
         val uri = trackUri(ctx) ?: return
-        thread {
+        thread { runCatching {
             val cur = (if (likedFor == uri) liked else null) ?: Web.isLiked(uri.substringAfterLast(':')) ?: false
             liked = !cur; likedFor = uri; likedAt = System.currentTimeMillis()
             SpoxNotification.refresh(ctx)
             val ok = Web.setLiked(uri.substringAfterLast(':'), !cur)
             if (!ok) { liked = cur; SpoxNotification.refresh(ctx) }
             PlayerView.say(ctx, if (!ok) "Couldn't change Liked Songs" else if (!cur) "Saved to Liked Songs" else "Removed from Liked Songs")
-        }
+        } }
     }
 
     /** The playlist + / - works on: SpoX's list, else the playlist playing. */
@@ -52,7 +52,7 @@ object Quick {
         val uri = trackUri(ctx) ?: return
         val list = listUri(ctx)
         val name = (if (Smart.on) Smart.listName else Engine.get(ctx).now.contextName).ifEmpty { "the playlist" }
-        thread {
+        thread { runCatching {
             var inPl = Web.inPlaylist(list, uri)
             var tries = 0
             while (inPl == null && tries++ < 15 && list.startsWith("spotify:playlist:")) { Thread.sleep(200); inPl = Web.inPlaylist(list, uri) }
@@ -62,6 +62,6 @@ object Quick {
             val ok = if (inPl) Web.removeFrom(list, uri) else Web.addTo(list, uri)
             if (!ok) { Web.markInPlaylist(list, uri, inPl); SpoxNotification.refresh(ctx) }
             PlayerView.say(ctx, if (!ok) "Couldn't change $name (is it yours?)" else if (inPl) "Removed from $name" else "Added to $name")
-        }
+        } }
     }
 }

@@ -51,6 +51,7 @@ class EngineService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        io.github.oatomh.spox.CrashLog.install(this)
         engine = Engine.get(this)
         Player.init(this)
         engine.now.listeners += changed
