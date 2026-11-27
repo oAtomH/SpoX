@@ -34,6 +34,8 @@ pub struct Lyrics {
 
 /// Everything the background threads send to the UI.
 pub enum Ev {
+    /// Spotify Connect devices: (id, name, type, active)
+    Devices(Vec<(String, String, String, bool)>),
     Status(String),
     SoloistMsg(Value),
     SoloistConnected(bool),

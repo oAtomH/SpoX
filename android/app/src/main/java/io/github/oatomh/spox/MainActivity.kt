@@ -52,7 +52,7 @@ class MainActivity : Activity() {
                 "#Spotify account (library, search, likes)" to "",
                 "Account" to if (Web.signedIn) Web.userName().ifEmpty { "signed in" } else Web.status.ifEmpty { "sign in..." },
                 "Client ID" to if (Web.clientId().isEmpty()) "add..." else "set (change...)",
-                "Spotify requests" to Web.limitLeft().let { l -> when { l == 0L -> "ok"; l < 120 -> "waiting ${l}s"; l < 7200 -> "waiting ${l / 60}m"; else -> "waiting ${l / 3600}h ${l % 3600 / 60}m" } },
+                "Spotify requests" to Web.limitLeft().let { (l, what) -> when { l == 0L -> "ok"; l < 120 -> "$what waits ${l}s"; l < 7200 -> "$what waits ${l / 60}m"; else -> "$what waits ${l / 3600}h ${l % 3600 / 60}m" } },
                 "Last.fm scrobbling" to if (Stats.lastfmOn()) Stats.lastfmUser() else "connect...",
                 "#Look" to "",
                 "Colour pack" to Skin.packName(this),

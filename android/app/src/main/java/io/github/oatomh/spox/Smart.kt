@@ -636,7 +636,9 @@ object Smart {
 
     private fun discover() {
         // only while this SpoX plays (not the PC or another device), at most every 15 s
-        if (!engine.now.active || System.currentTimeMillis() - lastDisc < 15_000) return
+        // new songs come mostly from Spotify's own suggestions in the queue (free, see harvest);
+        // similar artists use the small search quota: at most once a minute, never while on hold
+        if (!engine.now.active || Web.searchOnHold() || System.currentTimeMillis() - lastDisc < 60_000) return
         if (!finding.compareAndSet(0, 1)) return
         lastDisc = System.currentTimeMillis()
         thread(name = "spox-discover") {
@@ -646,7 +648,7 @@ object Smart {
                 if (pool.size >= 6) warmUntil = 0
                 plan()
                 // still owed: look again right away (the slow lane keeps Spotify happy)
-                if (synchronized(lock) { owed.isNotEmpty() }) main.postDelayed({ discover() }, 15_000)
+                if (synchronized(lock) { owed.isNotEmpty() }) main.postDelayed({ discover() }, 60_000)
                 if (wasWarm && warmUntil == 0L) rearm()
                 save(); changed()
             }
@@ -688,8 +690,9 @@ object Smart {
             }
         }
         synchronized(searches) {
-            searches.removeAll { now - it > 600_000 }
-            if (searches.size >= 8) return emptyList()
+            // searching has its own small quota at Spotify: at most 6 searches an hour
+            searches.removeAll { now - it > 3_600_000 }
+            if (searches.size >= 6 || Web.searchOnHold()) return emptyList()
             searches += now
         }
         val r = Web.getBg("/search?type=track&limit=10&q=" + enc("artist:\"$a\""))?.optJSONObject("tracks")?.optJSONArray("items") ?: return emptyList()

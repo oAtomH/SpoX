@@ -195,6 +195,10 @@ enum CtxAct {
     CopyLink(String),
     /// a colour pack / theme from the dropdown
     Pack(String),
+    /// move playback to this Spotify Connect device
+    Transfer(String),
+    /// play the open playlist (through SpoX, in your shuffle mode)
+    PlayList,
 }
 
 struct CtxMenu {
@@ -676,6 +680,21 @@ impl App {
                 if self.play.track.as_ref().map(|t| t.uri == uri).unwrap_or(false) {
                     self.liked = Some(liked);
                     self.liked_uri = uri;
+                }
+            }
+            Ev::Devices(list) => {
+                if list.is_empty() {
+                    self.osd("NO DEVICES FOUND");
+                } else {
+                    let items = list
+                        .into_iter()
+                        .map(|(id, name, kind, active)| {
+                            let k = match kind.as_str() { "smartphone" => "phone", "computer" => "pc", "speaker" => "speaker", "tv" => "tv", _ => "" };
+                            (format!("{} {}{}", if active { ">" } else { " " }, name, if k.is_empty() { String::new() } else { format!("  ({})", k) }), CtxAct::Transfer(id))
+                        })
+                        .collect();
+                    self.ctx_menu = Some(CtxMenu { x: 6.0, y: 16.0, items });
+                    self.right_used = true;
                 }
             }
             Ev::SignedIn(ok) => {
@@ -2835,6 +2854,7 @@ impl App {
                         let u = self.tracks[r].uri.clone();
                         self.selected = Some(r);
                         items = vec![
+                            ("Play this playlist".into(), CtxAct::PlayList),
                             ("Play".into(), CtxAct::PlayTrack(r)),
                             ("Add to queue".into(), CtxAct::QueueTrack(u.clone())),
                             ("Save to Liked Songs".into(), CtxAct::Like(u.clone())),
@@ -2842,6 +2862,11 @@ impl App {
                             ("Copy song link".into(), CtxAct::CopyLink(u)),
                             (format!("Sort: {}  (O)", sort_name(&self.pl_sort)), CtxAct::Sort),
                             ("Find in playlist  (Ctrl+F)".into(), CtxAct::Find),
+                        ];
+                    } else {
+                        items = vec![
+                            ("Play this playlist".into(), CtxAct::PlayList),
+                            (format!("Sort: {}  (O)", sort_name(&self.pl_sort)), CtxAct::Sort),
                         ];
                     }
                 }
@@ -3085,6 +3110,15 @@ impl App {
                 self.add_menu = true;
                 self.add_scroll = 0;
             }
+            CtxAct::Transfer(id) => {
+                let _ = self.web.send(Req::Transfer(id));
+                self.osd("SWITCHING...");
+            }
+            CtxAct::PlayList => {
+                if let Some(p) = self.sel.clone() {
+                    self.play_playlist(&p);
+                }
+            }
             CtxAct::Pack(n) => {
                 {
                     let mut c = self.cfg.lock().unwrap();
@@ -3145,16 +3179,15 @@ impl App {
         // Spotify keeps one request budget per Client ID (shared by every SpoX that uses it): when
         // it says wait, likes, the profile, new songs and lists can't load until it's over
         {
-            let left = crate::web::limit_left();
-            let v = if left == 0 {
-                "ok".to_string()
-            } else if left < 120 {
-                format!("waiting {}s", left)
+            let (left, what) = crate::web::limit_left();
+            let t = if left < 120 {
+                format!("{}s", left)
             } else if left < 7200 {
-                format!("waiting {}m", left / 60)
+                format!("{}m", left / 60)
             } else {
-                format!("waiting {}h {}m", left / 3600, left % 3600 / 60)
+                format!("{}h {}m", left / 3600, left % 3600 / 60)
             };
+            let v = if left == 0 { "ok".to_string() } else { format!("{} waits {}", what, t) };
             out.push(("Spotify requests".into(), v, 98));
         }
         for r in self.settings_rows_base() {
@@ -3803,6 +3836,10 @@ impl App {
         if let Some(v) = &self.update_ready {
             items.push((format!("Restart to update ({})", v), 20));
         }
+        if self.signed_in {
+            let dev = if self.play.is_active { self.device_name() } else { "another device".into() };
+            items.push((format!("Playing on {}...", dev), 21));
+        }
         items.push(("Settings...".into(), 5));
         items.push(("Open skin folder".into(), 7));
         items.push(("Quit + stop Soloist".into(), 8));
@@ -3838,6 +3875,11 @@ impl App {
         }
         if let Some(id) = clicked {
             match id {
+                21 => {
+                    // the device list comes back as Ev::Devices and opens as a menu
+                    let _ = self.web.send(Req::Devices);
+                    self.osd("LOOKING FOR DEVICES...");
+                }
                 20 => {
                     // hand over to the new version; this one closes without stopping the music
                     crate::update::restart();

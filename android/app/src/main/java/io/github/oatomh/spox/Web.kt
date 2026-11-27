@@ -131,30 +131,53 @@ object Web {
     // after a 429 nothing is sent until the wait is over; background work (finding new songs)
     // goes one request at a time, spaced out, and gives way to everything you press.
 
-    @Volatile private var coolUntil = 0L
+    // Spotify counts requests per developer account in separate buckets (searching is one) and,
+    // when one runs out, answers 429 "QUOTA_EXCEEDED" for a long time. A wait applies only to the
+    // kind of request that got it: an empty search budget no longer holds up likes or playing.
+    private val cools = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val bgLock = Any()
     @Volatile private var lastBg = 0L
     /** For the engine report / Settings: when Spotify last asked SpoX to slow down. */
     @Volatile var lastLimit = ""
 
-    private fun cooling() = System.currentTimeMillis() < coolUntil
-
-    /** Seconds Spotify still wants SpoX to wait (0 = fine), for Settings. */
-    fun limitLeft(): Long = maxOf(0L, (coolUntil - System.currentTimeMillis()) / 1000)
-
-    private fun limited(c: HttpURLConnection) {
-        // Spotify's own number: seconds normally, hours when the Client ID (shared by every SpoX
-        // that uses it) went over its limit; background work honours it in full
-        val wait = c.getHeaderField("Retry-After")?.toLongOrNull()?.coerceIn(2, 6 * 3600) ?: 5
-        coolUntil = maxOf(coolUntil, System.currentTimeMillis() + wait * 1000)
-        lastLimit = "Spotify asked to wait ${wait}s at " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())
+    /** The kind of request: the first part of its path (search, me/library, playlists...). */
+    private fun bucket(path: String): String {
+        val p = path.removePrefix(API).trimStart('/')
+        val parts = p.split('/', '?')
+        return if (parts.firstOrNull() == "me") parts.take(2).joinToString("/") else parts.firstOrNull().orEmpty()
     }
 
-    /** Waits out a cool-down (up to [maxMs]) before something you pressed. */
-    private fun waitCool(maxMs: Long = 30_000) {
-        val until = minOf(coolUntil, System.currentTimeMillis() + maxMs)
+    private fun coolUntil(path: String) = cools[bucket(path)] ?: 0L
+    private fun cooling(path: String) = System.currentTimeMillis() < coolUntil(path)
+    /** Searching is on hold. */
+    fun searchOnHold() = cooling("/search")
+
+    /** The longest wait still running, for Settings: (seconds, what). */
+    fun limitLeft(): Pair<Long, String> {
+        val now = System.currentTimeMillis()
+        return cools.entries.map { (it.value - now) / 1000 to it.key }.filter { it.first > 0 }.maxByOrNull { it.first } ?: (0L to "")
+    }
+
+    private fun limited(c: HttpURLConnection, path: String) {
+        val raw = c.getHeaderField("Retry-After")?.toLongOrNull()
+        val body = runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull().orEmpty()
+        val quota = body.contains("QUOTA_EXCEEDED")
+        // a used-up quota without a number: leave that kind of request alone for 6 hours
+        val wait = raw?.coerceIn(2, 24 * 3600) ?: if (quota) 6 * 3600L else 5L
+        val b = bucket(path)
+        cools.merge(b, System.currentTimeMillis() + wait * 1000) { a, z -> maxOf(a, z) }
+        lastLimit = "Spotify said wait for $b (${if (quota) "quota used up" else "too fast"}) ${wait}s at " +
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())
+    }
+
+    /** Waits out a cool-down for this kind of request (up to [maxMs]) before something you pressed. */
+    private fun waitCool(path: String, maxMs: Long = 30_000) {
+        val until = minOf(coolUntil(path), System.currentTimeMillis() + maxMs)
         while (System.currentTimeMillis() < until) Thread.sleep(250)
     }
+
+    /** A long wait for this kind of request: don't sit through it. */
+    private fun longWait(path: String) = coolUntil(path) - System.currentTimeMillis() > 60_000
 
     private fun raw(method: String, path: String, body: JSONObject?): Pair<Int, String> {
         val t = token() ?: return -1 to ""
@@ -168,7 +191,7 @@ object Web {
             c.outputStream.write(body.toString().toByteArray())
         } else if (method == "PUT" || method == "POST") { c.doOutput = true; c.setFixedLengthStreamingMode(0) }
         val code = c.responseCode
-        if (code == 429) limited(c)
+        if (code == 429) limited(c, path)
         val text = if (code in 200..299) c.inputStream.bufferedReader().readText() else ""
         return code to text
     }
@@ -178,23 +201,25 @@ object Web {
 
     /** Something you asked for: waits out a cool-down, and tries once more after a 429. */
     fun get(path: String): JSONObject? = runCatching {
-        waitCool()
+        if (longWait(path)) return null
+        waitCool(path)
         var r = raw("GET", path, null)
-        if (r.first == 429) { waitCool(); r = raw("GET", path, null) }
+        if (r.first == 429 && !longWait(path)) { waitCool(path); r = raw("GET", path, null) }
         if (r.first in 200..299) parse(r.second) else null
     }.getOrNull()
 
     fun send(method: String, path: String, body: JSONObject? = null): Boolean = runCatching {
-        waitCool()
+        if (longWait(path)) return false
+        waitCool(path)
         var r = raw(method, path, body)
-        if (r.first == 429) { waitCool(); r = raw(method, path, body) }
+        if (r.first == 429 && !longWait(path)) { waitCool(path); r = raw(method, path, body) }
         r.first in 200..299
     }.getOrDefault(false)
 
     /** Background work (finding new songs): one at a time, at least 1.5 s apart, and nothing at
      *  all while Spotify asks to slow down (it just tries later). */
     fun getBg(path: String): JSONObject? = synchronized(bgLock) {
-        if (cooling()) return null
+        if (cooling(path)) return null
         val gap = 1500 - (System.currentTimeMillis() - lastBg)
         if (gap > 0) Thread.sleep(gap)
         lastBg = System.currentTimeMillis()

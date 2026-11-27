@@ -309,7 +309,9 @@ object Player {
     fun playPause() {
         if (state.playing) pause() else play()
     }
-    fun next() { eng?.let { if (Smart.on) Smart.next() else it.command("skip_next"); return }; tc?.skipToNext() }
+    // while another device plays (SpoX on the PC...), the phone is a remote: plain next / back,
+    // which that device's own SpoX turns into its order; SpoX here never takes the music over
+    fun next() { eng?.let { if (Smart.on && it.now.active) Smart.next() else it.command("skip_next"); return }; tc?.skipToNext() }
 
     // ---- songs taken out of Up next ------------------------------------------------------------
 
@@ -343,7 +345,7 @@ object Player {
         if (Smart.on) Smart.remove(uris) else skipQueued(uris)
         changed()
     }
-    fun prev() { eng?.let { if (Smart.on) Smart.prev() else it.command("skip_prev"); return }; tc?.skipToPrevious() }
+    fun prev() { eng?.let { if (Smart.on && it.now.active) Smart.prev() else it.command("skip_prev"); return }; tc?.skipToPrevious() }
     fun seek(ms: Long) {
         eng?.let { e ->
             state = state.copy(positionMs = ms, positionAt = SystemClock.elapsedRealtime())

@@ -36,6 +36,10 @@ pub enum Req {
     SetLiked(String, bool),
     AddTo { playlist: Playlist, uri: String },
     RemoveFrom { playlist: Playlist, uri: String, key: String },
+    /// the "Playing on" list
+    Devices,
+    /// move playback to this device (keeps playing)
+    Transfer(String),
 }
 
 pub fn start(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context) -> Sender<Req> {
@@ -74,7 +78,7 @@ impl Api {
 
     /// Songs by an artist (for smart shuffle without a Last.fm key), shuffled a bit by the search offset.
     /// Songs by an artist, for new songs. Each artist is asked once every two weeks (kept on
-    /// disk), and at most 8 searches go out per 10 minutes: discovery never eats the request
+    /// disk), and at most 6 searches go out per hour: discovery never eats the request
     /// budget SpoX (on PC and phone, same Spotify app) needs for playing, likes and lists.
     pub fn search_artist(&self, artist: &str) -> Vec<Track> {
         if artist.is_empty() {
@@ -89,8 +93,9 @@ impl Api {
         }
         {
             let mut b = SEARCHES.lock().unwrap();
-            b.retain(|t| now - t < 600_000);
-            if b.len() >= 8 {
+            // searching has its own small quota at Spotify: at most 6 searches an hour
+            b.retain(|t| now - t < 3_600_000);
+            if b.len() >= 6 || cooling("/search") {
                 return Vec::new();
             }
             b.push(now);
@@ -277,11 +282,15 @@ impl Api {
     fn get(&self, path: &str) -> Result<Value, String> {
         let url = if path.starts_with("http") { path.to_string() } else { format!("{}{}", API, path) };
         for attempt in 0..3 {
-            wait_cool(30);
+            // a long wait for this kind of request: don't sit through it, fail now
+            if cool_until(path) - now_ms() > 60_000 {
+                return Err("Spotify asked SpoX to wait".into());
+            }
+            wait_cool(path, 30);
             let tok = self.token()?;
             match net::agent().get(&url).set("Authorization", &format!("Bearer {}", tok)).call() {
                 Ok(r) => return r.into_json().map_err(|e| e.to_string()),
-                Err(ureq::Error::Status(429, r)) => limited(&r),
+                Err(ureq::Error::Status(429, r)) => limited(r, path),
                 Err(ureq::Error::Status(401, _)) if attempt == 0 => {
                     self.cfg.lock().unwrap().token_expires = 0;
                 }
@@ -296,7 +305,7 @@ impl Api {
     /// while Spotify asks to slow down (it tries again later instead of blocking play / likes).
     fn get_bg(&self, path: &str) -> Option<Value> {
         let _one = BG_LOCK.lock().unwrap();
-        if cooling() {
+        if cooling(path) {
             return None;
         }
         let since = now_ms() - LAST_BG.load(Ordering::SeqCst);
@@ -308,7 +317,7 @@ impl Api {
         match net::agent().get(&format!("{}{}", API, path)).set("Authorization", &format!("Bearer {}", tok)).call() {
             Ok(r) => r.into_json().ok(),
             Err(ureq::Error::Status(429, r)) => {
-                limited(&r);
+                limited(r, path);
                 None
             }
             Err(_) => None,
@@ -321,7 +330,10 @@ impl Api {
 
     fn send(&self, method: &str, path: &str, body: Option<Value>) -> Result<(), String> {
         for _ in 0..2 {
-            wait_cool(30);
+            if cool_until(path) - now_ms() > 60_000 {
+                return Err("Spotify asked SpoX to wait".into());
+            }
+            wait_cool(path, 30);
             let tok = self.token()?;
             let req = net::agent().request(method, &format!("{}{}", API, path)).set("Authorization", &format!("Bearer {}", tok));
             let r = match &body {
@@ -330,7 +342,7 @@ impl Api {
             };
             match r {
                 Ok(_) => return Ok(()),
-                Err(ureq::Error::Status(429, r)) => limited(&r),
+                Err(ureq::Error::Status(429, r)) => limited(r, path),
                 Err(ureq::Error::Status(code, _)) => return Err(format!("http {}", code)),
                 Err(e) => return Err(e.to_string()),
             }
@@ -599,6 +611,32 @@ fn run(cfg: Shared, ev: Sender<Ev>, ctx: egui::Context, rx: Receiver<Req>) {
             }
             Req::LoadTracks(p) => api.tracks(&p),
             Req::LoadMe => api.me(),
+            Req::Devices => {
+                let list = api
+                    .get("/me/player/devices")
+                    .ok()
+                    .and_then(|v| v["devices"].as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|d| {
+                        (
+                            d["id"].as_str().unwrap_or("").to_string(),
+                            d["name"].as_str().unwrap_or("").to_string(),
+                            d["type"].as_str().unwrap_or("").to_lowercase(),
+                            d["is_active"].as_bool().unwrap_or(false),
+                        )
+                    })
+                    .filter(|d| !d.0.is_empty())
+                    .collect();
+                let _ = ev.send(Ev::Devices(list));
+                ctx.request_repaint();
+            }
+            Req::Transfer(id) => {
+                if let Err(e) = api.put("/me/player", json!({ "device_ids": [id], "play": true })) {
+                    web_log(&format!("transfer failed: {}", e));
+                    let _ = ev.send(Ev::Status("COULDN'T SWITCH DEVICE".into()));
+                }
+            }
             Req::CheckLiked(uri) => {
                 if let Ok(v) = api.get(&format!("/me/library/contains?uris={}", enc(&uri))) {
                     let liked = v.as_array().and_then(|a| a.first()).and_then(|x| x.as_bool()).unwrap_or(false);
@@ -780,42 +818,76 @@ mod iso_tests {
 // and the phone share one limit); then every request fails for a while, also "play". After a 429
 // nothing is sent until the wait is over, and background work goes one at a time, spaced out.
 
-use std::sync::atomic::AtomicI64;
-static COOL_UNTIL: AtomicI64 = AtomicI64::new(0);
-static LAST_BG: AtomicI64 = AtomicI64::new(0);
+// Spotify counts requests per developer account in separate buckets (searching is one of them)
+// and, when one runs out, answers 429 "QUOTA_EXCEEDED" for a long time. So a wait applies only
+// to the kind of request that got it: an empty search budget no longer holds up likes, your
+// profile, playlists or playing.
+static COOLS: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
+static LAST_BG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static BG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn now_ms() -> i64 {
     crate::config::now_ms()
 }
 
-/// Spotify asked SpoX to slow down and the wait isn't over (for the logs).
+/// The kind of request: the first part of its path (search, me, playlists, ...).
+fn bucket(path: &str) -> String {
+    let p = path.strip_prefix(API).unwrap_or(path);
+    let p = p.trim_start_matches('/');
+    let first = p.split(['/', '?']).next().unwrap_or("");
+    if first == "me" {
+        // /me/library, /me/player, /me/playlists... each its own
+        p.split(['/', '?']).take(2).collect::<Vec<_>>().join("/")
+    } else {
+        first.to_string()
+    }
+}
+
+fn cool_until(path: &str) -> i64 {
+    let b = bucket(path);
+    COOLS.lock().unwrap().iter().find(|(k, _)| *k == b).map(|(_, t)| *t).unwrap_or(0)
+}
+
+/// Searching is on hold (for the shuffle log).
 pub fn cooling_now() -> bool {
-    cooling()
+    now_ms() < cool_until("/search")
 }
 
-fn cooling() -> bool {
-    now_ms() < COOL_UNTIL.load(Ordering::SeqCst)
+fn cooling(path: &str) -> bool {
+    now_ms() < cool_until(path)
 }
 
-fn limited(r: &ureq::Response) {
-    // Spotify's own number: a few seconds normally, hours when the app (its Client ID, shared by
-    // every SpoX that uses it) went over its limit. Background work honours it in full; things
-    // you press still try after at most 30 s
-    let raw: i64 = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(5);
-    let wait = raw.clamp(2, 6 * 3600);
-    COOL_UNTIL.fetch_max(now_ms() + wait * 1000, Ordering::SeqCst);
-    web_log(&format!("Spotify asked to slow down: Retry-After {}s", raw));
+fn limited(r: ureq::Response, path: &str) {
+    let raw: Option<i64> = r.header("Retry-After").and_then(|s| s.parse().ok());
+    let body = r.into_string().unwrap_or_default();
+    let quota = body.contains("QUOTA_EXCEEDED");
+    // a used-up quota without a number: leave that kind of request alone for 6 hours
+    let wait = match (raw, quota) {
+        (Some(n), _) => n.clamp(2, 24 * 3600),
+        (None, true) => 6 * 3600,
+        (None, false) => 5,
+    };
+    let b = bucket(path);
+    {
+        let mut c = COOLS.lock().unwrap();
+        let until = now_ms() + wait * 1000;
+        match c.iter_mut().find(|(k, _)| *k == b) {
+            Some(e) => e.1 = e.1.max(until),
+            None => c.push((b.clone(), until)),
+        }
+    }
+    web_log(&format!("Spotify said wait for {} ({}): {}s", b, if quota { "quota used up" } else { "too fast" }, wait));
 }
 
-/// Seconds Spotify still wants SpoX to wait (0 = fine), for Settings.
-pub fn limit_left() -> i64 {
-    ((COOL_UNTIL.load(Ordering::SeqCst) - now_ms()) / 1000).max(0)
+/// The longest wait still running, and for what (for Settings).
+pub fn limit_left() -> (i64, String) {
+    let now = now_ms();
+    COOLS.lock().unwrap().iter().map(|(k, t)| ((t - now) / 1000, k.clone())).filter(|(l, _)| *l > 0).max_by_key(|(l, _)| *l).unwrap_or((0, String::new()))
 }
 
-/// Waits out a cool-down (at most `max_s` seconds) before something you pressed.
-fn wait_cool(max_s: i64) {
-    let until = COOL_UNTIL.load(Ordering::SeqCst).min(now_ms() + max_s * 1000);
+/// Waits out a cool-down for this kind of request (at most `max_s` seconds) before something you pressed.
+fn wait_cool(path: &str, max_s: i64) {
+    let until = cool_until(path).min(now_ms() + max_s * 1000);
     while now_ms() < until {
         std::thread::sleep(Duration::from_millis(250));
     }

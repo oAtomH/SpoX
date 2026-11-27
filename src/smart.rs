@@ -430,7 +430,9 @@ impl Engine {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
-            ON.store(self.on, std::sync::atomic::Ordering::SeqCst);
+            // only while this PC plays: when the phone (or another device) plays, this SpoX is a
+            // remote and next / back go to that device as they are
+            ON.store(self.on && self.play.is_active, std::sync::atomic::Ordering::SeqCst);
             if self.go_at.map(|t| Instant::now() >= t).unwrap_or(false) {
                 self.go_at = None;
                 self.send_go();
@@ -517,7 +519,15 @@ impl Engine {
         let hungry = self.plan();
         // only while this SpoX plays (not when the phone or another device does), and at most
         // every 15 s: the Spotify requests are shared with everything else SpoX does
-        if self.ratio() > 0 && self.play.is_active && (hungry || self.pool.lock().unwrap().len() < 20) && self.last_disc.elapsed() > Duration::from_secs(15) {
+        // new songs come mostly from Spotify's own suggestions in the queue (free, see harvest);
+        // looking up similar artists uses the small search quota, so: at most once a minute, and
+        // not at all while Spotify has searching on hold
+        if self.ratio() > 0
+            && self.play.is_active
+            && !crate::web::cooling_now()
+            && (hungry || self.pool.lock().unwrap().len() < 20)
+            && self.last_disc.elapsed() > Duration::from_secs(60)
+        {
             self.last_disc = Instant::now();
             self.discover();
         }
@@ -1167,11 +1177,18 @@ impl Engine {
         }
         let ups: Vec<Track> = self.play.upcoming.iter().filter(|t| t.provider.contains("autoplay") || t.provider.contains("recommend")).cloned().collect();
         let fresh: Vec<Track> = ups.into_iter().filter(|t| !self.is_known(t)).collect();
-        let mut pool = self.pool.lock().unwrap();
-        for t in fresh {
-            if !pool.iter().any(|p| p.uri == t.uri) {
-                pool.push_front(t);
+        let mut added = 0;
+        {
+            let mut pool = self.pool.lock().unwrap();
+            for t in fresh {
+                if !pool.iter().any(|p| p.uri == t.uri) {
+                    pool.push_front(t);
+                    added += 1;
+                }
             }
+        }
+        if added > 0 {
+            slog(&format!("{} new songs from Spotify's own suggestions", added));
         }
     }
 
