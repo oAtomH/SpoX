@@ -355,6 +355,18 @@ impl Api {
             Ok(v) => v,
             Err(e) => {
                 web_log(&format!("/me failed: {}", e));
+                // try again by itself once Spotify's wait is over (the name and picture come back
+                // without a restart)
+                static RETRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !RETRY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let api = self.clone();
+                    std::thread::spawn(move || {
+                        let wait = (cool_until("/me") - now_ms()).clamp(5 * 60_000, 24 * 3600_000);
+                        std::thread::sleep(Duration::from_millis(wait as u64 + 5_000));
+                        RETRY.store(false, std::sync::atomic::Ordering::SeqCst);
+                        api.me();
+                    });
+                }
                 // no profile access: at least the name, from the owner of one of your playlists
                 let name = self
                     .get("/me/playlists?limit=20")

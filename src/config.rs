@@ -98,6 +98,8 @@ pub struct Config {
     pub tb_lines: String,
     pub tb_shuffle_btn: bool,
     pub tb_like_btn: bool,
+    /// NEW next to songs SpoX shuffle mixed in (Up next)
+    pub show_new: bool,
     pub tb_prev_btn: bool,
     pub tb_next_btn: bool,
     pub tb_add_btn: bool,
@@ -185,6 +187,7 @@ impl Default for Config {
             tb_lines: "auto".into(),
             tb_shuffle_btn: true,
             tb_like_btn: true,
+            show_new: true,
             tb_prev_btn: true,
             tb_next_btn: true,
             tb_add_btn: true,

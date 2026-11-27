@@ -44,6 +44,8 @@ pub enum Cmd {
     Resume,
     /// the new-songs share changed
     Ratio,
+    /// forget the new songs found so far (they can come back)
+    Forget,
 }
 
 /// "Song Title (Remastered 2011) - Live" + "Artist, Feat" -> "song title|artist"
@@ -421,6 +423,10 @@ impl Engine {
                 Ok(Cmd::Next) => self.next(),
                 Ok(Cmd::Prev) => self.prev(),
                 Ok(Cmd::Mode(shuffle)) => self.apply_mode(shuffle),
+                Ok(Cmd::Forget) => {
+                    self.used.lock().unwrap().clear();
+                    slog("found new songs forgotten");
+                }
                 Ok(Cmd::Ratio) => {
                     if self.on && self.shuffled {
                         self.replan(true);

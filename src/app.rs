@@ -136,6 +136,9 @@ pub struct App {
     tracks_all: Vec<Track>,
     /// how the open playlist is sorted: added / title / artist / album / length / custom
     pl_sort: String,
+    /// sleep timer: pause at this time, or when this song ends
+    sleep_at: Option<Instant>,
+    sleep_song: Option<String>,
     /// Recently played section shows "Your stats" instead (days: 7 / 30 / 365 / 0 = all time)
     hist_stats: bool,
     hist_days: i64,
@@ -199,6 +202,10 @@ enum CtxAct {
     Transfer(String),
     /// play the open playlist (through SpoX, in your shuffle mode)
     PlayList,
+    /// sort the open playlist this way ("title", "title!" = reversed)
+    SetSort(String),
+    /// the sleep timer: minutes (0 = off, -1 = at the end of this song)
+    Sleep(i64),
 }
 
 struct CtxMenu {
@@ -355,6 +362,8 @@ impl App {
             q_removed: Default::default(),
             tracks_all: Vec::new(),
             pl_sort: String::new(),
+            sleep_at: None,
+            sleep_song: None,
             pl_find: None,
             hist_stats: false,
             hist_days: 7,
@@ -880,6 +889,124 @@ impl App {
         self.set_tab(Tab::Playlist);
         self.pl_find = Some(String::new());
         self.osd("TYPE TO FIND \u{b7} ENTER PLAYS \u{b7} ESC CLOSES");
+    }
+
+    fn set_sort(&mut self, k: String) {
+        self.pl_sort = k;
+        if let Some(p) = &self.sel {
+            let mut c = self.cfg.lock().unwrap();
+            c.sorts.insert(p.uri.clone(), self.pl_sort.clone());
+            c.save();
+        }
+        self.scroll[SCROLL_PL] = 0.0;
+        self.apply_view();
+    }
+
+    /// Sort menu, like the phone's "Sort by": pick one; the one that's on again turns it around.
+    fn sort_menu(&mut self, x: f32, y: f32) {
+        let base = self.pl_sort.trim_end_matches('!').to_string();
+        let rev = self.pl_sort.ends_with('!');
+        let mut items: Vec<(String, CtxAct)> = ["added", "title", "artist", "album", "length", "custom"]
+            .iter()
+            .map(|k| {
+                let on = *k == base;
+                let label = if on { format!("> {}{}", sort_name(k), if rev { "  (reversed)" } else { "" }) } else { format!("  {}", sort_name(k)) };
+                let next = if on { if rev { k.to_string() } else { format!("{}!", k) } } else { k.to_string() };
+                (label, CtxAct::SetSort(next))
+            })
+            .collect();
+        let flip = match base.as_str() { "added" => if rev { "Newest first" } else { "Oldest first" }, "title" => if rev { "A to Z" } else { "Z to A" }, "length" => if rev { "Shortest first" } else { "Longest first" }, _ => "Turn around" };
+        items.push((format!("  {}", flip), CtxAct::SetSort(if rev { base.clone() } else { format!("{}!", base) })));
+        self.ctx_menu = Some(CtxMenu { x, y, items });
+        self.right_used = true;
+    }
+
+    /// The bar over an open playlist: Play, Sort, Find and the shuffle mode (like the phone's library).
+    fn draw_pl_tools(&mut self, p: &egui::Painter, o: Pos2, s: f32, inp: &Inp, r: [f32; 4]) -> [f32; 4] {
+        let h = 12.0;
+        let (hcol, dim, bg) = (self.skin.color("header"), self.skin.color("list_dim"), self.skin.color("input_bg"));
+        let free = self.pressed.is_none() && self.drag == Drag::None && !self.pl_drop;
+        let sort_lbl = format!("Sort: {}{} v", sort_name(&self.pl_sort), if self.pl_sort.ends_with('!') { " ^" } else { "" });
+        let find_lbl = match &self.pl_find { Some(f) if !f.is_empty() => format!("Find: {}", f), Some(_) => "Find: _".to_string(), None => "Find".to_string() };
+        let mode_lbl = match self.shuffle_mode().as_str() { "spox" => "SpoX shuffle", "shuffle" => "Shuffle", _ => "In order" }.to_string();
+        let chips = [("> Play".to_string(), 0u8), (sort_lbl, 1), (find_lbl, 2), (mode_lbl, 3)];
+        let mut x = r[0];
+        let mut hit: Option<(u8, f32)> = None;
+        for (i, (lbl, id)) in chips.iter().enumerate() {
+            let mut w = self.tw(lbl) + 8.0;
+            if i == 3 {
+                // the shuffle mode sits on the right
+                x = x.max(r[0] + r[2] - w);
+            }
+            if x + w > r[0] + r[2] {
+                w = (r[0] + r[2] - x).max(0.0);
+                if w < 16.0 {
+                    break;
+                }
+            }
+            let over = free && inp.over(x, r[1], w, h);
+            let down = over && inp.down;
+            let edge = if over || (*id == 2 && self.pl_find.is_some()) { hcol } else { dim };
+            self.fill(p, o, s, x, r[1], w, h, edge);
+            self.fill(p, o, s, x + 1.0, r[1] + 1.0, w - 2.0, h - 2.0, bg);
+            let t = self.fit(lbl, w - 6.0);
+            self.text(p, o, s, x + 4.0, r[1] + 2.0 + if down { 1.0 } else { 0.0 }, &t, if over { hcol } else { dim });
+            if over {
+                self.hover_now = Some(["play list", "sort", "find", "shuffle mode"][*id as usize].into());
+                if inp.released {
+                    hit = Some((*id, x));
+                }
+            }
+            x += w + 4.0;
+        }
+        match hit {
+            Some((0, _)) => {
+                if let Some(pl) = self.sel.clone() {
+                    self.play_playlist(&pl);
+                }
+            }
+            Some((1, cx)) => self.sort_menu(cx, r[1] + h + 2.0),
+            Some((2, _)) => {
+                if self.pl_find.is_some() {
+                    self.pl_find = None;
+                    self.apply_view();
+                } else {
+                    self.start_find();
+                }
+            }
+            Some((3, _)) => self.cycle_shuffle(),
+            _ => {}
+        }
+        [r[0], r[1] + h + 3.0, r[2], r[3] - h - 3.0]
+    }
+
+    fn sleep_label(&self) -> String {
+        if self.sleep_song.is_some() {
+            return "end of this song".into();
+        }
+        match self.sleep_at {
+            Some(t) => {
+                let left = t.saturating_duration_since(Instant::now()).as_secs();
+                format!("{}:{:02} left", left / 60, left % 60)
+            }
+            None => "off".into(),
+        }
+    }
+
+    fn set_sleep(&mut self, m: i64) {
+        self.sleep_at = None;
+        self.sleep_song = None;
+        match m {
+            0 => self.osd("SLEEP TIMER OFF"),
+            -1 => {
+                self.sleep_song = Some(self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default());
+                self.osd("PAUSES AT THE END OF THIS SONG");
+            }
+            m => {
+                self.sleep_at = Some(Instant::now() + Duration::from_secs(m as u64 * 60));
+                self.osd(format!("PAUSES IN {} MIN", m));
+            }
+        }
     }
 
     /// Sort the open playlist the next way (remembered per playlist).
@@ -2415,18 +2542,9 @@ impl App {
                             let ms: u64 = self.tracks.iter().map(|t| t.duration_ms).sum();
                             let mins = ms / 60_000;
                             let dur = if ms == 0 { String::new() } else if mins >= 60 { format!("  \u{b7}  {}h {}m", mins / 60, mins % 60) } else { format!("  \u{b7}  {}m", mins) };
-                            let smart = if self.smart_on && self.smart_shuffled { "  \u{b7}  SpoX shuffle" } else { "" };
-                            let sort = match self.pl_sort.trim_end_matches('!') {
-                                "added" => "  \u{b7}  newest",
-                                "title" => "  \u{b7}  A-Z",
-                                "artist" => "  \u{b7}  by artist",
-                                "album" => "  \u{b7}  by album",
-                                "length" => "  \u{b7}  by length",
-                                _ => "",
-                            };
                             match &self.pl_find {
-                                Some(f) => format!("Find: {}_  \u{b7}  {} of {}", f, self.tracks.len(), self.tracks_all.len()),
-                                None => format!("{}  \u{b7}  {} songs{}{}{}", pl.name, n, dur, sort, smart),
+                                Some(f) if !f.is_empty() => format!("{}  \u{b7}  {} of {} songs", pl.name, self.tracks.len(), self.tracks_all.len()),
+                                _ => format!("{}  \u{b7}  {} songs{}", pl.name, n, dur),
                             }
                         }
                         None => "Playlists".into(),
@@ -2437,7 +2555,7 @@ impl App {
                     // SpoX's own Up next while it plays a list, else Spotify's queue
                     let list: Vec<&Track> = if self.smart_on { self.smart_upcoming.iter().map(|x| &x.0).collect() } else { self.play.upcoming.iter().collect() };
                     let ms: u64 = list.iter().map(|t| t.duration_ms).sum();
-                    let newn = if self.smart_on { list.iter().filter(|t| self.smart_new.contains(&t.uri)).count() } else { 0 };
+                    let newn = if self.smart_on && self.cfg.lock().unwrap().show_new { list.iter().filter(|t| self.smart_new.contains(&t.uri)).count() } else { 0 };
                     let l = if list.is_empty() {
                         "Up next".to_string()
                     } else if newn > 0 {
@@ -2538,7 +2656,11 @@ impl App {
                 self.nine(p, o, s, "list_bg", c[0], c[1], c[2], c[3], 4.0);
                 let sr = [c[0] + c[2] + 4.0, c[1], 8.0, c[3]];
                 self.nine(p, o, s, "scroll_bg", sr[0], sr[1], sr[2], sr[3], 4.0);
-                self.draw_section(p, o, s, inp, t, [c[0] + 3.0, c[1] + 3.0, c[2] - 6.0, c[3] - 6.0], sr);
+                let mut inner = [c[0] + 3.0, c[1] + 3.0, c[2] - 6.0, c[3] - 6.0];
+                if t == Tab::Playlist && self.sel.is_some() && !self.picker && inner[3] > 40.0 {
+                    inner = self.draw_pl_tools(p, o, s, inp, inner);
+                }
+                self.draw_section(p, o, s, inp, t, inner, sr);
             }
         }
     }
@@ -2654,9 +2776,8 @@ impl App {
                     // highlighted: songs you've never listened to, and songs that aren't from your
                     // playlist (smart shuffle / Spotify's autoplay picks)
                     // while SpoX plays a list: NEW = a new song SpoX mixed in (only in SpoX shuffle)
-                    let never = !self.smart_on && crate::smart::knows(&t.name, &t.artists) == Some(false);
-                    let outside = self.smart_new.contains(&t.uri) || p.contains("autoplay") || p.contains("recommend");
-                    let is_new = never || outside;
+                    let _ = &p;
+                    let is_new = self.smart_on && self.cfg.lock().unwrap().show_new && self.smart_new.contains(&t.uri);
                     // like the phone: the title, the artist under it (dimmer), NEW on the right
                     if self.q_picked.contains(&t.uri) {
                         picked_rows.push(rows.len());
@@ -3114,6 +3235,8 @@ impl App {
                 let _ = self.web.send(Req::Transfer(id));
                 self.osd("SWITCHING...");
             }
+            CtxAct::SetSort(k) => self.set_sort(k),
+            CtxAct::Sleep(m) => self.set_sleep(m),
             CtxAct::PlayList => {
                 if let Some(p) = self.sel.clone() {
                     self.play_playlist(&p);
@@ -3242,7 +3365,11 @@ impl App {
             ("Colour pack".into(), c.color_pack.clone(), 16),
             ("Hide animation".into(), match c.collapse_anim.as_str() { "dissolve" => "pixel dissolve", "shutter" => "shutter", "none" => "none", _ => "TV switch-off" }.into(), 19),
             ("@lab".into(), String::new(), 0),
-            ("Smart shuffle".into(), String::new(), 0),
+            ("Listening".into(), String::new(), 0),
+            ("Sleep timer".into(), self.sleep_label(), 27),
+            ("Shuffle".into(), match c.shuffle_mode.as_str() { "spox" => "SpoX shuffle", "shuffle" => "shuffle", _ => "in order" }.into(), 24),
+            ("NEW tags in Up next".into(), onoff(c.show_new), 25),
+            ("Forget found new songs".into(), "reset".into(), 26),
             ("SpoX shuffle: new songs".into(), format!("{}%", c.smart_ratio), 20),
             ("Same artist twice in a row".into(), if c.smart_avoid_artist { "avoid" } else { "allow" }.into(), 21),
             ("Last.fm key (more new songs)".into(), if c.lastfm_key.is_empty() { "add...".into() } else { "set".into() }, 22),
@@ -3393,6 +3520,29 @@ impl App {
                     c.grey_light = 100;
                     c.color_over = crate::skin::pack_colors(&c.color_pack);
                     reskin = true;
+                }
+                24 => {
+                    drop(c);
+                    self.cycle_shuffle();
+                    self.cfg.lock().unwrap().save();
+                    return;
+                }
+                25 => c.show_new = !c.show_new,
+                26 => {
+                    drop(c);
+                    if let Some(sm) = &self.smart {
+                        let _ = sm.send(crate::smart::Cmd::Forget);
+                    }
+                    self.osd("FOUND SONGS FORGOTTEN");
+                    return;
+                }
+                27 => {
+                    drop(c);
+                    let on = |m: i64| if m == 0 { "off".to_string() } else if m == -1 { "end of this song".to_string() } else { format!("{} min", m) };
+                    let items = [0, 15, 30, 45, 60, 90, -1].iter().map(|m| (format!("  {}", on(*m)), CtxAct::Sleep(*m))).collect();
+                    self.ctx_menu = Some(CtxMenu { x: 20.0, y: 16.0, items });
+                    self.right_used = true;
+                    return;
                 }
                 70 => c.dev_mode = !c.dev_mode,
                 71 => {
@@ -4116,6 +4266,20 @@ impl eframe::App for App {
 
         while let Ok(e) = self.rx.try_recv() {
             self.on_event(e);
+        }
+        // sleep timer
+        let cur = self.play.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
+        let song_over = self.sleep_song.as_ref().map(|u| !u.is_empty() && *u != cur).unwrap_or(false);
+        if song_over || self.sleep_at.map(|t| Instant::now() >= t).unwrap_or(false) {
+            self.sleep_at = None;
+            self.sleep_song = None;
+            if self.play.status == "playing" {
+                self.send(command("pause"));
+            }
+            self.osd("SLEEP TIMER: PAUSED");
+        }
+        if self.sleep_at.is_some() || self.sleep_song.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
         // no tray icon while the taskbar player is there (it does the same job)
         if let Some(tr) = &self._tray {
